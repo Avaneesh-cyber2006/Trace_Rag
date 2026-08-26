@@ -26,6 +26,7 @@ def get_normalized_origin_url(repo_path: Path) -> GitHubRepositoryURL:
         GitCommandError,
         ODBError,
         OSError,
+        RuntimeError,
         ValueError,
         IndexError,
     ) as exc:
@@ -55,6 +56,7 @@ def extract_repository_info(
         GitCommandError,
         ODBError,
         OSError,
+        RuntimeError,
         ValueError,
     ) as exc:
         raise MetadataExtractionError("Unable to read repository Git metadata.") from exc

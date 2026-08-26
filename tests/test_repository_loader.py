@@ -291,6 +291,31 @@ def test_metadata_translates_corrupt_object_database(
         extract_repository_info(tmp_path / "repository", repository_url, False)
 
 
+def test_workspace_translates_symlink_loop_resolution_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def symlink_loop(path: Path, strict: bool = False) -> Path:
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", symlink_loop)
+
+    with pytest.raises(WorkspaceError):
+        RepositoryLoader._safe_destination(tmp_path, "acme_example")
+
+
+def test_metadata_translates_symlink_loop_resolution_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def symlink_loop(path: Path, strict: bool = False) -> Path:
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", symlink_loop)
+    repository_url = validate_github_repository_url("https://github.com/acme/example")
+
+    with pytest.raises(metadata_module.MetadataExtractionError):
+        extract_repository_info(tmp_path / "repository", repository_url, False)
+
+
 def test_loader_removes_only_new_partial_clone_after_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

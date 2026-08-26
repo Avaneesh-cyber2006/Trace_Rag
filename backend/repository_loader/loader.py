@@ -80,7 +80,10 @@ class RepositoryLoader:
 
     @staticmethod
     def _safe_destination(workspace: Path, directory_name: str) -> Path:
-        destination = (workspace / directory_name).resolve(strict=False)
+        try:
+            destination = (workspace / directory_name).resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceError("Unable to resolve the repository destination safely.") from exc
         if destination.parent != workspace:
             raise WorkspaceError("The repository destination would escape the workspace.")
         return destination
