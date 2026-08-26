@@ -7,6 +7,7 @@ from pathlib import Path
 
 from git import InvalidGitRepositoryError, NoSuchPathError, Repo
 from git.exc import GitCommandError
+from gitdb.exc import ODBError
 
 from .exceptions import InvalidRepositoryURL, MetadataExtractionError
 from .models import GitHubRepositoryURL, RepositoryInfo
@@ -19,7 +20,15 @@ def get_normalized_origin_url(repo_path: Path) -> GitHubRepositoryURL:
         repository = Repo(repo_path)
         origin_url = repository.remote("origin").url
         return validate_github_repository_url(origin_url)
-    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError) as exc:
+    except (
+        InvalidGitRepositoryError,
+        NoSuchPathError,
+        GitCommandError,
+        ODBError,
+        OSError,
+        ValueError,
+        IndexError,
+    ) as exc:
         raise MetadataExtractionError("Unable to read the repository origin.") from exc
     except InvalidRepositoryURL as exc:
         raise MetadataExtractionError("The repository origin is not a supported GitHub URL.") from exc
@@ -31,8 +40,8 @@ def extract_repository_info(
     reused_existing_clone: bool,
 ) -> RepositoryInfo:
     """Extract basic Git and filesystem metadata without executing repository code."""
-    resolved_path = repo_path.resolve()
     try:
+        resolved_path = repo_path.resolve()
         repository = Repo(resolved_path)
         if repository.bare:
             raise MetadataExtractionError("The repository has no working tree.")
@@ -40,7 +49,14 @@ def extract_repository_info(
         current_commit = repository.head.commit.hexsha
     except MetadataExtractionError:
         raise
-    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError) as exc:
+    except (
+        InvalidGitRepositoryError,
+        NoSuchPathError,
+        GitCommandError,
+        ODBError,
+        OSError,
+        ValueError,
+    ) as exc:
         raise MetadataExtractionError("Unable to read repository Git metadata.") from exc
 
     total_files, repository_size_bytes = _measure_working_tree(resolved_path)

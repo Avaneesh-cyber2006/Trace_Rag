@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 import pytest
+import backend.repository_loader.metadata as metadata_module
+from gitdb.exc import ODBError
 
 from backend.repository_loader import (
     CloneFailed,
@@ -202,6 +204,91 @@ def test_loader_reports_missing_git(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(GitNotInstalled):
         RepositoryLoader(tmp_path / "workspace").load("https://github.com/acme/example")
+
+
+def test_loader_translates_git_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def inaccessible_git(*args: object, **kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess, "run", inaccessible_git)
+
+    with pytest.raises(GitNotInstalled):
+        RepositoryLoader(tmp_path / "workspace").load("https://github.com/acme/example")
+
+
+def test_clone_uses_private_empty_hooks_and_git_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    create_committed_repository(source)
+    workspace = tmp_path / "workspace"
+    predictable_hooks = workspace / ".tracerag-disabled-hooks"
+    predictable_hooks.mkdir(parents=True)
+    (predictable_hooks / "post-checkout").write_text("malicious", encoding="utf-8")
+    real_run = subprocess.run
+
+    def inspect_clone(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "clone" not in command:
+            return real_run(command, **kwargs)
+        hooks_path = Path(command[command.index("-c") + 1].split("=", 1)[1])
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        global_config = Path(environment["GIT_CONFIG_GLOBAL"])
+        assert hooks_path != predictable_hooks
+        assert hooks_path.is_dir()
+        assert list(hooks_path.iterdir()) == []
+        assert global_config.is_file()
+        assert global_config.read_bytes() == b""
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        local_command = command.copy()
+        local_command[-2] = source.as_uri()
+        return real_run(local_command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", inspect_clone)
+
+    info = RepositoryLoader(workspace).load("https://github.com/acme/example")
+
+    assert info.success is True
+
+
+def test_clone_translates_os_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def inaccessible_clone(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "--version" in command:
+            return subprocess.CompletedProcess(command, 0, "git version test", "")
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess, "run", inaccessible_clone)
+
+    with pytest.raises(CloneFailed):
+        RepositoryLoader(tmp_path / "workspace").load("https://github.com/acme/example")
+
+
+def test_metadata_translates_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def inaccessible_repository(path: Path) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(metadata_module, "Repo", inaccessible_repository)
+    repository_url = validate_github_repository_url("https://github.com/acme/example")
+
+    with pytest.raises(metadata_module.MetadataExtractionError):
+        extract_repository_info(tmp_path / "repository", repository_url, False)
+
+
+def test_metadata_translates_corrupt_object_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def corrupt_repository(path: Path) -> None:
+        raise ODBError("corrupt object database")
+
+    monkeypatch.setattr(metadata_module, "Repo", corrupt_repository)
+    repository_url = validate_github_repository_url("https://github.com/acme/example")
+
+    with pytest.raises(metadata_module.MetadataExtractionError):
+        extract_repository_info(tmp_path / "repository", repository_url, False)
 
 
 def test_loader_removes_only_new_partial_clone_after_timeout(

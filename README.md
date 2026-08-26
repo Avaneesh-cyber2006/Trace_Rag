@@ -71,6 +71,6 @@ Existing Clone:      No
 
 ### Security
 
-Cloned contents are untrusted input and are treated strictly as data. The loader uses argument-based Git subprocess calls with a timeout and disabled hooks. It never imports cloned Python modules, runs scripts or package managers, installs repository dependencies, invokes builds/tests, or executes Git hooks. Existing workspace data is never overwritten or silently deleted.
+Cloned contents are untrusted input and are treated strictly as data. The loader uses argument-based Git subprocess calls with a timeout, a fresh empty hooks directory, and isolated system/global Git configuration. It never imports cloned Python modules, runs scripts or package managers, installs repository dependencies, invokes builds/tests, or executes Git hooks. Existing workspace data is never overwritten or silently deleted.
 
 **Current limitation:** Only public GitHub repositories are supported. No token, API key, OAuth flow, or private-repository authentication is implemented.

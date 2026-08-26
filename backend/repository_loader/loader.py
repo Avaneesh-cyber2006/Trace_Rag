@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .exceptions import (
@@ -53,7 +54,7 @@ class RepositoryLoader:
             reused_existing_clone = True
         else:
             logger.info("Cloning repository")
-            self._clone(validated_url.normalized_url, destination, workspace)
+            self._clone(validated_url.normalized_url, destination)
             reused_existing_clone = False
 
         logger.info("Extracting metadata")
@@ -94,7 +95,7 @@ class RepositoryLoader:
                 text=True,
                 timeout=10,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise GitNotInstalled("Git is not installed or is not available on PATH.") from exc
 
     @staticmethod
@@ -108,34 +109,49 @@ class RepositoryLoader:
         if origin.normalized_url.casefold() != expected_url.casefold():
             raise WorkspaceError("The existing destination belongs to another repository.")
 
-    def _clone(self, repository_url: str, destination: Path, workspace: Path) -> None:
-        command = [
-            "git",
-            "-c",
-            f"core.hooksPath={workspace / '.tracerag-disabled-hooks'}",
-            "clone",
-            "--depth",
-            "1",
-            repository_url,
-            str(destination),
-        ]
+    def _clone(self, repository_url: str, destination: Path) -> None:
         environment = os.environ.copy()
+        for name in tuple(environment):
+            if name.startswith("GIT_CONFIG_"):
+                environment.pop(name)
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_ATTR_NOSYSTEM"] = "1"
         try:
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=self.clone_timeout_seconds,
-                env=environment,
-            )
+            with tempfile.TemporaryDirectory(prefix="tracerag-git-") as temporary_directory:
+                trusted_directory = Path(temporary_directory)
+                hooks_path = trusted_directory / "hooks"
+                hooks_path.mkdir()
+                global_config = trusted_directory / "global.gitconfig"
+                global_config.write_bytes(b"")
+                environment["GIT_CONFIG_GLOBAL"] = str(global_config)
+                command = [
+                    "git",
+                    "-c",
+                    f"core.hooksPath={hooks_path}",
+                    "clone",
+                    "--depth",
+                    "1",
+                    repository_url,
+                    str(destination),
+                ]
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.clone_timeout_seconds,
+                    env=environment,
+                )
         except subprocess.TimeoutExpired as exc:
             self._remove_new_destination(destination)
             raise CloneFailed("Repository cloning timed out.") from exc
         except FileNotFoundError as exc:
             self._remove_new_destination(destination)
             raise GitNotInstalled("Git became unavailable while cloning.") from exc
+        except OSError as exc:
+            self._remove_new_destination(destination)
+            raise CloneFailed("The clone process could not access a required resource.") from exc
         except subprocess.CalledProcessError as exc:
             self._remove_new_destination(destination)
             raise self._translate_clone_failure(exc.stderr) from exc
@@ -154,8 +170,8 @@ class RepositoryLoader:
         if destination.exists():
             try:
                 shutil.rmtree(destination)
-            except OSError as exc:
-                raise CloneFailed("Clone failed and its partial destination could not be removed.") from exc
+            except OSError:
+                logger.warning("Unable to remove a partial clone destination")
 
 
 def load_repository(
