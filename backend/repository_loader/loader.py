@@ -72,7 +72,7 @@ class RepositoryLoader:
         try:
             self.workspace_path.mkdir(parents=True, exist_ok=True)
             workspace = self.workspace_path.resolve(strict=True)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise WorkspaceError("Unable to prepare the repository workspace.") from exc
         if not workspace.is_dir():
             raise WorkspaceError("The configured workspace is not a directory.")

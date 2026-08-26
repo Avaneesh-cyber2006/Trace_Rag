@@ -303,6 +303,18 @@ def test_workspace_translates_symlink_loop_resolution_error(
         RepositoryLoader._safe_destination(tmp_path, "acme_example")
 
 
+def test_workspace_preparation_translates_symlink_loop_resolution_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def symlink_loop(path: Path, strict: bool = False) -> Path:
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", symlink_loop)
+
+    with pytest.raises(WorkspaceError):
+        RepositoryLoader(tmp_path / "workspace")._prepare_workspace()
+
+
 def test_metadata_translates_symlink_loop_resolution_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
