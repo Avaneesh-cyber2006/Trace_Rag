@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .classifier import classify_file, detect_language
 from .exceptions import InvalidRepositoryPath, RepositoryScanError, ScannerConfigurationError
-from .filters import DEFAULT_IGNORED_DIRECTORIES, classify_filename, is_binary_sample
+from .filters import DEFAULT_IGNORED_DIRECTORIES, classify_filename, is_binary_sample, is_link_or_reparse
 from .models import (
     FileInventory,
     IgnoredFile,
@@ -58,8 +58,11 @@ class FileScanner:
                     path = Path(entry.path)
                     relative_path = path.relative_to(root).as_posix()
                     try:
-                        if entry.is_symlink():
-                            ignored.append(IgnoredFile(relative_path, IgnoreReason.SYMLINK))
+                        if is_link_or_reparse(entry):
+                            if entry.is_dir(follow_symlinks=False):
+                                skipped.append(SkippedDirectory(relative_path, SkippedDirectoryReason.SYMLINK))
+                            else:
+                                ignored.append(IgnoredFile(relative_path, IgnoreReason.SYMLINK))
                         elif entry.is_dir(follow_symlinks=False):
                             if entry.name.casefold() in DEFAULT_IGNORED_DIRECTORIES:
                                 skipped.append(SkippedDirectory(relative_path, SkippedDirectoryReason.IGNORED_DIRECTORY))

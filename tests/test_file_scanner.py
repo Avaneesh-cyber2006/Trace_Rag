@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import io
 import os
+import stat
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -24,6 +25,7 @@ from backend.file_scanner.filters import (
     DEFAULT_IGNORED_DIRECTORIES,
     classify_filename,
     is_binary_sample,
+    is_link_or_reparse,
     is_supported_filename,
 )
 from backend.file_scanner.classifier import classify_file, detect_language
@@ -343,3 +345,48 @@ def test_descendant_enumeration_failure_is_recoverable(tmp_path: Path, monkeypat
     assert inventory.skipped_directories == (
         SkippedDirectory("blocked", SkippedDirectoryReason.UNREADABLE),
     )
+
+
+def make_symlink(link: Path, target: Path, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+
+def test_file_and_broken_symlinks_are_ignored(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_bytes(b"pass\n")
+    make_symlink(tmp_path / "linked.py", target)
+    make_symlink(tmp_path / "broken.py", tmp_path / "missing.py")
+    inventory = FileScanner().scan(tmp_path)
+    assert IgnoredFile("broken.py", IgnoreReason.SYMLINK) in inventory.ignored
+    assert IgnoredFile("linked.py", IgnoreReason.SYMLINK) in inventory.ignored
+    assert [item.relative_path for item in inventory.files] == ["target.py"]
+    assert inventory.total_files_seen == 3
+
+
+def test_directory_symlink_escape_is_never_traversed(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    write_bytes(outside / "secret.py", b"secret = True\n")
+    make_symlink(repository / "outside_link", outside, target_is_directory=True)
+    inventory = FileScanner().scan(repository)
+    assert inventory.files == ()
+    assert inventory.ignored == (IgnoredFile("outside_link", IgnoreReason.SYMLINK),)
+
+
+def test_reparse_attribute_is_detected_without_symlink_flag() -> None:
+    class FakeStat:
+        st_file_attributes = stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+    class FakeEntry:
+        def is_symlink(self) -> bool:
+            return False
+
+        def stat(self, *, follow_symlinks: bool = True) -> FakeStat:
+            assert not follow_symlinks
+            return FakeStat()
+
+    assert is_link_or_reparse(FakeEntry())  # type: ignore[arg-type]

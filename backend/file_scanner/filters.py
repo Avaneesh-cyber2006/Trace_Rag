@@ -1,6 +1,8 @@
 """Deterministic allowlist and content filters."""
 
 import codecs
+import os
+import stat
 import unicodedata
 
 from .models import IgnoreReason
@@ -115,3 +117,12 @@ def is_binary_sample(sample: bytes) -> bool:
             for byte in sample
         )
         return controls / len(sample) > 0.30
+
+
+def is_link_or_reparse(entry: os.DirEntry[str]) -> bool:
+    if entry.is_symlink():
+        return True
+    metadata = entry.stat(follow_symlinks=False)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
