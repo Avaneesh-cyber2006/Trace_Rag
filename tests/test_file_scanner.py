@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import io
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
+import backend.file_scanner.scanner as scanner_module
 
 from backend.file_scanner import (
     FileCategory,
@@ -11,6 +14,7 @@ from backend.file_scanner import (
     IgnoreReason,
     IgnoredFile,
     InvalidRepositoryPath,
+    RepositoryScanError,
     ScannedFile,
     ScannerConfigurationError,
     SkippedDirectory,
@@ -243,3 +247,99 @@ def test_ignored_files_and_counters_are_consistent(tmp_path: Path) -> None:
     assert inventory.included_files == len(inventory.files) == 1
     assert inventory.ignored_files == len(inventory.ignored) == 4
     assert inventory.total_files_seen == inventory.included_files + inventory.ignored_files == 5
+
+
+def test_oversized_file_is_ignored_without_opening(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "large.py"
+    target.write_bytes(b"x" * 11)
+    original_open = Path.open
+
+    def guarded_open(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            raise AssertionError("oversized file must not be opened")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    inventory = FileScanner(max_file_size_bytes=10).scan(tmp_path)
+    assert inventory.ignored == (IgnoredFile("large.py", IgnoreReason.TOO_LARGE),)
+
+
+def test_file_exactly_at_size_limit_is_included(tmp_path: Path) -> None:
+    (tmp_path / "limit.py").write_bytes(b"x" * 10)
+    assert FileScanner(max_file_size_bytes=10).scan(tmp_path).included_files == 1
+
+
+def test_scanner_reads_only_configured_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "sample.py"
+    target.write_bytes(b"abcdefgh")
+    read_sizes: list[int] = []
+
+    class RecordingBytesIO(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return super().read(size)
+
+    original_open = Path.open
+
+    def recording_open(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            return RecordingBytesIO(b"abcdefgh")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", recording_open)
+    assert FileScanner(binary_sample_size=4).scan(tmp_path).included_files == 1
+    assert read_sizes == [4]
+
+
+def test_binary_unicode_and_empty_files_are_classified(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "payload.txt", b"text\x00payload")
+    write_bytes(tmp_path / "unicode.md", "नमस्ते\n".encode("utf-8"))
+    write_bytes(tmp_path / "bom.txt", "hello\n".encode("utf-16"))
+    write_bytes(tmp_path / "empty.py", b"")
+    inventory = FileScanner().scan(tmp_path)
+    assert IgnoredFile("payload.txt", IgnoreReason.BINARY) in inventory.ignored
+    assert [item.relative_path for item in inventory.files] == ["bom.txt", "empty.py", "unicode.md"]
+
+
+def test_file_open_failure_is_recoverable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "unreadable.py"
+    target.write_bytes(b"pass\n")
+    original_open = Path.open
+
+    def failing_open(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            raise PermissionError("denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    inventory = FileScanner().scan(tmp_path)
+    assert inventory.ignored == (IgnoredFile("unreadable.py", IgnoreReason.UNREADABLE),)
+    assert inventory.total_files_seen == 1
+
+
+def test_root_enumeration_failure_is_translated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing_scandir(path: object):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "scandir", failing_scandir)
+    with pytest.raises(RepositoryScanError):
+        FileScanner().scan(tmp_path)
+
+
+def test_descendant_enumeration_failure_is_recoverable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    write_bytes(tmp_path / "sibling.py", b"pass\n")
+    original_scandir = scanner_module.os.scandir
+
+    def selective_scandir(path: object):
+        if Path(path) == blocked:
+            raise PermissionError("denied")
+        return original_scandir(path)
+
+    monkeypatch.setattr(scanner_module.os, "scandir", selective_scandir)
+    inventory = FileScanner().scan(tmp_path)
+    assert inventory.included_files == 1
+    assert inventory.skipped_directories == (
+        SkippedDirectory("blocked", SkippedDirectoryReason.UNREADABLE),
+    )

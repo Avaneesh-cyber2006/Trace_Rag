@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 
 from .classifier import classify_file, detect_language
-from .exceptions import InvalidRepositoryPath, ScannerConfigurationError
-from .filters import DEFAULT_IGNORED_DIRECTORIES, classify_filename
+from .exceptions import InvalidRepositoryPath, RepositoryScanError, ScannerConfigurationError
+from .filters import DEFAULT_IGNORED_DIRECTORIES, classify_filename, is_binary_sample
 from .models import (
     FileInventory,
     IgnoredFile,
@@ -46,32 +46,54 @@ class FileScanner:
 
         while pending:
             directory = pending.pop()
-            with os.scandir(directory) as entries:
+            try:
+                entries_context = os.scandir(directory)
+            except (OSError, RuntimeError) as exc:
+                if directory == root:
+                    raise RepositoryScanError("Unable to enumerate the repository root.") from exc
+                skipped.append(SkippedDirectory(directory.relative_to(root).as_posix(), SkippedDirectoryReason.UNREADABLE))
+                continue
+            with entries_context as entries:
                 for entry in entries:
                     path = Path(entry.path)
                     relative_path = path.relative_to(root).as_posix()
-                    if entry.is_symlink():
-                        ignored.append(IgnoredFile(relative_path, IgnoreReason.SYMLINK))
-                    elif entry.is_dir(follow_symlinks=False):
-                        if entry.name.casefold() in DEFAULT_IGNORED_DIRECTORIES:
-                            skipped.append(SkippedDirectory(relative_path, SkippedDirectoryReason.IGNORED_DIRECTORY))
-                        else:
-                            pending.append(path)
-                    elif entry.is_file(follow_symlinks=False):
-                        reason = classify_filename(entry.name)
-                        if reason is not None:
-                            ignored.append(IgnoredFile(relative_path, reason))
-                            continue
-                        size = entry.stat(follow_symlinks=False).st_size
-                        extension = path.suffix.casefold()
-                        files.append(ScannedFile(
-                            relative_path=relative_path,
-                            filename=entry.name,
-                            extension=extension,
-                            language=detect_language(entry.name, extension),
-                            category=classify_file(relative_path, entry.name, extension),
-                            size_bytes=size,
-                        ))
+                    try:
+                        if entry.is_symlink():
+                            ignored.append(IgnoredFile(relative_path, IgnoreReason.SYMLINK))
+                        elif entry.is_dir(follow_symlinks=False):
+                            if entry.name.casefold() in DEFAULT_IGNORED_DIRECTORIES:
+                                skipped.append(SkippedDirectory(relative_path, SkippedDirectoryReason.IGNORED_DIRECTORY))
+                            else:
+                                pending.append(path)
+                        elif entry.is_file(follow_symlinks=False):
+                            reason = classify_filename(entry.name)
+                            if reason is not None:
+                                ignored.append(IgnoredFile(relative_path, reason))
+                                continue
+                            size = entry.stat(follow_symlinks=False).st_size
+                            if size > self.max_file_size_bytes:
+                                ignored.append(IgnoredFile(relative_path, IgnoreReason.TOO_LARGE))
+                                continue
+                            try:
+                                with path.open("rb") as stream:
+                                    sample = stream.read(self.binary_sample_size)
+                            except (OSError, RuntimeError):
+                                ignored.append(IgnoredFile(relative_path, IgnoreReason.UNREADABLE))
+                                continue
+                            if is_binary_sample(sample):
+                                ignored.append(IgnoredFile(relative_path, IgnoreReason.BINARY))
+                                continue
+                            extension = path.suffix.casefold()
+                            files.append(ScannedFile(
+                                relative_path=relative_path,
+                                filename=entry.name,
+                                extension=extension,
+                                language=detect_language(entry.name, extension),
+                                category=classify_file(relative_path, entry.name, extension),
+                                size_bytes=size,
+                            ))
+                    except (OSError, RuntimeError):
+                        ignored.append(IgnoredFile(relative_path, IgnoreReason.UNREADABLE))
 
         sort_key = lambda item: (item.relative_path.casefold(), item.relative_path)
         files.sort(key=sort_key)
