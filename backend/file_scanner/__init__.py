@@ -15,11 +15,11 @@ from .models import (
     SkippedDirectory,
     SkippedDirectoryReason,
 )
-from .scanner import FileScanner
+from .scanner import FileScanner, scan_repository
 
 __all__ = [
     "FileCategory", "FileInventory", "FileScanner", "FileScannerError",
     "IgnoredFile", "IgnoreReason", "InvalidRepositoryPath", "RepositoryScanError",
     "ScannedFile", "ScannerConfigurationError", "SkippedDirectory",
-    "SkippedDirectoryReason",
+    "SkippedDirectoryReason", "scan_repository",
 ]

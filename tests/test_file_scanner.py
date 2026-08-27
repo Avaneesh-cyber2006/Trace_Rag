@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import io
+import logging
 import os
 import stat
 from pathlib import Path, PurePosixPath
@@ -20,6 +21,7 @@ from backend.file_scanner import (
     ScannerConfigurationError,
     SkippedDirectory,
     SkippedDirectoryReason,
+    scan_repository,
 )
 from backend.file_scanner.filters import (
     DEFAULT_IGNORED_DIRECTORIES,
@@ -29,6 +31,7 @@ from backend.file_scanner.filters import (
     is_supported_filename,
 )
 from backend.file_scanner.classifier import classify_file, detect_language
+from backend.repository_loader import RepositoryInfo
 
 
 def write_bytes(path: Path, content: bytes) -> None:
@@ -390,3 +393,36 @@ def test_reparse_attribute_is_detected_without_symlink_flag() -> None:
             return FakeStat()
 
     assert is_link_or_reparse(FakeEntry())  # type: ignore[arg-type]
+
+
+def test_scan_repository_convenience_function_uses_public_configuration(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "too-big.py", b"12345")
+    inventory = scan_repository(tmp_path, max_file_size_bytes=4, binary_sample_size=2)
+    assert inventory.ignored == (IgnoredFile("too-big.py", IgnoreReason.TOO_LARGE),)
+
+
+def test_scanner_accepts_repository_info_local_path(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "app.py", b"answer = 42\n")
+    info = RepositoryInfo(
+        success=True, owner="acme", repository_name="example",
+        repo_url="https://github.com/acme/example", local_path=str(tmp_path),
+        branch="main", current_commit="a" * 40, total_files=1,
+        repository_size_bytes=12, reused_existing_clone=False,
+    )
+    inventory = FileScanner().scan(info.local_path)
+    assert inventory.files[0].relative_path == "app.py"
+
+
+def test_scan_logs_lifecycle_without_file_contents(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    write_bytes(tmp_path / "app.py", b"TOP_SECRET_SENTINEL\n")
+    write_bytes(tmp_path / "logo.png", b"BINARY_SECRET_SENTINEL")
+    with caplog.at_level(logging.DEBUG, logger="backend.file_scanner.scanner"):
+        FileScanner().scan(tmp_path)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Starting repository scan" in message for message in messages)
+    assert any("Repository scan complete" in message for message in messages)
+    assert any("unsupported_type" in message for message in messages)
+    assert all("TOP_SECRET_SENTINEL" not in message for message in messages)
+    assert all("BINARY_SECRET_SENTINEL" not in message for message in messages)

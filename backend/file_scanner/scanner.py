@@ -1,6 +1,7 @@
 """Filesystem orchestration for the File Scanner & Filter."""
 
 import os
+import logging
 from pathlib import Path
 
 from .classifier import classify_file, detect_language
@@ -14,6 +15,8 @@ from .models import (
     SkippedDirectory,
     SkippedDirectoryReason,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class FileScanner:
@@ -38,7 +41,9 @@ class FileScanner:
         return root
 
     def scan(self, repository_path: Path | str) -> FileInventory:
+        logger.info("Starting repository scan")
         root = self._validate_repository_path(repository_path)
+        logger.info("Repository root validated")
         files: list[ScannedFile] = []
         ignored: list[IgnoredFile] = []
         skipped: list[SkippedDirectory] = []
@@ -52,6 +57,7 @@ class FileScanner:
                 if directory == root:
                     raise RepositoryScanError("Unable to enumerate the repository root.") from exc
                 skipped.append(SkippedDirectory(directory.relative_to(root).as_posix(), SkippedDirectoryReason.UNREADABLE))
+                logger.warning("Repository scan skipped an unreadable descendant directory")
                 continue
             with entries_context as entries:
                 for entry in entries:
@@ -102,7 +108,9 @@ class FileScanner:
         files.sort(key=sort_key)
         ignored.sort(key=sort_key)
         skipped.sort(key=sort_key)
-        return FileInventory(
+        for item in ignored:
+            logger.debug("File ignored: %s (%s)", item.relative_path, item.reason.value)
+        inventory = FileInventory(
             repository_path=str(root),
             total_files_seen=len(files) + len(ignored),
             included_files=len(files),
@@ -111,3 +119,17 @@ class FileScanner:
             ignored=tuple(ignored),
             skipped_directories=tuple(skipped),
         )
+        logger.info(
+            "Repository scan complete: %d included, %d ignored",
+            inventory.included_files,
+            inventory.ignored_files,
+        )
+        return inventory
+
+
+def scan_repository(
+    repository_path: Path | str,
+    max_file_size_bytes: int = 1_000_000,
+    binary_sample_size: int = 8192,
+) -> FileInventory:
+    return FileScanner(max_file_size_bytes, binary_sample_size).scan(repository_path)
