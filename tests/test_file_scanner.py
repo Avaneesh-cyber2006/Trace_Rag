@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -15,6 +15,7 @@ from backend.file_scanner import (
     SkippedDirectoryReason,
 )
 from backend.file_scanner.filters import classify_filename, is_binary_sample, is_supported_filename
+from backend.file_scanner.classifier import classify_file, detect_language
 
 
 def test_public_enum_values_are_stable() -> None:
@@ -135,3 +136,42 @@ def test_exactly_thirty_percent_controls_is_text() -> None:
 
 def test_more_than_thirty_percent_controls_is_binary() -> None:
     assert is_binary_sample(b"\x01\x02\x03\x04abcdef")
+
+
+@pytest.mark.parametrize(
+    ("filename", "extension", "expected"),
+    [
+        ("app.py", ".py", "python"), ("App.TSX", ".tsx", "typescript"),
+        ("main.cpp", ".cpp", "cpp"), ("types.h", ".h", "c/cpp"),
+        ("service.java", ".java", "java"), ("app.js", ".js", "javascript"),
+        ("main.cs", ".cs", "csharp"), ("main.go", ".go", "go"),
+        ("main.rs", ".rs", "rust"), ("Main.kt", ".kt", "kotlin"),
+        ("Dockerfile", "", "dockerfile"), ("Makefile", "", "make"),
+        ("schema.prisma", ".prisma", "prisma"), ("README.md", ".md", None),
+    ],
+)
+def test_detect_language(filename: str, extension: str, expected: str | None) -> None:
+    assert detect_language(filename, extension) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/config.json", FileCategory.TEST),
+        ("src/AuthServiceTest.java", FileCategory.TEST),
+        ("src/auth.spec.js", FileCategory.TEST),
+        ("migrations/001_create.sql", FileCategory.DATABASE),
+        ("schema.prisma", FileCategory.DATABASE),
+        ("package.json", FileCategory.BUILD),
+        ("Dockerfile", FileCategory.BUILD),
+        (".github/workflows/ci.yml", FileCategory.CONFIG),
+        (".env.example", FileCategory.CONFIG),
+        ("README.md", FileCategory.DOCUMENTATION),
+        ("src/app.py", FileCategory.SOURCE),
+        ("notes.txt", FileCategory.OTHER_TEXT),
+    ],
+)
+def test_category_precedence(path: str, expected: FileCategory) -> None:
+    filename = PurePosixPath(path).name
+    extension = PurePosixPath(path).suffix.casefold()
+    assert classify_file(path, filename, extension) is expected
