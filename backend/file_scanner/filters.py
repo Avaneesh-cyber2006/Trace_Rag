@@ -1,5 +1,8 @@
 """Deterministic allowlist and content filters."""
 
+import codecs
+import unicodedata
+
 from .models import IgnoreReason
 
 DEFAULT_IGNORED_DIRECTORIES = frozenset({
@@ -69,3 +72,46 @@ def classify_filename(filename: str) -> IgnoreReason | None:
     if not is_supported_filename(filename):
         return IgnoreReason.UNSUPPORTED_TYPE
     return None
+
+
+_ALLOWED_CONTROLS = {"\t", "\n", "\r", "\f", "\b"}
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def _decoded_text_is_binary(text: str) -> bool:
+    if not text:
+        return False
+    controls = sum(
+        character not in _ALLOWED_CONTROLS
+        and unicodedata.category(character).startswith("C")
+        and unicodedata.category(character) != "Cf"
+        for character in text
+    )
+    return controls / len(text) > 0.30
+
+
+def is_binary_sample(sample: bytes) -> bool:
+    if not sample:
+        return False
+    for bom, encoding in _BOMS:
+        if sample.startswith(bom):
+            try:
+                return _decoded_text_is_binary(sample.decode(encoding, errors="strict"))
+            except UnicodeDecodeError:
+                return True
+    if b"\x00" in sample:
+        return True
+    try:
+        return _decoded_text_is_binary(sample.decode("utf-8", errors="strict"))
+    except UnicodeDecodeError:
+        controls = sum(
+            (byte < 0x20 and byte not in {0x08, 0x09, 0x0A, 0x0C, 0x0D}) or byte == 0x7F
+            for byte in sample
+        )
+        return controls / len(sample) > 0.30

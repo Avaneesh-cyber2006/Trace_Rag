@@ -14,7 +14,7 @@ from backend.file_scanner import (
     ScannerConfigurationError,
     SkippedDirectoryReason,
 )
-from backend.file_scanner.filters import classify_filename, is_supported_filename
+from backend.file_scanner.filters import classify_filename, is_binary_sample, is_supported_filename
 
 
 def test_public_enum_values_are_stable() -> None:
@@ -111,3 +111,27 @@ def test_unsupported_types_are_rejected(filename: str) -> None:
 )
 def test_supported_source_manifest_doc_and_hidden_files(filename: str) -> None:
     assert classify_filename(filename) is None
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        b"", b"answer = 42\n", "नमस्ते TraceRAG\n".encode("utf-8"),
+        b"\xef\xbb\xbfhello\n", "hello\n".encode("utf-16"), b"caf\xe9\n",
+    ],
+)
+def test_binary_heuristic_accepts_expected_text(sample: bytes) -> None:
+    assert not is_binary_sample(sample)
+
+
+@pytest.mark.parametrize("sample", [b"text\x00payload", b"\xff\x00\x10\x01", b"\xff\xfe\x00"])
+def test_binary_heuristic_rejects_binary_samples(sample: bytes) -> None:
+    assert is_binary_sample(sample)
+
+
+def test_exactly_thirty_percent_controls_is_text() -> None:
+    assert not is_binary_sample(b"\x01\x02\x03abcdefg")
+
+
+def test_more_than_thirty_percent_controls_is_binary() -> None:
+    assert is_binary_sample(b"\x01\x02\x03\x04abcdef")
