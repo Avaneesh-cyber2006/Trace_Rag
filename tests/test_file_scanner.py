@@ -9,13 +9,25 @@ from backend.file_scanner import (
     FileCategory,
     FileScanner,
     IgnoreReason,
+    IgnoredFile,
     InvalidRepositoryPath,
     ScannedFile,
     ScannerConfigurationError,
+    SkippedDirectory,
     SkippedDirectoryReason,
 )
-from backend.file_scanner.filters import classify_filename, is_binary_sample, is_supported_filename
+from backend.file_scanner.filters import (
+    DEFAULT_IGNORED_DIRECTORIES,
+    classify_filename,
+    is_binary_sample,
+    is_supported_filename,
+)
 from backend.file_scanner.classifier import classify_file, detect_language
+
+
+def write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
 
 
 def test_public_enum_values_are_stable() -> None:
@@ -175,3 +187,59 @@ def test_category_precedence(path: str, expected: FileCategory) -> None:
     filename = PurePosixPath(path).name
     extension = PurePosixPath(path).suffix.casefold()
     assert classify_file(path, filename, extension) is expected
+
+
+def test_scan_returns_classified_files_in_deterministic_posix_order(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "src" / "service.py", b"service = True\n")
+    write_bytes(tmp_path / "README.md", "Résumé\n".encode("utf-8"))
+    write_bytes(tmp_path / "src" / "app.py", b"answer = 42\n")
+
+    inventory = FileScanner().scan(tmp_path)
+
+    assert [file.relative_path for file in inventory.files] == [
+        "README.md", "src/app.py", "src/service.py"
+    ]
+    assert all("\\" not in file.relative_path for file in inventory.files)
+    assert [file.language for file in inventory.files] == [None, "python", "python"]
+    assert inventory.repository_path == str(tmp_path.resolve())
+    assert inventory.included_files == 3
+    assert inventory.ignored_files == 0
+    assert inventory.total_files_seen == 3
+
+
+@pytest.mark.parametrize("directory", sorted(DEFAULT_IGNORED_DIRECTORIES))
+def test_ignored_directory_is_pruned_once(tmp_path: Path, directory: str) -> None:
+    write_bytes(tmp_path / directory / "nested" / "payload.py", b"outside = True\n")
+    inventory = FileScanner().scan(tmp_path)
+    assert inventory.total_files_seen == 0
+    assert inventory.ignored == ()
+    assert inventory.skipped_directories == (
+        SkippedDirectory(directory, SkippedDirectoryReason.IGNORED_DIRECTORY),
+    )
+
+
+@pytest.mark.parametrize("directory", ["builder", "distribution", "targeting", ".github"])
+def test_directory_lookalikes_are_not_pruned(tmp_path: Path, directory: str) -> None:
+    write_bytes(tmp_path / directory / "config.yml", b"enabled: true\n")
+    assert FileScanner().scan(tmp_path).included_files == 1
+
+
+def test_ignored_files_and_counters_are_consistent(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "app.py", b"pass\n")
+    write_bytes(tmp_path / ".env", b"SECRET=value\n")
+    write_bytes(tmp_path / "package-lock.json", b"{}")
+    write_bytes(tmp_path / "app.min.js", b"x")
+    write_bytes(tmp_path / "logo.png", b"not opened")
+    write_bytes(tmp_path / "node_modules" / "hidden.py", b"pass\n")
+
+    inventory = FileScanner().scan(tmp_path)
+
+    assert inventory.ignored == (
+        IgnoredFile(".env", IgnoreReason.SENSITIVE_FILE),
+        IgnoredFile("app.min.js", IgnoreReason.MINIFIED),
+        IgnoredFile("logo.png", IgnoreReason.UNSUPPORTED_TYPE),
+        IgnoredFile("package-lock.json", IgnoreReason.LOCKFILE),
+    )
+    assert inventory.included_files == len(inventory.files) == 1
+    assert inventory.ignored_files == len(inventory.ignored) == 4
+    assert inventory.total_files_seen == inventory.included_files + inventory.ignored_files == 5
