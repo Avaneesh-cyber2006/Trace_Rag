@@ -426,3 +426,87 @@ def test_scan_logs_lifecycle_without_file_contents(
     assert any("unsupported_type" in message for message in messages)
     assert all("TOP_SECRET_SENTINEL" not in message for message in messages)
     assert all("BINARY_SECRET_SENTINEL" not in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("filename", "language"),
+    [
+        ("x.py", "python"), ("x.java", "java"), ("x.js", "javascript"),
+        ("x.jsx", "javascript"), ("x.ts", "typescript"), ("x.tsx", "typescript"),
+        ("x.c", "c"), ("x.cc", "cpp"), ("x.h", "c/cpp"), ("x.hpp", "cpp"),
+        ("x.cs", "csharp"), ("x.go", "go"), ("x.rs", "rust"), ("x.rb", "ruby"),
+        ("x.php", "php"), ("x.kt", "kotlin"), ("x.swift", "swift"),
+        ("x.scala", "scala"), ("x.sh", "shell"), ("x.ps1", "powershell"),
+    ],
+)
+def test_source_extension_matrix(tmp_path: Path, filename: str, language: str) -> None:
+    write_bytes(tmp_path / filename, b"source\n")
+    result = FileScanner().scan(tmp_path).files[0]
+    assert result.language == language
+    assert result.category is FileCategory.SOURCE
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["x.class", "x.jar", "x.exe", "x.dll", "x.so", "x.png", "x.jpg", "x.mp3", "x.mp4", "x.zip", "x.gz", "x.ttf", "x.woff2", "x.db", "x.sqlite", "x.svg"],
+)
+def test_unsupported_type_matrix(tmp_path: Path, filename: str) -> None:
+    write_bytes(tmp_path / filename, b"text-looking payload")
+    assert FileScanner().scan(tmp_path).ignored == (
+        IgnoredFile(filename, IgnoreReason.UNSUPPORTED_TYPE),
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "category"),
+    [
+        ("package.json", FileCategory.BUILD), ("requirements.txt", FileCategory.BUILD),
+        ("pyproject.toml", FileCategory.BUILD), ("pom.xml", FileCategory.BUILD),
+        ("build.gradle", FileCategory.BUILD), ("Cargo.toml", FileCategory.BUILD),
+        ("go.mod", FileCategory.BUILD), ("application.properties", FileCategory.CONFIG),
+        ("design.rst", FileCategory.DOCUMENTATION), ("schema.sql", FileCategory.DATABASE),
+    ],
+)
+def test_manifest_and_category_matrix(tmp_path: Path, filename: str, category: FileCategory) -> None:
+    write_bytes(tmp_path / filename, b"text\n")
+    assert FileScanner().scan(tmp_path).files[0].category is category
+
+
+@pytest.mark.parametrize(
+    ("filename", "reason"),
+    [
+        (".env.production", IgnoreReason.SENSITIVE_FILE),
+        ("package-lock.json", IgnoreReason.LOCKFILE),
+        ("huge.min.js", IgnoreReason.MINIFIED),
+        ("huge.png", IgnoreReason.UNSUPPORTED_TYPE),
+    ],
+)
+def test_ignore_reason_precedence_without_content_reads(
+    tmp_path: Path, filename: str, reason: IgnoreReason, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / filename
+    target.write_bytes(b"x" * 20)
+    original_open = Path.open
+
+    def guarded_open(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            raise AssertionError("name-filtered file must not be opened")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    assert FileScanner(max_file_size_bytes=10).scan(tmp_path).ignored == (
+        IgnoredFile(filename, reason),
+    )
+
+
+def test_inventory_collections_sort_independently(tmp_path: Path) -> None:
+    write_bytes(tmp_path / "z.py", b"pass\n")
+    write_bytes(tmp_path / "A.py", b"pass\n")
+    write_bytes(tmp_path / "z.png", b"x")
+    write_bytes(tmp_path / "A.png", b"x")
+    write_bytes(tmp_path / "z" / "node_modules" / "x.py", b"pass\n")
+    write_bytes(tmp_path / "A" / "build" / "x.py", b"pass\n")
+    inventory = FileScanner().scan(tmp_path)
+    assert [item.relative_path for item in inventory.files] == ["A.py", "z.py"]
+    assert [item.relative_path for item in inventory.ignored] == ["A.png", "z.png"]
+    assert [item.relative_path for item in inventory.skipped_directories] == ["A/build", "z/node_modules"]
