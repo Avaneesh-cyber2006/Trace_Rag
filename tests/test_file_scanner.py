@@ -14,6 +14,7 @@ from backend.file_scanner import (
     ScannerConfigurationError,
     SkippedDirectoryReason,
 )
+from backend.file_scanner.filters import classify_filename, is_supported_filename
 
 
 def test_public_enum_values_are_stable() -> None:
@@ -73,3 +74,40 @@ def test_empty_repository_returns_empty_inventory(tmp_path: Path) -> None:
     assert inventory.files == ()
     assert inventory.ignored == ()
     assert inventory.skipped_directories == ()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [".env", ".env.production", "APP.ENV", "app.env.local", "private.pem", "ID_RSA", "credentials.json", "service-account.json"],
+)
+def test_sensitive_filenames_are_rejected(filename: str) -> None:
+    assert classify_filename(filename) is IgnoreReason.SENSITIVE_FILE
+
+
+@pytest.mark.parametrize("filename", [".env.example", ".ENV.SAMPLE", "app.env.template"])
+def test_safe_environment_templates_are_supported(filename: str) -> None:
+    assert classify_filename(filename) is None
+    assert is_supported_filename(filename)
+
+
+@pytest.mark.parametrize("filename", ["package-lock.json", "YARN.LOCK", "poetry.lock", "Cargo.lock"])
+def test_lockfiles_have_specific_reason(filename: str) -> None:
+    assert classify_filename(filename) is IgnoreReason.LOCKFILE
+
+
+@pytest.mark.parametrize("filename", ["app.min.js", "STYLES.MIN.CSS"])
+def test_minified_files_win_before_type_checks(filename: str) -> None:
+    assert classify_filename(filename) is IgnoreReason.MINIFIED
+
+
+@pytest.mark.parametrize("filename", ["logo.png", "diagram.svg", "archive.zip", "data.sqlite", "notes.unknown"])
+def test_unsupported_types_are_rejected(filename: str) -> None:
+    assert classify_filename(filename) is IgnoreReason.UNSUPPORTED_TYPE
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["app.py", "App.TSX", "README.md", "package.json", "pyproject.toml", "Dockerfile", ".gitignore"],
+)
+def test_supported_source_manifest_doc_and_hidden_files(filename: str) -> None:
+    assert classify_filename(filename) is None
