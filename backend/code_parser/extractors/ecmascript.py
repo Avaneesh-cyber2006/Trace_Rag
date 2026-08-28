@@ -33,7 +33,7 @@ from .base import (
 
 _BOUNDED_TEXT_MESSAGE = "Extracted text exceeded the 1,000-byte limit."
 _FUNCTION_DECLARATIONS = frozenset(
-    {"function_declaration", "generator_function_declaration"}
+    {"function_declaration", "function_signature", "generator_function_declaration"}
 )
 _FUNCTION_VALUES = frozenset(
     {"arrow_function", "function_expression", "generator_function"}
@@ -153,6 +153,21 @@ def _export_modifiers(node: Node) -> tuple[str, ...]:
     return ()
 
 
+def _ambient_modifiers(node: Node) -> tuple[str, ...]:
+    ancestor = node.parent
+    while ancestor is not None and ancestor.type not in {
+        "class_body",
+        "program",
+        "statement_block",
+    }:
+        if ancestor.type == "ambient_declaration":
+            return tuple(
+                child.type for child in ancestor.children if child.type == "declare"
+            )
+        ancestor = ancestor.parent
+    return ()
+
+
 def _direct_modifiers(node: Node) -> tuple[str, ...]:
     modifiers: list[str] = []
     for child in node.children:
@@ -170,13 +185,21 @@ def _direct_modifiers(node: Node) -> tuple[str, ...]:
 
 
 def _modifiers(node: Node) -> tuple[str, ...]:
-    return (*_direct_modifiers(node), *_export_modifiers(node))
+    return (
+        *_direct_modifiers(node),
+        *_ambient_modifiers(node),
+        *_export_modifiers(node),
+    )
+
+
+def _semantic_named_children(node: Node) -> tuple[Node, ...]:
+    return tuple(child for child in node.named_children if child.type != "comment")
 
 
 def _type_text(node: Node | None, capture: Callable[[Node], str]) -> str | None:
     if node is None:
         return None
-    declared = next(iter(node.named_children), None)
+    declared = next(iter(_semantic_named_children(node)), None)
     return capture(node) if declared is None else capture(declared)
 
 
@@ -264,7 +287,7 @@ def _class_bases(node: Node, capture: Callable[[Node], str]) -> tuple[str, ...]:
     )
     if heritage is None:
         return ()
-    return tuple(capture(child) for child in heritage.named_children)
+    return tuple(capture(child) for child in _semantic_named_children(heritage))
 
 
 def _typescript_class_relationships(
@@ -279,11 +302,15 @@ def _typescript_class_relationships(
         return (), ()
     bases: list[str] = []
     implemented: list[str] = []
-    for clause in heritage.named_children:
+    for clause in _semantic_named_children(heritage):
         if clause.type == "extends_clause":
-            bases.extend(capture(child) for child in clause.named_children)
+            bases.extend(
+                capture(child) for child in _semantic_named_children(clause)
+            )
         elif clause.type == "implements_clause":
-            implemented.extend(capture(child) for child in clause.named_children)
+            implemented.extend(
+                capture(child) for child in _semantic_named_children(clause)
+            )
     return tuple(bases), tuple(implemented)
 
 
@@ -295,7 +322,11 @@ def _interface_bases(
         (child for child in node.named_children if child.type == "extends_type_clause"),
         None,
     )
-    return () if clause is None else tuple(capture(child) for child in clause.named_children)
+    return (
+        ()
+        if clause is None
+        else tuple(capture(child) for child in _semantic_named_children(clause))
+    )
 
 
 def _bounded_raw_text(value: bytes) -> tuple[str, bool]:
@@ -446,6 +477,10 @@ def _is_module_declaration(node: Node) -> bool:
     parent = node.parent
     if parent is None:
         return False
+    if parent.type == "ambient_declaration":
+        parent = parent.parent
+        if parent is None:
+            return False
     if parent.type == "program":
         return True
     return (
@@ -748,7 +783,7 @@ class EcmaScriptExtractor:
                             source_location(declarator, source),
                             (),
                             None,
-                            _export_modifiers(node),
+                            _modifiers(node),
                             (),
                             (),
                         )

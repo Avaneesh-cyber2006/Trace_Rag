@@ -1552,6 +1552,114 @@ def test_typescript_extractor_normalizes_abstract_and_accessibility_modifiers() 
     assert result.symbols[-1].return_type == "number"
 
 
+def test_typescript_extractor_excludes_comments_from_types_and_heritage() -> None:
+    data = b'''interface Child extends /* interface note */ Parent {
+    read(x: /* parameter note */ string): /* return note */ number;
+}
+class Service extends /* base note */ Base implements /* first note */ Child, /* second note */ Other {}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    child, read, service = result.symbols
+    assert (child.base_types, service.base_types, service.implemented_types) == (
+        ("Parent",),
+        ("Base",),
+        ("Child", "Other"),
+    )
+    assert read.parameters == (ParameterInfo("x", "string", None),)
+    assert read.return_type == "number"
+    assert all(
+        "note" not in text
+        for text in (
+            *child.base_types,
+            *service.base_types,
+            *service.implemented_types,
+            read.parameters[0].type_name or "",
+            read.return_type or "",
+        )
+    )
+
+
+def test_typescript_extractor_preserves_top_level_function_overloads() -> None:
+    data = b'''function parse(value: string): string;
+function parse(value: number): number;
+function parse(value: string | number): string | number { return value; }
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert [
+        (
+            item.kind,
+            item.qualified_name,
+            item.location,
+            item.parameters,
+            item.return_type,
+        )
+        for item in result.symbols
+    ] == [
+        (
+            SymbolKind.FUNCTION,
+            "parse",
+            SourceLocation(0, 38, 1, 0, 1, 38),
+            (ParameterInfo("value", "string", None),),
+            "string",
+        ),
+        (
+            SymbolKind.FUNCTION,
+            "parse",
+            SourceLocation(39, 77, 2, 0, 2, 38),
+            (ParameterInfo("value", "number", None),),
+            "number",
+        ),
+        (
+            SymbolKind.FUNCTION,
+            "parse",
+            SourceLocation(78, 151, 3, 0, 3, 73),
+            (ParameterInfo("value", "string | number", None),),
+            "string | number",
+        ),
+    ]
+
+
+def test_typescript_extractor_keeps_module_ambient_constants_only() -> None:
+    data = b'''declare const LIMIT: number;
+export declare const EXPORTED: string;
+function outer() {
+    declare const LOCAL: number;
+    declare let MUTABLE: number;
+}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert [
+        (item.kind, item.qualified_name, item.location, item.modifiers)
+        for item in result.symbols
+    ] == [
+        (
+            SymbolKind.CONSTANT,
+            "LIMIT",
+            SourceLocation(14, 27, 1, 14, 1, 27),
+            ("declare",),
+        ),
+        (
+            SymbolKind.CONSTANT,
+            "EXPORTED",
+            SourceLocation(50, 66, 2, 21, 2, 37),
+            ("export", "declare"),
+        ),
+        (
+            SymbolKind.FUNCTION,
+            "outer",
+            SourceLocation(68, 154, 3, 0, 6, 1),
+            (),
+        ),
+    ]
+    assert all(item.name not in {"LOCAL", "MUTABLE"} for item in result.symbols)
+
+
 def test_tsx_extractor_uses_registry_grammar_without_jsx_symbol_noise() -> None:
     data = b'''type Props = { onLogin: () => void };
 
