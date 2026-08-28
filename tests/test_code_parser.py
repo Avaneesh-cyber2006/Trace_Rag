@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from tree_sitter import Language, Parser
+import tree_sitter_java
 import tree_sitter_python
 
 from backend.code_parser.extractors import get_extractor
@@ -656,6 +657,259 @@ def documented():
     assert result.calls == ()
     assert result.issues == ()
     assert not hasattr(result.symbols[0], "metadata")
+
+
+def parse_java_fixture(data: bytes):
+    parser = Parser(Language(tree_sitter_java.language()))
+    return parser.parse(data)
+
+
+def extract_java_fixture(data: bytes) -> ExtractionResult:
+    source = SourceBuffer(data, data, 0)
+    return get_extractor("java").extract(parse_java_fixture(data), source)
+
+
+def test_java_extractor_captures_primary_structure_and_original_ranges() -> None:
+    data = b'''package com.example.auth;
+
+import java.util.Optional;
+
+public final class AuthService implements AuthProvider {
+    private UserRepository repository;
+
+    public AuthService(UserRepository repository) {
+        this.repository = repository;
+    }
+
+    public Optional<User> find(String email) {
+        return repository.findByEmail(email);
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert result == ExtractionResult(
+        symbols=(
+            SymbolInfo(
+                "AuthService",
+                SymbolKind.CLASS,
+                "com.example.auth.AuthService",
+                None,
+                SourceLocation(55, 349, 5, 0, 15, 1),
+                (),
+                None,
+                ("public", "final"),
+                (),
+                ("AuthProvider",),
+            ),
+            SymbolInfo(
+                "AuthService",
+                SymbolKind.CONSTRUCTOR,
+                "com.example.auth.AuthService.AuthService",
+                "com.example.auth.AuthService",
+                SourceLocation(156, 247, 8, 4, 10, 5),
+                (ParameterInfo("repository", "UserRepository", None),),
+                None,
+                ("public",),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "find",
+                SymbolKind.METHOD,
+                "com.example.auth.AuthService.find",
+                "com.example.auth.AuthService",
+                SourceLocation(253, 347, 12, 4, 14, 5),
+                (ParameterInfo("email", "String", None),),
+                "Optional<User>",
+                ("public",),
+                (),
+                (),
+            ),
+        ),
+        imports=(
+            ImportInfo(
+                "java.util.Optional",
+                (),
+                False,
+                (),
+                SourceLocation(27, 53, 3, 0, 3, 26),
+            ),
+        ),
+        calls=(
+            CallSite(
+                "com.example.auth.AuthService.find",
+                "repository.findByEmail",
+                CallKind.CALL,
+                SourceLocation(311, 340, 13, 15, 13, 44),
+            ),
+        ),
+        issues=(),
+    )
+    assert all(symbol.name != "repository" for symbol in result.symbols)
+    assert [data[item.location.start_byte : item.location.end_byte] for item in result.symbols] == [
+        data[55:349],
+        data[156:247],
+        data[253:347],
+    ]
+
+
+def test_java_extractor_keeps_interface_signatures_and_extends_as_base_types() -> None:
+    data = b'''package api;
+interface Child extends Parent, Auditable {
+    public abstract String find(int id);
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.kind, item.qualified_name, item.parent_qualified_name) for item in result.symbols] == [
+        (SymbolKind.INTERFACE, "api.Child", None),
+        (SymbolKind.METHOD, "api.Child.find", "api.Child"),
+    ]
+    assert result.symbols[0].base_types == ("Parent", "Auditable")
+    assert result.symbols[0].implemented_types == ()
+    assert result.symbols[1].parameters == (ParameterInfo("id", "int", None),)
+    assert result.symbols[1].return_type == "String"
+    assert result.symbols[1].modifiers == ("public", "abstract")
+
+
+def test_java_extractor_keeps_enum_without_emitting_enum_members() -> None:
+    result = extract_java_fixture(b"enum Status { ACTIVE, INACTIVE }\n")
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.ENUM, "Status"),
+    ]
+
+
+def test_java_extractor_splits_class_extends_and_multiple_implements() -> None:
+    result = extract_java_fixture(
+        b"class Child extends Base implements First, Second {}\n"
+    )
+
+    assert len(result.symbols) == 1
+    assert result.symbols[0].base_types == ("Base",)
+    assert result.symbols[0].implemented_types == ("First", "Second")
+
+
+def test_java_extractor_keeps_overloads_at_distinct_locations() -> None:
+    data = b'''class Search {
+    void find(int id) {}
+    void find(String id) {}
+}
+'''
+
+    methods = [
+        item for item in extract_java_fixture(data).symbols
+        if item.kind is SymbolKind.METHOD
+    ]
+
+    assert [item.qualified_name for item in methods] == ["Search.find", "Search.find"]
+    assert [item.location for item in methods] == [
+        SourceLocation(19, 39, 2, 4, 2, 24),
+        SourceLocation(44, 67, 3, 4, 3, 27),
+    ]
+    assert [item.parameters for item in methods] == [
+        (ParameterInfo("id", "int", None),),
+        (ParameterInfo("id", "String", None),),
+    ]
+
+
+def test_java_extractor_distinguishes_object_creation_from_method_invocation() -> None:
+    data = b'''class Factory {
+    User make() {
+        audit();
+        return new User();
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.caller_qualified_name, item.callee_text, item.kind) for item in result.calls] == [
+        ("Factory.make", "audit", CallKind.CALL),
+        ("Factory.make", "User", CallKind.CONSTRUCTOR),
+    ]
+
+
+def test_java_extractor_normalizes_static_wildcard_imports() -> None:
+    data = b"import static java.util.Collections.*;\n"
+
+    result = extract_java_fixture(data)
+
+    assert result.imports == (
+        ImportInfo(
+            "java.util.Collections",
+            (),
+            True,
+            ("static",),
+            SourceLocation(0, 38, 1, 0, 1, 38),
+        ),
+    )
+
+
+def test_java_extractor_emits_only_final_type_fields_as_constants() -> None:
+    data = b'''interface Settings {
+    int DEFAULT = 1;
+}
+class Constants {
+    public static final int MAX = 3;
+    final String NAME = "app";
+    int ordinary = 4;
+    void update() {
+        final int local = 5;
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+    constants = [item for item in result.symbols if item.kind is SymbolKind.CONSTANT]
+
+    assert [(item.qualified_name, item.modifiers) for item in constants] == [
+        ("Constants.MAX", ("public", "static", "final")),
+        ("Constants.NAME", ("final",)),
+    ]
+    assert all(item.name not in {"DEFAULT", "ordinary", "local"} for item in result.symbols)
+
+
+def test_java_extractor_qualifies_nested_types_and_their_methods() -> None:
+    data = b'''package nested;
+class Outer {
+    interface Inner {
+        void run();
+    }
+    enum State { ON }
+    class Child {}
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.kind, item.qualified_name, item.parent_qualified_name) for item in result.symbols] == [
+        (SymbolKind.CLASS, "nested.Outer", None),
+        (SymbolKind.INTERFACE, "nested.Outer.Inner", "nested.Outer"),
+        (SymbolKind.METHOD, "nested.Outer.Inner.run", "nested.Outer.Inner"),
+        (SymbolKind.ENUM, "nested.Outer.State", "nested.Outer"),
+        (SymbolKind.CLASS, "nested.Outer.Child", "nested.Outer"),
+    ]
+
+
+def test_java_extractor_leaves_initializer_block_calls_unowned() -> None:
+    data = b'''class Init {
+    { boot(); }
+    static { warm(); }
+    void run() { go(); }
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        (None, "boot"),
+        (None, "warm"),
+        ("Init.run", "go"),
+    ]
 
 
 @pytest.mark.parametrize(
