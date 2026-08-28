@@ -1285,6 +1285,28 @@ const C = class {
     ]
 
 
+def test_javascript_extractor_uses_anonymous_class_call_ownership_barrier() -> None:
+    data = b'''function outer() {
+    const C = class {
+        @decorate()
+        method() { leaked(); }
+    };
+    return done();
+}
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.FUNCTION, "outer"),
+    ]
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        (None, "decorate"),
+        (None, "leaked"),
+        ("outer", "done"),
+    ]
+
+
 def test_javascript_extractor_keeps_decorator_calls_outside_method_ownership() -> None:
     data = b'''class C {
     @dec()

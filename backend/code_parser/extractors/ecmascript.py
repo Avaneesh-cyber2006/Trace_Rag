@@ -59,6 +59,7 @@ JAVASCRIPT = _EcmaScriptMode.JAVASCRIPT
 @dataclass(frozen=True, slots=True)
 class _ModeNodeSets:
     class_declarations: frozenset[str]
+    class_expressions: frozenset[str]
     interface_declarations: frozenset[str]
     method_declarations: frozenset[str]
     typed_declarations: bool
@@ -67,6 +68,7 @@ class _ModeNodeSets:
 _MODE_NODE_SETS = {
     JAVASCRIPT: _ModeNodeSets(
         class_declarations=frozenset({"class_declaration"}),
+        class_expressions=frozenset({"class"}),
         interface_declarations=frozenset(),
         method_declarations=frozenset({"method_definition"}),
         typed_declarations=False,
@@ -367,6 +369,7 @@ class EcmaScriptExtractor:
         scopes: list[_LexicalScope] = []
         ownership_scopes: list[str | None] = []
         pushed_scopes: set[_SCOPE_KEY] = set()
+        pushed_ownership_barriers: set[_SCOPE_KEY] = set()
         extracted_class_bodies: set[_SCOPE_KEY] = set()
         captured_truncated_text = False
 
@@ -394,7 +397,10 @@ class EcmaScriptExtractor:
             ancestor = node.parent
             while ancestor is not None:
                 if ancestor.type == "decorator":
-                    return ownership_scopes[-2] if len(ownership_scopes) > 1 else None
+                    decorated = ancestor.parent
+                    if decorated is not None and _node_key(decorated) in pushed_scopes:
+                        return ownership_scopes[-2] if len(ownership_scopes) > 1 else None
+                    return ownership_scopes[-1] if ownership_scopes else None
                 ancestor = ancestor.parent
             return ownership_scopes[-1] if ownership_scopes else None
 
@@ -402,10 +408,18 @@ class EcmaScriptExtractor:
             node = event.node
             key = _node_key(node)
             if event.kind is not ENTER:
+                if key in pushed_ownership_barriers:
+                    pushed_ownership_barriers.remove(key)
+                    ownership_scopes.pop()
                 if key in pushed_scopes:
                     pushed_scopes.remove(key)
                     scopes.pop()
                     ownership_scopes.pop()
+                continue
+
+            if node.type in node_sets.class_expressions:
+                ownership_scopes.append(None)
+                pushed_ownership_barriers.add(key)
                 continue
 
             if node.type in node_sets.class_declarations:
