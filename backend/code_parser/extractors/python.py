@@ -25,6 +25,8 @@ from .base import (
     ExtractionResult,
     ScopeStack,
     bounded_node_text,
+    collect_syntax_issues,
+    is_trustworthy_capture,
     iter_events,
     normalize_extraction,
     source_location,
@@ -148,7 +150,9 @@ class PythonExtractor:
         calls: list[CallSite] = []
         scopes: list[_LexicalScope] = []
         callable_scopes = ScopeStack()
+        pushed_scopes: set[tuple[int, int, str]] = set()
         captured_truncated_text = False
+        syntax_issues = collect_syntax_issues(tree, source)
 
         def capture(node: Node) -> str:
             nonlocal captured_truncated_text
@@ -158,17 +162,19 @@ class PythonExtractor:
 
         for event in iter_events(tree.root_node):
             node = event.node
+            node_key = (node.start_byte, node.end_byte, node.type)
             if event.kind is not ENTER:
-                if node.type in {"class_definition", "function_definition"}:
-                    name = node.child_by_field_name("name")
-                    if name is not None:
-                        scopes.pop()
-                        callable_scopes.pop()
+                if node_key in pushed_scopes:
+                    pushed_scopes.remove(node_key)
+                    scopes.pop()
+                    callable_scopes.pop()
                 continue
 
             if node.type == "class_definition":
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -188,11 +194,14 @@ class PythonExtractor:
                 )
                 scopes.append(_LexicalScope(qualified, "class"))
                 callable_scopes.push(qualified, is_callable=False)
+                pushed_scopes.add(node_key)
                 continue
 
             if node.type == "function_definition":
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -226,12 +235,18 @@ class PythonExtractor:
                 )
                 scopes.append(_LexicalScope(qualified, "function"))
                 callable_scopes.push(qualified, is_callable=True)
+                pushed_scopes.add(node_key)
                 continue
 
             if node.type == "assignment":
                 left = node.child_by_field_name("left")
                 constant_scope = not scopes or scopes[-1].kind == "class"
-                if left is not None and left.type == "identifier" and constant_scope:
+                if (
+                    left is not None
+                    and left.type == "identifier"
+                    and constant_scope
+                    and is_trustworthy_capture(node, source, syntax_issues, left)
+                ):
                     name = capture(left)
                     if name.isupper():
                         qualified, parent = _qualified_name(scopes, name)
@@ -252,18 +267,26 @@ class PythonExtractor:
                 continue
 
             if node.type == "import_statement":
-                imports.extend(_direct_imports(node, source, capture))
+                if is_trustworthy_capture(node, source, syntax_issues):
+                    imports.extend(_direct_imports(node, source, capture))
                 continue
 
             if node.type == "import_from_statement":
-                imported = _from_import(node, source, capture)
+                module = node.child_by_field_name("module_name")
+                imported = (
+                    _from_import(node, source, capture)
+                    if is_trustworthy_capture(node, source, syntax_issues, module)
+                    else None
+                )
                 if imported is not None:
                     imports.append(imported)
                 continue
 
             if node.type == "call":
                 function = node.child_by_field_name("function")
-                if function is not None:
+                if function is not None and is_trustworthy_capture(
+                    node, source, syntax_issues, function
+                ):
                     calls.append(
                         CallSite(
                             callable_scopes.nearest_callable,
@@ -273,7 +296,7 @@ class PythonExtractor:
                         )
                     )
 
-        issues = (
+        issues = syntax_issues + (
             (ParseIssue(ParseIssueKind.EXTRACTION_ERROR, _BOUNDED_TEXT_MESSAGE, None),)
             if captured_truncated_text
             else ()

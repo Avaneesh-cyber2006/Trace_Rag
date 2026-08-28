@@ -14,6 +14,8 @@ from backend.code_parser.models import (
     ImportBinding,
     ImportInfo,
     ParseIssue,
+    ParseIssueKind,
+    ParseStatus,
     SourceLocation,
     SymbolInfo,
 )
@@ -24,6 +26,8 @@ _MAX_TEXT_BYTES = 1000
 _ELLIPSIS = "…"
 _ELLIPSIS_BYTES = _ELLIPSIS.encode("utf-8")
 _ASCII_WHITESPACE = b" \t\n\r\f\v"
+_SYNTAX_ERROR_MESSAGE = "Syntax error in source file."
+_MISSING_NODE_MESSAGE = "Required syntax is missing."
 _T = TypeVar("_T")
 
 
@@ -294,6 +298,84 @@ def normalize_extraction(result: ExtractionResult) -> ExtractionResult:
             )
         ),
     )
+
+
+def collect_syntax_issues(tree: Tree, source: SourceBuffer) -> tuple[ParseIssue, ...]:
+    """Collect fixed, source-located syntax findings without recursive traversal."""
+
+    issues: list[ParseIssue] = []
+    for event in iter_events(tree.root_node):
+        if event.kind is not ENTER:
+            continue
+        node = event.node
+        if node.is_error:
+            issues.append(
+                ParseIssue(
+                    ParseIssueKind.SYNTAX_ERROR,
+                    _SYNTAX_ERROR_MESSAGE,
+                    source_location(node, source),
+                )
+            )
+        if node.is_missing:
+            issues.append(
+                ParseIssue(
+                    ParseIssueKind.MISSING_NODE,
+                    _MISSING_NODE_MESSAGE,
+                    source_location(node, source),
+                )
+            )
+    return normalize_extraction(ExtractionResult((), (), (), tuple(issues))).issues
+
+
+def is_trustworthy_capture(
+    node: Node,
+    source: SourceBuffer,
+    syntax_issues: tuple[ParseIssue, ...],
+    *required_nodes: Node | None,
+) -> bool:
+    """Allow captures outside invalid spans, or complete captures nested in one."""
+
+    try:
+        location = source_location(node, source)
+    except ValueError:
+        return False
+    invalid_locations = tuple(
+        issue.location
+        for issue in syntax_issues
+        if issue.location is not None
+        and issue.kind in {ParseIssueKind.SYNTAX_ERROR, ParseIssueKind.MISSING_NODE}
+    )
+    wholly_invalid = any(
+        invalid.start_byte <= location.start_byte
+        and location.end_byte <= invalid.end_byte
+        for invalid in invalid_locations
+    )
+    if not wholly_invalid:
+        return True
+    if node.is_error or node.is_missing or node.has_error:
+        return False
+    for required in required_nodes:
+        if (
+            required is None
+            or required.is_error
+            or required.is_missing
+            or required.has_error
+        ):
+            return False
+        try:
+            source_location(required, source)
+        except ValueError:
+            return False
+    return True
+
+
+def classify_parse_status(result: ExtractionResult) -> ParseStatus:
+    """Classify a normalized extraction strictly from issues and structure."""
+
+    has_structure = bool(result.symbols or result.imports or result.calls)
+    if not result.issues:
+        return ParseStatus.SUCCESS
+    return ParseStatus.PARTIAL if has_structure else ParseStatus.FAILED
 
 
 _EXTRACTOR_KEYS = frozenset({"python", "java", "javascript", "typescript", "tsx"})

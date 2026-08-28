@@ -23,6 +23,8 @@ from .base import (
     ENTER,
     ExtractionResult,
     bounded_node_text,
+    collect_syntax_issues,
+    is_trustworthy_capture,
     iter_events,
     normalize_extraction,
     source_location,
@@ -288,7 +290,9 @@ class JavaExtractor:
         calls: list[CallSite] = []
         scopes: list[_LexicalScope] = []
         ownership_scopes: list[str | None] = []
+        pushed_scopes: set[tuple[int, int, str]] = set()
         captured_truncated_text = False
+        syntax_issues = collect_syntax_issues(tree, source)
 
         def capture(node: Node) -> str:
             nonlocal captured_truncated_text
@@ -324,29 +328,28 @@ class JavaExtractor:
                 ),
                 None,
             )
-            if name_node is not None:
+            if name_node is not None and is_trustworthy_capture(
+                child, source, syntax_issues, name_node
+            ):
                 package_name = capture(name_node)
             break
 
         for event in iter_events(tree.root_node):
             node = event.node
+            node_key = (node.start_byte, node.end_byte, node.type)
             if event.kind is not ENTER:
-                if node.type in _TYPE_DECLARATIONS:
-                    name = node.child_by_field_name("name")
-                    if name is not None:
-                        scopes.pop()
-                        ownership_scopes.pop()
-                elif node.type in {"constructor_declaration", "method_declaration"}:
-                    name = node.child_by_field_name("name")
-                    if name is not None and node.parent is not None and node.parent.type in _TYPE_BODIES:
-                        scopes.pop()
-                        ownership_scopes.pop()
+                if node_key in pushed_scopes:
+                    pushed_scopes.remove(node_key)
+                    scopes.pop()
+                    ownership_scopes.pop()
                 continue
 
             type_kind = _TYPE_DECLARATIONS.get(node.type)
             if type_kind is not None:
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, package_name, name)
@@ -367,13 +370,16 @@ class JavaExtractor:
                 )
                 scopes.append(_LexicalScope(qualified, "type"))
                 ownership_scopes.append(None)
+                pushed_scopes.add(node_key)
                 continue
 
             if node.type in {"constructor_declaration", "method_declaration"}:
                 if node.parent is None or node.parent.type not in _TYPE_BODIES:
                     continue
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, package_name, name)
@@ -404,21 +410,30 @@ class JavaExtractor:
                 )
                 scopes.append(_LexicalScope(qualified, "callable"))
                 ownership_scopes.append(qualified)
+                pushed_scopes.add(node_key)
                 continue
 
             if node.type == "field_declaration":
-                symbols.extend(_field_constants(node, scopes, source, capture))
+                if is_trustworthy_capture(node, source, syntax_issues):
+                    symbols.extend(_field_constants(node, scopes, source, capture))
                 continue
 
             if node.type == "import_declaration":
-                imported = _import_info(node, source, capture)
+                imported = (
+                    _import_info(node, source, capture)
+                    if is_trustworthy_capture(node, source, syntax_issues)
+                    else None
+                )
                 if imported is not None:
                     imports.append(imported)
                 continue
 
             if node.type == "method_invocation":
                 arguments = node.child_by_field_name("arguments")
-                if arguments is not None:
+                name_node = node.child_by_field_name("name")
+                if arguments is not None and is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     calls.append(
                         CallSite(
                             ownership_scopes[-1] if ownership_scopes else None,
@@ -431,7 +446,9 @@ class JavaExtractor:
 
             if node.type == "object_creation_expression":
                 type_node = node.child_by_field_name("type")
-                if type_node is not None:
+                if type_node is not None and is_trustworthy_capture(
+                    node, source, syntax_issues, type_node
+                ):
                     calls.append(
                         CallSite(
                             ownership_scopes[-1] if ownership_scopes else None,
@@ -441,7 +458,7 @@ class JavaExtractor:
                         )
                     )
 
-        issues = (
+        issues = syntax_issues + (
             (ParseIssue(ParseIssueKind.EXTRACTION_ERROR, _BOUNDED_TEXT_MESSAGE, None),)
             if captured_truncated_text
             else ()

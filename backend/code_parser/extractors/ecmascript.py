@@ -25,6 +25,8 @@ from .base import (
     ENTER,
     ExtractionResult,
     bounded_node_text,
+    collect_syntax_issues,
+    is_trustworthy_capture,
     iter_events,
     normalize_extraction,
     source_location,
@@ -530,6 +532,7 @@ class EcmaScriptExtractor:
         pushed_ownership_barriers: set[_SCOPE_KEY] = set()
         extracted_class_bodies: set[_SCOPE_KEY] = set()
         captured_truncated_text = False
+        syntax_issues = collect_syntax_issues(tree, source)
 
         def capture(node: Node) -> str:
             nonlocal captured_truncated_text
@@ -582,7 +585,9 @@ class EcmaScriptExtractor:
 
             if node.type in node_sets.class_declarations:
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -616,7 +621,9 @@ class EcmaScriptExtractor:
 
             if node.type in node_sets.interface_declarations:
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -642,7 +649,9 @@ class EcmaScriptExtractor:
 
             if node.type in _FUNCTION_DECLARATIONS:
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -672,7 +681,9 @@ class EcmaScriptExtractor:
                 ):
                     continue
                 name_node = node.child_by_field_name("name")
-                if name_node is None:
+                if name_node is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
@@ -701,6 +712,10 @@ class EcmaScriptExtractor:
             stable_binding = _stable_function_binding(node)
             if stable_binding is not None:
                 name_node, value = stable_binding
+                if not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node, value
+                ):
+                    continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
                 symbols.append(
@@ -737,6 +752,10 @@ class EcmaScriptExtractor:
                     "property_identifier",
                 }:
                     continue
+                if not is_trustworthy_capture(
+                    node, source, syntax_issues, name_node
+                ):
+                    continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
                 symbols.append(
@@ -772,6 +791,10 @@ class EcmaScriptExtractor:
                         or (value is not None and value.type in _FUNCTION_VALUES)
                     ):
                         continue
+                    if not is_trustworthy_capture(
+                        declarator, source, syntax_issues, name_node
+                    ):
+                        continue
                     name = capture(name_node)
                     qualified, parent = _qualified_name(scopes, name)
                     symbols.append(
@@ -791,12 +814,24 @@ class EcmaScriptExtractor:
                 continue
 
             if node.type == "import_statement":
-                imported = _es_import(node, source, capture, capture_module)
+                module_node = node.child_by_field_name("source")
+                imported = (
+                    _es_import(node, source, capture, capture_module)
+                    if is_trustworthy_capture(
+                        node, source, syntax_issues, module_node
+                    )
+                    else None
+                )
                 if imported is not None:
                     imports.append(imported)
                 continue
 
             if node.type == "call_expression":
+                function = node.child_by_field_name("function")
+                if function is None or not is_trustworthy_capture(
+                    node, source, syntax_issues, function
+                ):
+                    continue
                 imported = _commonjs_import(
                     node,
                     source,
@@ -805,21 +840,21 @@ class EcmaScriptExtractor:
                 )
                 if imported is not None:
                     imports.append(imported)
-                function = node.child_by_field_name("function")
-                if function is not None:
-                    calls.append(
-                        CallSite(
-                            call_owner(node),
-                            capture(function),
-                            CallKind.CALL,
-                            source_location(node, source),
-                        )
+                calls.append(
+                    CallSite(
+                        call_owner(node),
+                        capture(function),
+                        CallKind.CALL,
+                        source_location(node, source),
                     )
+                )
                 continue
 
             if node.type == "new_expression":
                 constructor = node.child_by_field_name("constructor")
-                if constructor is not None:
+                if constructor is not None and is_trustworthy_capture(
+                    node, source, syntax_issues, constructor
+                ):
                     calls.append(
                         CallSite(
                             call_owner(node),
@@ -829,7 +864,7 @@ class EcmaScriptExtractor:
                         )
                     )
 
-        issues = (
+        issues = syntax_issues + (
             (ParseIssue(ParseIssueKind.EXTRACTION_ERROR, _BOUNDED_TEXT_MESSAGE, None),)
             if captured_truncated_text
             else ()

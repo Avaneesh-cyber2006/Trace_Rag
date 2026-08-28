@@ -212,7 +212,7 @@ def extraction_location(start_byte: int, end_byte: int) -> SourceLocation:
     return SourceLocation(start_byte, end_byte, 1, start_byte, 1, end_byte)
 
 
-def test_normalize_extraction_deduplicates_first_values_and_sorts_by_design_keys() -> None:
+def test_normalize_extraction_deduplicates_first_values_and_sorts_syntax_issues() -> None:
     first_symbol = SymbolInfo(
         "same", SymbolKind.FUNCTION, "first.same", None, extraction_location(20, 24), (), None,
         ("ASYNC", "public", "unknown", "async"), (), (),
@@ -1733,6 +1733,270 @@ def test_jsx_extractor_ignores_elements_and_keeps_expression_container_calls() -
     ]
     assert result.imports == ()
     assert result.issues == ()
+
+
+@pytest.mark.parametrize(
+    ("extractor_key", "data", "retained_name", "invalid_range"),
+    [
+        (
+            "python",
+            b"def kept():\n    return ok()\n\ndef broken(\n",
+            "kept",
+            (29, 40),
+        ),
+        (
+            "java",
+            b"class Kept { void ok() { run(); } }\nclass Broken { void nope( {\n",
+            "Kept",
+            (36, 63),
+        ),
+        (
+            "javascript",
+            b"function kept() { ok(); }\nfunction broken( {\n",
+            "kept",
+            (26, 44),
+        ),
+        (
+            "typescript",
+            b"interface Kept {}\nfunction broken( {\n",
+            "Kept",
+            (18, 36),
+        ),
+        (
+            "tsx",
+            b"function Kept() { return <div />; }\nfunction broken( {\n",
+            "Kept",
+            (36, 54),
+        ),
+    ],
+)
+def test_malformed_supported_source_retains_complete_metadata_as_partial_parse(
+    extractor_key: str,
+    data: bytes,
+    retained_name: str,
+    invalid_range: tuple[int, int],
+) -> None:
+    if extractor_key == "python":
+        tree = parse_python_fixture(data)
+    elif extractor_key == "java":
+        tree = parse_java_fixture(data)
+    elif extractor_key == "javascript":
+        tree = parse_javascript_fixture(data)
+    elif extractor_key == "typescript":
+        tree = parse_typescript_fixture(data)
+    else:
+        tree = Parser(Language(tree_sitter_typescript.language_tsx())).parse(data)
+
+    result = get_extractor(extractor_key).extract(tree, SourceBuffer(data, data, 0))
+
+    assert tree.root_node.has_error
+    assert retained_name in {symbol.name for symbol in result.symbols}
+    assert extractor_base.classify_parse_status(result) is ParseStatus.PARTIAL
+    assert result.issues
+    assert {issue.kind for issue in result.issues} <= {
+        ParseIssueKind.SYNTAX_ERROR,
+        ParseIssueKind.MISSING_NODE,
+    }
+    assert ParseIssueKind.SYNTAX_ERROR in {issue.kind for issue in result.issues}
+    assert all(issue.location is not None for issue in result.issues)
+    syntax_issue = next(
+        issue for issue in result.issues if issue.kind is ParseIssueKind.SYNTAX_ERROR
+    )
+    assert syntax_issue.location is not None
+    assert (
+        syntax_issue.location.start_byte,
+        syntax_issue.location.end_byte,
+    ) == invalid_range
+    assert data[slice(*invalid_range)].startswith(
+        b"def broken" if extractor_key == "python" else b"function broken"
+        if extractor_key in {"javascript", "typescript", "tsx"}
+        else b"class Broken"
+    )
+    assert all(
+        issue.message in {
+            "Syntax error in source file.",
+            "Required syntax is missing.",
+        }
+        for issue in result.issues
+    )
+    assert all("broken" not in issue.message.lower() for issue in result.issues)
+
+
+def test_syntax_issue_locations_use_original_bom_bytes_and_missing_nodes() -> None:
+    parse_bytes = b"class A {"
+    original_bytes = codecs.BOM_UTF8 + parse_bytes
+    tree = parse_java_fixture(parse_bytes)
+
+    issues = extractor_base.collect_syntax_issues(
+        tree,
+        SourceBuffer(original_bytes, parse_bytes, len(codecs.BOM_UTF8)),
+    )
+
+    assert issues == (
+        ParseIssue(
+            ParseIssueKind.MISSING_NODE,
+            "Required syntax is missing.",
+            SourceLocation(12, 12, 1, 12, 1, 12),
+        ),
+    )
+
+
+def test_syntax_issue_collection_deduplicates_identical_error_captures() -> None:
+    point = SimpleNamespace(row=0, column=1)
+    duplicate_errors = [
+        SimpleNamespace(
+            type="ERROR",
+            start_byte=1,
+            end_byte=4,
+            start_point=point,
+            end_point=SimpleNamespace(row=0, column=4),
+            is_error=True,
+            is_missing=False,
+            children=[],
+        )
+        for _ in range(2)
+    ]
+    root = SimpleNamespace(
+        type="module",
+        start_byte=0,
+        end_byte=5,
+        start_point=SimpleNamespace(row=0, column=0),
+        end_point=SimpleNamespace(row=0, column=5),
+        is_error=False,
+        is_missing=False,
+        children=duplicate_errors,
+    )
+    data = b"xbad!"
+
+    issues = extractor_base.collect_syntax_issues(
+        SimpleNamespace(root_node=root),
+        SourceBuffer(data, data, 0),
+    )
+
+    assert issues == (
+        ParseIssue(
+            ParseIssueKind.SYNTAX_ERROR,
+            "Syntax error in source file.",
+            SourceLocation(1, 4, 1, 1, 1, 4),
+        ),
+    )
+    assert b"bad" not in issues[0].message.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        (ExtractionResult((), (), (), ()), ParseStatus.SUCCESS),
+        (
+            ExtractionResult(
+                (
+                    SymbolInfo(
+                        "kept",
+                        SymbolKind.FUNCTION,
+                        "kept",
+                        None,
+                        SourceLocation(0, 4, 1, 0, 1, 4),
+                        (),
+                        None,
+                        (),
+                        (),
+                        (),
+                    ),
+                ),
+                (),
+                (),
+                (),
+            ),
+            ParseStatus.SUCCESS,
+        ),
+        (
+            ExtractionResult(
+                (),
+                (),
+                (),
+                (
+                    ParseIssue(
+                        ParseIssueKind.SYNTAX_ERROR,
+                        "Syntax error in source file.",
+                        SourceLocation(0, 1, 1, 0, 1, 1),
+                    ),
+                ),
+            ),
+            ParseStatus.FAILED,
+        ),
+        (
+            ExtractionResult(
+                (),
+                (),
+                (CallSite(None, "kept", CallKind.CALL, SourceLocation(0, 6, 1, 0, 1, 6)),),
+                (
+                    ParseIssue(
+                        ParseIssueKind.EXTRACTION_ERROR,
+                        "Extracted text exceeded the 1,000-byte limit.",
+                        None,
+                    ),
+                ),
+            ),
+            ParseStatus.PARTIAL,
+        ),
+        (
+            ExtractionResult(
+                (),
+                (),
+                (),
+                (
+                    ParseIssue(
+                        ParseIssueKind.EXTRACTION_ERROR,
+                        "Extraction failed.",
+                        None,
+                    ),
+                ),
+            ),
+            ParseStatus.FAILED,
+        ),
+    ],
+)
+def test_parse_status_depends_only_on_issues_and_trustworthy_structure(
+    result: ExtractionResult,
+    expected_status: ParseStatus,
+) -> None:
+    assert extractor_base.classify_parse_status(result) is expected_status
+    if expected_status is ParseStatus.FAILED:
+        assert result.symbols == ()
+        assert result.imports == ()
+        assert result.calls == ()
+
+
+def test_parse_status_keeps_clean_supported_trees_successful() -> None:
+    empty = extract_python_fixture(b"# no structure\n")
+    structural = extract_python_fixture(b"def kept():\n    pass\n")
+
+    assert empty == ExtractionResult((), (), (), ())
+    assert extractor_base.classify_parse_status(empty) is ParseStatus.SUCCESS
+    assert [symbol.name for symbol in structural.symbols] == ["kept"]
+    assert structural.issues == ()
+    assert extractor_base.classify_parse_status(structural) is ParseStatus.SUCCESS
+
+
+def test_syntax_issue_invalid_span_retains_only_a_complete_nested_call() -> None:
+    complete_data = b"@@ broken();"
+    complete_tree = parse_javascript_fixture(complete_data)
+    complete = extract_javascript_fixture(complete_data)
+
+    incomplete_data = b"@@ broken("
+    incomplete_tree = parse_javascript_fixture(incomplete_data)
+    incomplete = extract_javascript_fixture(incomplete_data)
+
+    assert complete_tree.root_node.has_error
+    assert complete.calls == (
+        CallSite(None, "broken", CallKind.CALL, SourceLocation(3, 11, 1, 3, 1, 11)),
+    )
+    assert extractor_base.classify_parse_status(complete) is ParseStatus.PARTIAL
+    assert incomplete_tree.root_node.has_error
+    assert incomplete.symbols == ()
+    assert incomplete.imports == ()
+    assert incomplete.calls == ()
+    assert extractor_base.classify_parse_status(incomplete) is ParseStatus.FAILED
 
 
 @pytest.mark.parametrize(
