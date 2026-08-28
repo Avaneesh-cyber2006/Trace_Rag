@@ -478,6 +478,34 @@ class Item:
     ]
 
 
+def test_python_extractor_retains_untyped_splat_parameter_identifiers() -> None:
+    data = b'''def f(*args, **kwargs):
+    pass
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result.symbols[0].parameters == (
+        ParameterInfo("args", None, None),
+        ParameterInfo("kwargs", None, None),
+    )
+
+
+def test_python_extractor_normalizes_annotated_splats_without_losing_parameter_order() -> None:
+    data = b'''def annotated(prefix: str = "x", *args: int, flag: bool = True, **kwargs: object):
+    pass
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result.symbols[0].parameters == (
+        ParameterInfo("prefix", "str", '"x"'),
+        ParameterInfo("args", "int", None),
+        ParameterInfo("flag", "bool", "True"),
+        ParameterInfo("kwargs", "object", None),
+    )
+
+
 def test_python_extractor_emits_only_module_and_class_uppercase_constants() -> None:
     data = b'''MODULE_VALUE = 1
 lower = 2

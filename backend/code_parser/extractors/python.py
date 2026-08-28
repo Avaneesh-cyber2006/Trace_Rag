@@ -51,10 +51,15 @@ def _parameters(node: Node, capture: Callable[[Node], str]) -> tuple[ParameterIn
         name_node = child if child.type == "identifier" else child.child_by_field_name("name")
         if name_node is None and child.type == "typed_parameter" and child.named_children:
             name_node = child.named_children[0]
+        if name_node is None and child.type in {
+            "list_splat_pattern",
+            "dictionary_splat_pattern",
+        }:
+            name_node = child
         if name_node is None:
             continue
 
-        if name_node.type in {"list_splat", "dictionary_splat"}:
+        if name_node.type in {"list_splat_pattern", "dictionary_splat_pattern"}:
             nested_name = name_node.child_by_field_name("name")
             if nested_name is None and name_node.named_children:
                 nested_name = name_node.named_children[0]
@@ -276,4 +281,3 @@ class PythonExtractor:
         return normalize_extraction(
             ExtractionResult(tuple(symbols), tuple(imports), tuple(calls), issues)
         )
-
