@@ -1,7 +1,7 @@
 """Language adapters and shared extraction infrastructure."""
 
 from .base import BaseExtractor, ExtractionResult, get_extractor as _get_extractor
-from .ecmascript import JAVASCRIPT, EcmaScriptExtractor
+from .ecmascript import JAVASCRIPT, TSX, TYPESCRIPT, EcmaScriptExtractor
 from .java import JavaExtractor
 from .python import PythonExtractor
 
@@ -15,6 +15,10 @@ def get_extractor(extractor_key: str) -> BaseExtractor:
         return JavaExtractor()
     if extractor_key == "javascript":
         return EcmaScriptExtractor(mode=JAVASCRIPT)
+    if extractor_key == "typescript":
+        return EcmaScriptExtractor(mode=TYPESCRIPT)
+    if extractor_key == "tsx":
+        return EcmaScriptExtractor(mode=TSX)
     return _get_extractor(extractor_key)
 
 

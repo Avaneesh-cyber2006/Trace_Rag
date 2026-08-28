@@ -11,6 +11,7 @@ from tree_sitter import Language, Parser
 import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_python
+import tree_sitter_typescript
 
 from backend.code_parser.extractors import get_extractor
 from backend.code_parser.extractors import base as extractor_base
@@ -989,6 +990,16 @@ def extract_javascript_fixture(data: bytes) -> ExtractionResult:
     return get_extractor("javascript").extract(parse_javascript_fixture(data), source)
 
 
+def parse_typescript_fixture(data: bytes):
+    parser = Parser(Language(tree_sitter_typescript.language_typescript()))
+    return parser.parse(data)
+
+
+def extract_typescript_fixture(data: bytes) -> ExtractionResult:
+    source = SourceBuffer(data, data, 0)
+    return get_extractor("typescript").extract(parse_typescript_fixture(data), source)
+
+
 def test_javascript_extractor_captures_primary_structure_and_original_ranges() -> None:
     data = b'''import api from "./api.js";
 
@@ -1324,6 +1335,271 @@ def test_javascript_extractor_keeps_decorator_calls_outside_method_ownership() -
         (None, "dec"),
         ("C.method", "body"),
     ]
+
+
+def test_typescript_extractor_captures_interfaces_types_and_original_ranges() -> None:
+    data = b'''import api, { User } from "./api";
+
+interface AuthProvider {
+    login(user: User, password?: string): Promise<boolean>;
+}
+
+export class AuthService implements AuthProvider {
+    async login(user: User, password = "guest"): Promise<boolean> {
+        return api.login(user, password);
+    }
+}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert result == ExtractionResult(
+        symbols=(
+            SymbolInfo(
+                "AuthProvider",
+                SymbolKind.INTERFACE,
+                "AuthProvider",
+                None,
+                SourceLocation(36, 122, 3, 0, 5, 1),
+                (),
+                None,
+                (),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "login",
+                SymbolKind.METHOD,
+                "AuthProvider.login",
+                "AuthProvider",
+                SourceLocation(65, 119, 4, 4, 4, 58),
+                (
+                    ParameterInfo("user", "User", None),
+                    ParameterInfo("password", "string", None),
+                ),
+                "Promise<boolean>",
+                (),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "AuthService",
+                SymbolKind.CLASS,
+                "AuthService",
+                None,
+                SourceLocation(131, 292, 7, 7, 11, 1),
+                (),
+                None,
+                ("export",),
+                (),
+                ("AuthProvider",),
+            ),
+            SymbolInfo(
+                "login",
+                SymbolKind.METHOD,
+                "AuthService.login",
+                "AuthService",
+                SourceLocation(179, 290, 8, 4, 10, 5),
+                (
+                    ParameterInfo("user", "User", None),
+                    ParameterInfo("password", None, '"guest"'),
+                ),
+                "Promise<boolean>",
+                ("async",),
+                (),
+                (),
+            ),
+        ),
+        imports=(
+            ImportInfo(
+                "./api",
+                (
+                    ImportBinding("default", "api"),
+                    ImportBinding("User", None),
+                ),
+                False,
+                (),
+                SourceLocation(0, 34, 1, 0, 1, 34),
+            ),
+        ),
+        calls=(
+            CallSite(
+                "AuthService.login",
+                "api.login",
+                CallKind.CALL,
+                SourceLocation(258, 283, 9, 15, 9, 40),
+            ),
+        ),
+        issues=(),
+    )
+    assert [data[item.location.start_byte : item.location.end_byte] for item in result.symbols] == [
+        data[36:122],
+        data[65:119],
+        data[131:292],
+        data[179:290],
+    ]
+
+
+def test_typescript_extractor_applies_typed_declaration_and_exclusion_policies() -> None:
+    data = b'''interface Auditable extends Serializable, Identifiable {
+    format(value?: string): string;
+}
+
+class Service extends Base implements Auditable, Disposable {
+    process(value: string): string;
+    process(value: number): string;
+    process(value: string | number): string { return String(value); }
+    configure(optional?: number, ...labels: string[], limit: number = 3, { enabled }: Options = defaults): void {
+        consume(optional);
+    }
+    ordinary: string;
+    static readonly VERSION: string = "1";
+}
+
+type Alias = string;
+const handler = (input: string): boolean => check(input);
+const LIMIT: number = 3;
+function outer() {
+    const LOCAL = 1;
+    [1].map((item: number) => use(item));
+}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.INTERFACE, "Auditable"),
+        (SymbolKind.METHOD, "Auditable.format"),
+        (SymbolKind.CLASS, "Service"),
+        (SymbolKind.METHOD, "Service.process"),
+        (SymbolKind.METHOD, "Service.process"),
+        (SymbolKind.METHOD, "Service.process"),
+        (SymbolKind.METHOD, "Service.configure"),
+        (SymbolKind.CONSTANT, "Service.VERSION"),
+        (SymbolKind.FUNCTION, "handler"),
+        (SymbolKind.CONSTANT, "LIMIT"),
+        (SymbolKind.FUNCTION, "outer"),
+    ]
+    auditable, service = result.symbols[0], result.symbols[2]
+    assert auditable.base_types == ("Serializable", "Identifiable")
+    assert service.base_types == ("Base",)
+    assert service.implemented_types == ("Auditable", "Disposable")
+    overloads = [item for item in result.symbols if item.qualified_name == "Service.process"]
+    assert [(item.location.start_byte, item.location.end_byte) for item in overloads] == [
+        (162, 192),
+        (198, 228),
+        (234, 299),
+    ]
+    assert [item.parameters for item in overloads] == [
+        (ParameterInfo("value", "string", None),),
+        (ParameterInfo("value", "number", None),),
+        (ParameterInfo("value", "string | number", None),),
+    ]
+    configure = next(item for item in result.symbols if item.qualified_name == "Service.configure")
+    assert configure.parameters == (
+        ParameterInfo("optional", "number", None),
+        ParameterInfo("labels", "string[]", None),
+        ParameterInfo("limit", "number", "3"),
+        ParameterInfo("{ enabled }", "Options", "defaults"),
+    )
+    assert configure.return_type == "void"
+    version = next(item for item in result.symbols if item.qualified_name == "Service.VERSION")
+    assert (version.kind, version.modifiers) == (
+        SymbolKind.CONSTANT,
+        ("static", "readonly"),
+    )
+    handler = next(item for item in result.symbols if item.qualified_name == "handler")
+    assert handler.parameters == (ParameterInfo("input", "string", None),)
+    assert handler.return_type == "boolean"
+    assert all(
+        item.name not in {"Alias", "ordinary", "LOCAL", "item"}
+        for item in result.symbols
+    )
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        ("Service.process", "String"),
+        ("Service.configure", "consume"),
+        ("handler", "check"),
+        ("outer", "[1].map"),
+        ("outer", "use"),
+    ]
+    assert result.issues == ()
+
+
+def test_typescript_extractor_normalizes_abstract_and_accessibility_modifiers() -> None:
+    data = b'''abstract class Worker {
+    private static readonly TOKEN = "x";
+    abstract run(input: string): number;
+}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert [
+        (item.kind, item.qualified_name, item.modifiers)
+        for item in result.symbols
+    ] == [
+        (SymbolKind.CLASS, "Worker", ("abstract",)),
+        (
+            SymbolKind.CONSTANT,
+            "Worker.TOKEN",
+            ("private", "static", "readonly"),
+        ),
+        (SymbolKind.METHOD, "Worker.run", ("abstract",)),
+    ]
+    assert result.symbols[-1].parameters == (
+        ParameterInfo("input", "string", None),
+    )
+    assert result.symbols[-1].return_type == "number"
+
+
+def test_tsx_extractor_uses_registry_grammar_without_jsx_symbol_noise() -> None:
+    data = b'''type Props = { onLogin: () => void };
+
+export function LoginButton({ onLogin }: Props): JSX.Element {
+    return <button onClick={() => onLogin()}>Login</button>;
+}
+'''
+    file = scanned_file(
+        "src/LoginButton.tsx",
+        language="typescript",
+        extension=".tsx",
+    )
+    registry = ParserRegistry()
+    spec = registry.select(file)
+
+    assert spec is not None
+    assert (spec.language, spec.extractor_key) == (ParsedLanguage.TSX, "tsx")
+    handle = registry.get_parser(spec)
+    source = SourceBuffer(data, data, 0)
+    result = get_extractor(spec.extractor_key).extract(handle.parser.parse(data), source)
+
+    assert result == ExtractionResult(
+        symbols=(
+            SymbolInfo(
+                "LoginButton",
+                SymbolKind.FUNCTION,
+                "LoginButton",
+                None,
+                SourceLocation(46, 164, 3, 7, 5, 1),
+                (ParameterInfo("{ onLogin }", "Props", None),),
+                "JSX.Element",
+                ("export",),
+                (),
+                (),
+            ),
+        ),
+        imports=(),
+        calls=(
+            CallSite(
+                "LoginButton",
+                "onLogin",
+                CallKind.CALL,
+                SourceLocation(136, 145, 4, 34, 4, 43),
+            ),
+        ),
+        issues=(),
+    )
+    assert all(item.name not in {"Props", "button", "onClick"} for item in result.symbols)
 
 
 def test_jsx_extractor_ignores_elements_and_keeps_expression_container_calls() -> None:

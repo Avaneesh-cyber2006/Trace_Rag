@@ -39,7 +39,19 @@ _FUNCTION_VALUES = frozenset(
     {"arrow_function", "function_expression", "generator_function"}
 )
 _DIRECT_MODIFIERS = frozenset(
-    {"abstract", "async", "declare", "get", "override", "readonly", "set", "static"}
+    {
+        "abstract",
+        "async",
+        "declare",
+        "get",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "set",
+        "static",
+    }
 )
 _MAX_TEXT_BYTES = 1000
 _ELLIPSIS = "…"
@@ -51,9 +63,13 @@ class _EcmaScriptMode(str, Enum):
     """Closed grammar modes; later modes must opt into their own node sets."""
 
     JAVASCRIPT = "javascript"
+    TYPESCRIPT = "typescript"
+    TSX = "tsx"
 
 
 JAVASCRIPT = _EcmaScriptMode.JAVASCRIPT
+TYPESCRIPT = _EcmaScriptMode.TYPESCRIPT
+TSX = _EcmaScriptMode.TSX
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +88,28 @@ _MODE_NODE_SETS = {
         interface_declarations=frozenset(),
         method_declarations=frozenset({"method_definition"}),
         typed_declarations=False,
+    ),
+    TYPESCRIPT: _ModeNodeSets(
+        class_declarations=frozenset(
+            {"abstract_class_declaration", "class_declaration"}
+        ),
+        class_expressions=frozenset({"class"}),
+        interface_declarations=frozenset({"interface_declaration"}),
+        method_declarations=frozenset(
+            {"abstract_method_signature", "method_definition", "method_signature"}
+        ),
+        typed_declarations=True,
+    ),
+    TSX: _ModeNodeSets(
+        class_declarations=frozenset(
+            {"abstract_class_declaration", "class_declaration"}
+        ),
+        class_expressions=frozenset({"class"}),
+        interface_declarations=frozenset({"interface_declaration"}),
+        method_declarations=frozenset(
+            {"abstract_method_signature", "method_definition", "method_signature"}
+        ),
+        typed_declarations=True,
     ),
 }
 
@@ -120,6 +158,12 @@ def _direct_modifiers(node: Node) -> tuple[str, ...]:
     for child in node.children:
         if child.type in _DIRECT_MODIFIERS:
             modifiers.append(child.type)
+        elif child.type == "accessibility_modifier":
+            modifiers.extend(
+                nested.type
+                for nested in child.children
+                if nested.type in _DIRECT_MODIFIERS
+            )
         elif child.type == "*":
             modifiers.append("generator")
     return tuple(modifiers)
@@ -129,7 +173,46 @@ def _modifiers(node: Node) -> tuple[str, ...]:
     return (*_direct_modifiers(node), *_export_modifiers(node))
 
 
-def _parameter(node: Node, capture: Callable[[Node], str]) -> ParameterInfo:
+def _type_text(node: Node | None, capture: Callable[[Node], str]) -> str | None:
+    if node is None:
+        return None
+    declared = next(iter(node.named_children), None)
+    return capture(node) if declared is None else capture(declared)
+
+
+def _parameter_name(pattern: Node, capture: Callable[[Node], str]) -> str:
+    if pattern.type != "rest_pattern":
+        return capture(pattern)
+    declared = next(
+        (
+            child
+            for child in pattern.named_children
+            if child.type in {"array_pattern", "identifier", "object_pattern"}
+        ),
+        None,
+    )
+    return capture(pattern) if declared is None else capture(declared)
+
+
+def _typed_parameter(node: Node, capture: Callable[[Node], str]) -> ParameterInfo:
+    pattern = node.child_by_field_name("pattern")
+    declared_type = _type_text(node.child_by_field_name("type"), capture)
+    default = node.child_by_field_name("value")
+    return ParameterInfo(
+        capture(node) if pattern is None else _parameter_name(pattern, capture),
+        declared_type,
+        None if default is None else capture(default),
+    )
+
+
+def _parameter(
+    node: Node,
+    capture: Callable[[Node], str],
+    typed_declarations: bool,
+) -> ParameterInfo:
+    if typed_declarations and node.type in {"optional_parameter", "required_parameter"}:
+        return _typed_parameter(node, capture)
+
     if node.type == "assignment_pattern":
         name = node.child_by_field_name("left")
         default = node.child_by_field_name("right")
@@ -140,29 +223,38 @@ def _parameter(node: Node, capture: Callable[[Node], str]) -> ParameterInfo:
         )
 
     if node.type == "rest_pattern":
-        name = next(
-            (
-                child
-                for child in node.named_children
-                if child.type in {
-                    "array_pattern",
-                    "identifier",
-                    "object_pattern",
-                }
-            ),
-            None,
-        )
-        return ParameterInfo(capture(node) if name is None else capture(name), None, None)
+        return ParameterInfo(_parameter_name(node, capture), None, None)
 
     return ParameterInfo(capture(node), None, None)
 
 
-def _parameters(node: Node, capture: Callable[[Node], str]) -> tuple[ParameterInfo, ...]:
+def _parameters(
+    node: Node,
+    capture: Callable[[Node], str],
+    typed_declarations: bool,
+) -> tuple[ParameterInfo, ...]:
     parameters = node.child_by_field_name("parameters")
     if parameters is not None:
-        return tuple(_parameter(child, capture) for child in parameters.named_children)
+        return tuple(
+            _parameter(child, capture, typed_declarations)
+            for child in parameters.named_children
+        )
     parameter = node.child_by_field_name("parameter")
-    return () if parameter is None else (_parameter(parameter, capture),)
+    return (
+        ()
+        if parameter is None
+        else (_parameter(parameter, capture, typed_declarations),)
+    )
+
+
+def _return_type(
+    node: Node,
+    capture: Callable[[Node], str],
+    typed_declarations: bool,
+) -> str | None:
+    if not typed_declarations:
+        return None
+    return _type_text(node.child_by_field_name("return_type"), capture)
 
 
 def _class_bases(node: Node, capture: Callable[[Node], str]) -> tuple[str, ...]:
@@ -173,6 +265,37 @@ def _class_bases(node: Node, capture: Callable[[Node], str]) -> tuple[str, ...]:
     if heritage is None:
         return ()
     return tuple(capture(child) for child in heritage.named_children)
+
+
+def _typescript_class_relationships(
+    node: Node,
+    capture: Callable[[Node], str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    heritage = next(
+        (child for child in node.named_children if child.type == "class_heritage"),
+        None,
+    )
+    if heritage is None:
+        return (), ()
+    bases: list[str] = []
+    implemented: list[str] = []
+    for clause in heritage.named_children:
+        if clause.type == "extends_clause":
+            bases.extend(capture(child) for child in clause.named_children)
+        elif clause.type == "implements_clause":
+            implemented.extend(capture(child) for child in clause.named_children)
+    return tuple(bases), tuple(implemented)
+
+
+def _interface_bases(
+    node: Node,
+    capture: Callable[[Node], str],
+) -> tuple[str, ...]:
+    clause = next(
+        (child for child in node.named_children if child.type == "extends_type_clause"),
+        None,
+    )
+    return () if clause is None else tuple(capture(child) for child in clause.named_children)
 
 
 def _bounded_raw_text(value: bytes) -> tuple[str, bool]:
@@ -428,6 +551,14 @@ class EcmaScriptExtractor:
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, name)
+                if node_sets.typed_declarations:
+                    base_types, implemented_types = _typescript_class_relationships(
+                        node,
+                        capture,
+                    )
+                else:
+                    base_types = _class_bases(node, capture)
+                    implemented_types = ()
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -438,14 +569,40 @@ class EcmaScriptExtractor:
                         (),
                         None,
                         _modifiers(node),
-                        _class_bases(node, capture),
-                        (),
+                        base_types,
+                        implemented_types,
                     )
                 )
                 body = node.child_by_field_name("body")
                 if body is not None:
                     extracted_class_bodies.add(_node_key(body))
                 push_scope(node, qualified, "class")
+                continue
+
+            if node.type in node_sets.interface_declarations:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    continue
+                name = capture(name_node)
+                qualified, parent = _qualified_name(scopes, name)
+                symbols.append(
+                    SymbolInfo(
+                        name,
+                        SymbolKind.INTERFACE,
+                        qualified,
+                        parent,
+                        source_location(node, source),
+                        (),
+                        None,
+                        _modifiers(node),
+                        _interface_bases(node, capture),
+                        (),
+                    )
+                )
+                body = node.child_by_field_name("body")
+                if body is not None:
+                    extracted_class_bodies.add(_node_key(body))
+                push_scope(node, qualified, "interface")
                 continue
 
             if node.type in _FUNCTION_DECLARATIONS:
@@ -461,8 +618,8 @@ class EcmaScriptExtractor:
                         qualified,
                         parent,
                         source_location(node, source),
-                        _parameters(node, capture),
-                        None,
+                        _parameters(node, capture, node_sets.typed_declarations),
+                        _return_type(node, capture, node_sets.typed_declarations),
                         _modifiers(node),
                         (),
                         (),
@@ -476,7 +633,7 @@ class EcmaScriptExtractor:
                     node.parent is None
                     or _node_key(node.parent) not in extracted_class_bodies
                     or not scopes
-                    or scopes[-1].kind != "class"
+                    or scopes[-1].kind not in {"class", "interface"}
                 ):
                     continue
                 name_node = node.child_by_field_name("name")
@@ -486,7 +643,7 @@ class EcmaScriptExtractor:
                 qualified, parent = _qualified_name(scopes, name)
                 kind = (
                     SymbolKind.CONSTRUCTOR
-                    if name == "constructor"
+                    if name == "constructor" and scopes[-1].kind == "class"
                     else SymbolKind.METHOD
                 )
                 symbols.append(
@@ -496,8 +653,8 @@ class EcmaScriptExtractor:
                         qualified,
                         parent,
                         source_location(node, source),
-                        _parameters(node, capture),
-                        None,
+                        _parameters(node, capture, node_sets.typed_declarations),
+                        _return_type(node, capture, node_sets.typed_declarations),
                         _modifiers(node),
                         (),
                         (),
@@ -518,14 +675,49 @@ class EcmaScriptExtractor:
                         qualified,
                         parent,
                         source_location(node, source),
-                        _parameters(value, capture),
-                        None,
+                        _parameters(value, capture, node_sets.typed_declarations),
+                        _return_type(value, capture, node_sets.typed_declarations),
                         (*_direct_modifiers(value), *_export_modifiers(node)),
                         (),
                         (),
                     )
                 )
                 push_scope(node, qualified, "callable")
+                continue
+
+            if (
+                node_sets.typed_declarations
+                and node.type == "public_field_definition"
+                and node.parent is not None
+                and _node_key(node.parent) in extracted_class_bodies
+                and scopes
+                and scopes[-1].kind == "class"
+            ):
+                field_modifiers = _direct_modifiers(node)
+                if not {"static", "readonly"}.issubset(field_modifiers):
+                    continue
+                name_node = node.child_by_field_name("name")
+                if name_node is None or name_node.type not in {
+                    "identifier",
+                    "property_identifier",
+                }:
+                    continue
+                name = capture(name_node)
+                qualified, parent = _qualified_name(scopes, name)
+                symbols.append(
+                    SymbolInfo(
+                        name,
+                        SymbolKind.CONSTANT,
+                        qualified,
+                        parent,
+                        source_location(node, source),
+                        (),
+                        None,
+                        field_modifiers,
+                        (),
+                        (),
+                    )
+                )
                 continue
 
             if node.type == "lexical_declaration" and _is_module_declaration(node):
