@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from tree_sitter import Language, Parser
 import tree_sitter_java
+import tree_sitter_javascript
 import tree_sitter_python
 
 from backend.code_parser.extractors import get_extractor
@@ -976,6 +977,281 @@ class Child extends /* base note */ Base {}
             result.imports[0].module,
         )
     )
+
+
+def parse_javascript_fixture(data: bytes):
+    parser = Parser(Language(tree_sitter_javascript.language()))
+    return parser.parse(data)
+
+
+def extract_javascript_fixture(data: bytes) -> ExtractionResult:
+    source = SourceBuffer(data, data, 0)
+    return get_extractor("javascript").extract(parse_javascript_fixture(data), source)
+
+
+def test_javascript_extractor_captures_primary_structure_and_original_ranges() -> None:
+    data = b'''import api from "./api.js";
+
+export default class AuthService {
+    constructor(client) {
+        this.client = client;
+    }
+
+    async login(user, password = "guest") {
+        return api.login(user, password);
+    }
+}
+
+export function logout(user) {
+    return api.logout(user);
+}
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert result == ExtractionResult(
+        symbols=(
+            SymbolInfo(
+                "AuthService",
+                SymbolKind.CLASS,
+                "AuthService",
+                None,
+                SourceLocation(44, 220, 3, 15, 11, 1),
+                (),
+                None,
+                ("export", "default"),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "constructor",
+                SymbolKind.CONSTRUCTOR,
+                "AuthService.constructor",
+                "AuthService",
+                SourceLocation(68, 125, 4, 4, 6, 5),
+                (ParameterInfo("client", None, None),),
+                None,
+                (),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "login",
+                SymbolKind.METHOD,
+                "AuthService.login",
+                "AuthService",
+                SourceLocation(131, 218, 8, 4, 10, 5),
+                (
+                    ParameterInfo("user", None, None),
+                    ParameterInfo("password", None, '"guest"'),
+                ),
+                None,
+                ("async",),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "logout",
+                SymbolKind.FUNCTION,
+                "logout",
+                None,
+                SourceLocation(229, 283, 13, 7, 15, 1),
+                (ParameterInfo("user", None, None),),
+                None,
+                ("export",),
+                (),
+                (),
+            ),
+        ),
+        imports=(
+            ImportInfo(
+                "./api.js",
+                (ImportBinding("default", "api"),),
+                False,
+                (),
+                SourceLocation(0, 27, 1, 0, 1, 27),
+            ),
+        ),
+        calls=(
+            CallSite(
+                "AuthService.login",
+                "api.login",
+                CallKind.CALL,
+                SourceLocation(186, 211, 9, 15, 9, 40),
+            ),
+            CallSite(
+                "logout",
+                "api.logout",
+                CallKind.CALL,
+                SourceLocation(264, 280, 14, 11, 14, 27),
+            ),
+        ),
+        issues=(),
+    )
+    assert all(symbol.return_type is None for symbol in result.symbols)
+    assert [data[item.location.start_byte : item.location.end_byte] for item in result.symbols] == [
+        data[44:220],
+        data[68:125],
+        data[131:218],
+        data[229:283],
+    ]
+
+
+def test_javascript_extractor_names_only_direct_function_bindings_and_inherits_callback_owner() -> None:
+    data = b'''function outer(items) {
+    const arrow = (value = 1) => work(value);
+    let expression = function internal(value) { return work2(value); };
+    assigned = async function(value) { return work3(value); };
+    items.map(item => transform(item));
+    return arrow(1);
+}
+setTimeout(() => tick(), 0);
+ignored ||= () => nope();
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert [
+        (item.qualified_name, item.parent_qualified_name, item.parameters, item.modifiers)
+        for item in result.symbols
+    ] == [
+        ("outer", None, (ParameterInfo("items", None, None),), ()),
+        ("outer.arrow", "outer", (ParameterInfo("value", None, "1"),), ()),
+        ("outer.expression", "outer", (ParameterInfo("value", None, None),), ()),
+        ("outer.assigned", "outer", (ParameterInfo("value", None, None),), ("async",)),
+    ]
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        ("outer.arrow", "work"),
+        ("outer.expression", "work2"),
+        ("outer.assigned", "work3"),
+        ("outer", "items.map"),
+        ("outer", "transform"),
+        ("outer", "arrow"),
+        (None, "setTimeout"),
+        (None, "tick"),
+        (None, "nope"),
+    ]
+    assert all(item.name not in {"ignored", "internal", "item"} for item in result.symbols)
+
+
+def test_javascript_extractor_limits_constants_and_keeps_bounded_call_syntax() -> None:
+    data = b'''const LIMIT = 3;
+const { FIRST } = settings;
+const helper = () => {
+    const LOCAL = 1;
+    new Client();
+    registry[key](LOCAL);
+};
+class Child extends framework.Base {}
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.CONSTANT, "LIMIT"),
+        (SymbolKind.FUNCTION, "helper"),
+        (SymbolKind.CLASS, "Child"),
+    ]
+    assert result.symbols[-1].base_types == ("framework.Base",)
+    assert all(item.name not in {"FIRST", "LOCAL"} for item in result.symbols)
+    assert [(item.caller_qualified_name, item.callee_text, item.kind) for item in result.calls] == [
+        ("helper", "Client", CallKind.CONSTRUCTOR),
+        ("helper", "registry[key]", CallKind.CALL),
+    ]
+
+
+def test_javascript_extractor_normalizes_es_and_commonjs_import_policies() -> None:
+    data = b'''import "./setup.js";
+import defaultApi, { readFile as read, writeFile } from "lib";
+import * as path from "path";
+const fs = require("fs");
+const { join: combine, resolve } = require("path-tools");
+require("side");
+require(name);
+import("lazy");
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert result.imports == (
+        ImportInfo("./setup.js", (), False, (), SourceLocation(0, 20, 1, 0, 1, 20)),
+        ImportInfo(
+            "lib",
+            (
+                ImportBinding("default", "defaultApi"),
+                ImportBinding("readFile", "read"),
+                ImportBinding("writeFile", None),
+            ),
+            False,
+            (),
+            SourceLocation(21, 83, 2, 0, 2, 62),
+        ),
+        ImportInfo(
+            "path",
+            (ImportBinding("*", "path"),),
+            True,
+            (),
+            SourceLocation(84, 113, 3, 0, 3, 29),
+        ),
+        ImportInfo(
+            "fs",
+            (ImportBinding("*", "fs"),),
+            True,
+            (),
+            SourceLocation(125, 138, 4, 11, 4, 24),
+        ),
+        ImportInfo(
+            "path-tools",
+            (
+                ImportBinding("join", "combine"),
+                ImportBinding("resolve", None),
+            ),
+            False,
+            (),
+            SourceLocation(175, 196, 5, 35, 5, 56),
+        ),
+        ImportInfo("side", (), False, (), SourceLocation(198, 213, 6, 0, 6, 15)),
+    )
+    assert [(item.callee_text, item.kind) for item in result.calls] == [
+        ("require", CallKind.CALL),
+        ("require", CallKind.CALL),
+        ("require", CallKind.CALL),
+        ("require", CallKind.CALL),
+        ("import", CallKind.CALL),
+    ]
+    assert [item.module for item in result.imports] == [
+        "./setup.js",
+        "lib",
+        "path",
+        "fs",
+        "path-tools",
+        "side",
+    ]
+
+
+def test_jsx_extractor_ignores_elements_and_keeps_expression_container_calls() -> None:
+    data = b'''export function LoginPanel({ user }) {
+    return <Panel onClick={() => clicked()}>{format(user)}<Widget /></Panel>;
+}
+'''
+    tree = parse_javascript_fixture(data)
+
+    result = get_extractor("javascript").extract(tree, SourceBuffer(data, data, 0))
+
+    assert not tree.root_node.has_error
+    assert [(item.kind, item.qualified_name, item.parameters) for item in result.symbols] == [
+        (
+            SymbolKind.FUNCTION,
+            "LoginPanel",
+            (ParameterInfo("{ user }", None, None),),
+        ),
+    ]
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        ("LoginPanel", "clicked"),
+        ("LoginPanel", "format"),
+    ]
+    assert result.imports == ()
+    assert result.issues == ()
 
 
 @pytest.mark.parametrize(
