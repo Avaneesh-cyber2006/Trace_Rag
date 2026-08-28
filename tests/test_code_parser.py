@@ -10,6 +10,7 @@ import pytest
 from tree_sitter import Language, Parser
 import tree_sitter_python
 
+from backend.code_parser.extractors import get_extractor
 from backend.code_parser.extractors import base as extractor_base
 from backend.code_parser.extractors.base import (
     ENTER,
@@ -262,6 +263,371 @@ def test_modifier_order_is_fixed_and_ignores_unknown_values() -> None:
     assert normalize_modifiers(
         ("generator", "PRIVATE", "readonly", "async", "static", "private", "unknown")
     ) == ("private", "static", "async", "readonly", "generator")
+
+
+def extract_python_fixture(data: bytes) -> ExtractionResult:
+    source = SourceBuffer(data, data, 0)
+    return get_extractor("python").extract(parse_python_fixture(data), source)
+
+
+def test_python_extractor_captures_primary_structure_and_original_ranges() -> None:
+    data = b'''import os
+from app.services import AuthService as Service
+
+class UserController(BaseController):
+    def __init__(self, service: Service = Service()) -> None:
+        self.service = service
+
+    def login(self, email: str = "guest") -> bool:
+        return self.service.authenticate(email)
+
+def helper(value: int) -> str:
+    return str(value)
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result == ExtractionResult(
+        symbols=(
+            SymbolInfo(
+                "UserController",
+                SymbolKind.CLASS,
+                "UserController",
+                None,
+                SourceLocation(59, 289, 4, 0, 9, 47),
+                (),
+                None,
+                (),
+                ("BaseController",),
+                (),
+            ),
+            SymbolInfo(
+                "__init__",
+                SymbolKind.CONSTRUCTOR,
+                "UserController.__init__",
+                "UserController",
+                SourceLocation(101, 189, 5, 4, 6, 30),
+                (
+                    ParameterInfo("self", None, None),
+                    ParameterInfo("service", "Service", "Service()"),
+                ),
+                "None",
+                (),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "login",
+                SymbolKind.METHOD,
+                "UserController.login",
+                "UserController",
+                SourceLocation(195, 289, 8, 4, 9, 47),
+                (
+                    ParameterInfo("self", None, None),
+                    ParameterInfo("email", "str", '"guest"'),
+                ),
+                "bool",
+                (),
+                (),
+                (),
+            ),
+            SymbolInfo(
+                "helper",
+                SymbolKind.FUNCTION,
+                "helper",
+                None,
+                SourceLocation(291, 343, 11, 0, 12, 21),
+                (ParameterInfo("value", "int", None),),
+                "str",
+                (),
+                (),
+                (),
+            ),
+        ),
+        imports=(
+            ImportInfo(
+                "os",
+                (ImportBinding("os", None),),
+                False,
+                (),
+                SourceLocation(0, 9, 1, 0, 1, 9),
+            ),
+            ImportInfo(
+                "app.services",
+                (ImportBinding("AuthService", "Service"),),
+                False,
+                (),
+                SourceLocation(10, 57, 2, 0, 2, 47),
+            ),
+        ),
+        calls=(
+            CallSite(
+                "UserController.__init__",
+                "Service",
+                CallKind.CALL,
+                SourceLocation(139, 148, 5, 42, 5, 51),
+            ),
+            CallSite(
+                "UserController.login",
+                "self.service.authenticate",
+                CallKind.CALL,
+                SourceLocation(257, 289, 9, 15, 9, 47),
+            ),
+            CallSite(
+                "helper",
+                "str",
+                CallKind.CALL,
+                SourceLocation(333, 343, 12, 11, 12, 21),
+            ),
+        ),
+        issues=(),
+    )
+    assert [data[item.location.start_byte : item.location.end_byte] for item in result.symbols] == [
+        data[59:289],
+        data[101:189],
+        data[195:289],
+        data[291:343],
+    ]
+
+
+def test_python_extractor_keeps_async_declaration_and_decorator_call_ownership() -> None:
+    data = b'''@register(factory())
+async def fetch(value: Input = default()) -> Output:
+    return await load(value)
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result.symbols == (
+        SymbolInfo(
+            "fetch",
+            SymbolKind.FUNCTION,
+            "fetch",
+            None,
+            SourceLocation(21, 102, 2, 0, 3, 28),
+            (ParameterInfo("value", "Input", "default()"),),
+            "Output",
+            ("async",),
+            (),
+            (),
+        ),
+    )
+    assert result.calls == (
+        CallSite(None, "register", CallKind.CALL, SourceLocation(1, 20, 1, 1, 1, 20)),
+        CallSite(None, "factory", CallKind.CALL, SourceLocation(10, 19, 1, 10, 1, 19)),
+        CallSite("fetch", "default", CallKind.CALL, SourceLocation(52, 61, 2, 31, 2, 40)),
+        CallSite("fetch", "load", CallKind.CALL, SourceLocation(91, 102, 3, 17, 3, 28)),
+    )
+    assert result.imports == ()
+    assert result.issues == ()
+    assert data[result.symbols[0].location.start_byte : result.symbols[0].location.end_byte].startswith(
+        b"async def fetch"
+    )
+
+
+def test_python_extractor_qualifies_nested_functions_and_owns_inner_calls() -> None:
+    data = b'''def outer():
+    def inner(value):
+        return transform(value)
+    return inner(1)
+'''
+
+    result = extract_python_fixture(data)
+
+    assert [(item.kind, item.qualified_name, item.parent_qualified_name) for item in result.symbols] == [
+        (SymbolKind.FUNCTION, "outer", None),
+        (SymbolKind.FUNCTION, "outer.inner", "outer"),
+    ]
+    assert result.calls == (
+        CallSite(
+            "outer.inner",
+            "transform",
+            CallKind.CALL,
+            SourceLocation(50, 66, 3, 15, 3, 31),
+        ),
+        CallSite("outer", "inner", CallKind.CALL, SourceLocation(78, 86, 4, 11, 4, 19)),
+    )
+
+
+def test_python_extractor_classifies_only_class_init_as_constructor() -> None:
+    data = b'''def __init__(self):
+    pass
+
+class Item:
+    def __init__(self):
+        build()
+
+    def refresh(cls):
+        reset()
+'''
+
+    result = extract_python_fixture(data)
+
+    assert [(item.kind, item.qualified_name, item.parent_qualified_name) for item in result.symbols] == [
+        (SymbolKind.FUNCTION, "__init__", None),
+        (SymbolKind.CLASS, "Item", None),
+        (SymbolKind.CONSTRUCTOR, "Item.__init__", "Item"),
+        (SymbolKind.METHOD, "Item.refresh", "Item"),
+    ]
+    assert result.symbols[0].parameters == (ParameterInfo("self", None, None),)
+    assert result.symbols[2].parameters == (ParameterInfo("self", None, None),)
+    assert result.symbols[3].parameters == (ParameterInfo("cls", None, None),)
+    assert [(item.caller_qualified_name, item.callee_text, item.kind) for item in result.calls] == [
+        ("Item.__init__", "build", CallKind.CALL),
+        ("Item.refresh", "reset", CallKind.CALL),
+    ]
+
+
+def test_python_extractor_emits_only_module_and_class_uppercase_constants() -> None:
+    data = b'''MODULE_VALUE = 1
+lower = 2
+
+class Settings:
+    CLASS_VALUE: int = 3
+    lower = 4
+
+    def update(self):
+        LOCAL_VALUE = 5
+        self.ATTRIBUTE_VALUE = 6
+'''
+
+    result = extract_python_fixture(data)
+
+    constants = [item for item in result.symbols if item.kind is SymbolKind.CONSTANT]
+    assert constants == [
+        SymbolInfo(
+            "MODULE_VALUE",
+            SymbolKind.CONSTANT,
+            "MODULE_VALUE",
+            None,
+            SourceLocation(0, 16, 1, 0, 1, 16),
+            (),
+            None,
+            (),
+            (),
+            (),
+        ),
+        SymbolInfo(
+            "CLASS_VALUE",
+            SymbolKind.CONSTANT,
+            "Settings.CLASS_VALUE",
+            "Settings",
+            SourceLocation(48, 68, 5, 4, 5, 24),
+            (),
+            None,
+            (),
+            (),
+            (),
+        ),
+    ]
+    assert [item.qualified_name for item in result.symbols] == [
+        "MODULE_VALUE",
+        "Settings",
+        "Settings.CLASS_VALUE",
+        "Settings.update",
+    ]
+
+
+def test_python_extractor_normalizes_wildcard_relative_and_aliased_imports() -> None:
+    data = b'''from . import local
+from ..pkg import *
+import os.path as osp
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result.imports == (
+        ImportInfo(
+            ".",
+            (ImportBinding("local", None),),
+            False,
+            (),
+            SourceLocation(0, 19, 1, 0, 1, 19),
+        ),
+        ImportInfo(
+            "..pkg",
+            (),
+            True,
+            (),
+            SourceLocation(20, 39, 2, 0, 2, 19),
+        ),
+        ImportInfo(
+            "os.path",
+            (ImportBinding("os.path", "osp"),),
+            False,
+            (),
+            SourceLocation(40, 61, 3, 0, 3, 21),
+        ),
+    )
+
+
+def test_python_extractor_keeps_class_looking_invocations_as_plain_calls() -> None:
+    data = b'''def make():
+    return User()
+'''
+
+    result = extract_python_fixture(data)
+
+    assert result.calls == (
+        CallSite("make", "User", CallKind.CALL, SourceLocation(23, 29, 2, 11, 2, 17)),
+    )
+
+
+def test_python_extractor_bounds_declared_text_and_reports_one_issue() -> None:
+    type_name = b"T" * 1001
+    default_name = b"D" * 1001
+    return_name = b"R" * 1001
+    callee_name = b"C" * 1001
+    data = (
+        b"def bounded(value: "
+        + type_name
+        + b" = "
+        + default_name
+        + b") -> "
+        + return_name
+        + b":\n    return "
+        + callee_name
+        + b"()\n"
+    )
+
+    result = extract_python_fixture(data)
+
+    assert len(result.symbols) == 1
+    assert result.symbols[0].name == "bounded"
+    assert result.symbols[0].parameters == (
+        ParameterInfo("value", ("T" * 997) + "…", ("D" * 997) + "…"),
+    )
+    assert result.symbols[0].return_type == ("R" * 997) + "…"
+    assert result.calls[0].callee_text == ("C" * 997) + "…"
+    assert result.calls[0].kind is CallKind.CALL
+    call_location = result.calls[0].location
+    assert data[call_location.start_byte : call_location.end_byte] == callee_name + b"()"
+    assert result.issues == (
+        ParseIssue(
+            ParseIssueKind.EXTRACTION_ERROR,
+            "Extracted text exceeded the 1,000-byte limit.",
+            None,
+        ),
+    )
+
+
+def test_python_extractor_ignores_comments_and_docstrings_as_metadata() -> None:
+    data = b'''"""module docs"""
+# note
+def documented():
+    """function docs"""
+    return None
+'''
+
+    result = extract_python_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.FUNCTION, "documented"),
+    ]
+    assert result.imports == ()
+    assert result.calls == ()
+    assert result.issues == ()
+    assert not hasattr(result.symbols[0], "metadata")
 
 
 @pytest.mark.parametrize(
