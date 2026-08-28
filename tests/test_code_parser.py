@@ -1229,6 +1229,81 @@ import("lazy");
     ]
 
 
+def test_javascript_extractor_bounds_unquoted_long_literal_modules_without_losing_imports() -> None:
+    es_module = "e" * 1001
+    commonjs_module = "c" * 1001
+    data = (
+        f'import "{es_module}";\nrequire("{commonjs_module}");\n'.encode("utf-8")
+    )
+
+    result = extract_javascript_fixture(data)
+
+    bounded_es = ("e" * 997) + "…"
+    bounded_commonjs = ("c" * 997) + "…"
+    assert [(item.module, item.bindings) for item in result.imports] == [
+        (bounded_es, ()),
+        (bounded_commonjs, ()),
+    ]
+    assert result.calls == (
+        CallSite(
+            None,
+            "require",
+            CallKind.CALL,
+            SourceLocation(1012, 2024, 2, 0, 2, 1012),
+        ),
+    )
+    assert result.issues == (
+        ParseIssue(
+            ParseIssueKind.EXTRACTION_ERROR,
+            "Extracted text exceeded the 1,000-byte limit.",
+            None,
+        ),
+    )
+
+
+def test_javascript_extractor_excludes_members_of_unextracted_class_expressions() -> None:
+    data = b'''export default class {
+    constructor() { build(); }
+    method() { run(); }
+}
+const C = class {
+    constructor() { initialize(); }
+    method() { execute(); }
+};
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.CONSTANT, "C"),
+    ]
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        (None, "build"),
+        (None, "run"),
+        (None, "initialize"),
+        (None, "execute"),
+    ]
+
+
+def test_javascript_extractor_keeps_decorator_calls_outside_method_ownership() -> None:
+    data = b'''class C {
+    @dec()
+    method() { body(); }
+}
+'''
+
+    result = extract_javascript_fixture(data)
+
+    assert [(item.kind, item.qualified_name) for item in result.symbols] == [
+        (SymbolKind.CLASS, "C"),
+        (SymbolKind.METHOD, "C.method"),
+    ]
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        (None, "dec"),
+        ("C.method", "body"),
+    ]
+
+
 def test_jsx_extractor_ignores_elements_and_keeps_expression_container_calls() -> None:
     data = b'''export function LoginPanel({ user }) {
     return <Panel onClick={() => clicked()}>{format(user)}<Widget /></Panel>;

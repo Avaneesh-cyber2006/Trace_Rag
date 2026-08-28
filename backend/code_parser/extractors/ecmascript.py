@@ -41,6 +41,9 @@ _FUNCTION_VALUES = frozenset(
 _DIRECT_MODIFIERS = frozenset(
     {"abstract", "async", "declare", "get", "override", "readonly", "set", "static"}
 )
+_MAX_TEXT_BYTES = 1000
+_ELLIPSIS = "…"
+_ELLIPSIS_BYTES = _ELLIPSIS.encode("utf-8")
 _SCOPE_KEY = tuple[str, int, int]
 
 
@@ -170,13 +173,30 @@ def _class_bases(node: Node, capture: Callable[[Node], str]) -> tuple[str, ...]:
     return tuple(capture(child) for child in heritage.named_children)
 
 
-def _string_value(node: Node | None, capture: Callable[[Node], str]) -> str | None:
+def _bounded_raw_text(value: bytes) -> tuple[str, bool]:
+    if len(value) <= _MAX_TEXT_BYTES:
+        return value.decode("utf-8", errors="strict"), False
+    prefix = value[: _MAX_TEXT_BYTES - len(_ELLIPSIS_BYTES)]
+    while prefix:
+        try:
+            return prefix.decode("utf-8", errors="strict") + _ELLIPSIS, True
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+    return _ELLIPSIS, True
+
+
+def _string_value(
+    node: Node | None,
+    source: SourceBuffer,
+) -> tuple[str, bool] | None:
     if node is None or node.type != "string":
         return None
-    value = capture(node)
-    if len(value) < 2 or value[0] not in {'"', "'"} or value[-1] != value[0]:
+    if not 0 <= node.start_byte <= node.end_byte <= len(source.parse_bytes):
+        raise ValueError("Tree-sitter string range is outside the source buffer.")
+    value = source.parse_bytes[node.start_byte : node.end_byte]
+    if len(value) < 2 or value[:1] not in {b'"', b"'"} or value[-1:] != value[:1]:
         return None
-    return value[1:-1]
+    return _bounded_raw_text(value[1:-1])
 
 
 def _import_specifier(
@@ -194,8 +214,9 @@ def _es_import(
     node: Node,
     source: SourceBuffer,
     capture: Callable[[Node], str],
+    capture_module: Callable[[Node | None], str | None],
 ) -> ImportInfo | None:
-    module = _string_value(node.child_by_field_name("source"), capture)
+    module = capture_module(node.child_by_field_name("source"))
     if module is None:
         return None
 
@@ -275,6 +296,7 @@ def _commonjs_import(
     node: Node,
     source: SourceBuffer,
     capture: Callable[[Node], str],
+    capture_module: Callable[[Node | None], str | None],
 ) -> ImportInfo | None:
     function = node.child_by_field_name("function")
     if function is None or function.type != "identifier" or capture(function) != "require":
@@ -282,7 +304,7 @@ def _commonjs_import(
     arguments = node.child_by_field_name("arguments")
     if arguments is None or len(arguments.named_children) != 1:
         return None
-    module = _string_value(arguments.named_children[0], capture)
+    module = capture_module(arguments.named_children[0])
     if module is None:
         return None
     bindings, wildcard = _commonjs_bindings(node, capture)
@@ -345,6 +367,7 @@ class EcmaScriptExtractor:
         scopes: list[_LexicalScope] = []
         ownership_scopes: list[str | None] = []
         pushed_scopes: set[_SCOPE_KEY] = set()
+        extracted_class_bodies: set[_SCOPE_KEY] = set()
         captured_truncated_text = False
 
         def capture(node: Node) -> str:
@@ -353,10 +376,27 @@ class EcmaScriptExtractor:
             captured_truncated_text |= bounded.was_truncated
             return bounded.text
 
+        def capture_module(node: Node | None) -> str | None:
+            nonlocal captured_truncated_text
+            bounded = _string_value(node, source)
+            if bounded is None:
+                return None
+            text, was_truncated = bounded
+            captured_truncated_text |= was_truncated
+            return text
+
         def push_scope(node: Node, qualified_name: str, kind: str) -> None:
             scopes.append(_LexicalScope(qualified_name, kind))
             ownership_scopes.append(qualified_name if kind == "callable" else None)
             pushed_scopes.add(_node_key(node))
+
+        def call_owner(node: Node) -> str | None:
+            ancestor = node.parent
+            while ancestor is not None:
+                if ancestor.type == "decorator":
+                    return ownership_scopes[-2] if len(ownership_scopes) > 1 else None
+                ancestor = ancestor.parent
+            return ownership_scopes[-1] if ownership_scopes else None
 
         for event in iter_events(tree.root_node):
             node = event.node
@@ -388,6 +428,9 @@ class EcmaScriptExtractor:
                         (),
                     )
                 )
+                body = node.child_by_field_name("body")
+                if body is not None:
+                    extracted_class_bodies.add(_node_key(body))
                 push_scope(node, qualified, "class")
                 continue
 
@@ -415,7 +458,12 @@ class EcmaScriptExtractor:
                 continue
 
             if node.type in node_sets.method_declarations:
-                if node.parent is None or node.parent.type != "class_body":
+                if (
+                    node.parent is None
+                    or _node_key(node.parent) not in extracted_class_bodies
+                    or not scopes
+                    or scopes[-1].kind != "class"
+                ):
                     continue
                 name_node = node.child_by_field_name("name")
                 if name_node is None:
@@ -502,20 +550,25 @@ class EcmaScriptExtractor:
                 continue
 
             if node.type == "import_statement":
-                imported = _es_import(node, source, capture)
+                imported = _es_import(node, source, capture, capture_module)
                 if imported is not None:
                     imports.append(imported)
                 continue
 
             if node.type == "call_expression":
-                imported = _commonjs_import(node, source, capture)
+                imported = _commonjs_import(
+                    node,
+                    source,
+                    capture,
+                    capture_module,
+                )
                 if imported is not None:
                     imports.append(imported)
                 function = node.child_by_field_name("function")
                 if function is not None:
                     calls.append(
                         CallSite(
-                            ownership_scopes[-1] if ownership_scopes else None,
+                            call_owner(node),
                             capture(function),
                             CallKind.CALL,
                             source_location(node, source),
@@ -528,7 +581,7 @@ class EcmaScriptExtractor:
                 if constructor is not None:
                     calls.append(
                         CallSite(
-                            ownership_scopes[-1] if ownership_scopes else None,
+                            call_owner(node),
                             capture(constructor),
                             CallKind.CONSTRUCTOR,
                             source_location(node, source),
