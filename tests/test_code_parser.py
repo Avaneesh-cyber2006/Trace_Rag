@@ -1,4 +1,8 @@
+import codecs
 from dataclasses import FrozenInstanceError
+import os
+from pathlib import Path
+import stat
 
 import pytest
 from tree_sitter import Language
@@ -15,6 +19,13 @@ from backend.code_parser.registry import (
     ParserRegistry,
     ParserSpec,
     ParserUnavailable,
+)
+import backend.code_parser.reader as reader_module
+from backend.code_parser.reader import (
+    SafeSourceReader,
+    SourceBuffer,
+    SourceReadError,
+    is_reparse_metadata,
 )
 from backend.file_scanner.models import FileCategory, ScannedFile
 from backend.code_parser.models import (
@@ -219,6 +230,398 @@ def scanned_file(
         category=FileCategory.SOURCE,
         size_bytes=0,
     )
+
+
+def write_inventory_file(
+    root: Path,
+    relative_path: str,
+    data: bytes,
+    language: str | None,
+) -> ScannedFile:
+    path = root.joinpath(*relative_path.split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return ScannedFile(
+        relative_path=relative_path,
+        filename=relative_path.rsplit("/", maxsplit=1)[-1],
+        extension=Path(relative_path).suffix,
+        language=language,
+        category=FileCategory.SOURCE,
+        size_bytes=len(data),
+    )
+
+
+def source_candidate(relative_path: str, size_bytes: int = 0) -> ScannedFile:
+    return ScannedFile(
+        relative_path=relative_path,
+        filename=relative_path.rsplit("/", maxsplit=1)[-1],
+        extension=".py",
+        language="python",
+        category=FileCategory.SOURCE,
+        size_bytes=size_bytes,
+    )
+
+
+def platform_opener_name() -> str:
+    return "_open_verified_windows" if os.name == "nt" else "_open_verified_posix"
+
+
+def replace_platform_opener(
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: object,
+) -> None:
+    monkeypatch.setattr(reader_module, platform_opener_name(), replacement)
+
+
+class MutatingReadStream:
+    def __init__(
+        self,
+        stream: object,
+        *,
+        before_read: object | None = None,
+        after_read: object | None = None,
+        after_close: object | None = None,
+        trigger_call: int = 1,
+    ) -> None:
+        self._stream = stream
+        self._before_read = before_read
+        self._after_read = after_read
+        self._after_close = after_close
+        self._trigger_call = trigger_call
+        self._read_calls = 0
+
+    def fileno(self) -> int:
+        return self._stream.fileno()  # type: ignore[no-any-return, union-attr]
+
+    def read(self, size: int = -1) -> bytes:
+        self._read_calls += 1
+        if self._read_calls == self._trigger_call and self._before_read is not None:
+            self._before_read()  # type: ignore[operator]
+        data = self._stream.read(size)  # type: ignore[union-attr]
+        if self._read_calls == self._trigger_call and self._after_read is not None:
+            self._after_read()  # type: ignore[operator]
+        return data
+
+    def __enter__(self) -> "MutatingReadStream":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._stream.close()  # type: ignore[union-attr]
+        if self._after_close is not None:
+            self._after_close()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "file"])
+def test_repository_root_must_resolve_to_an_existing_directory(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    root = tmp_path / root_kind
+    if root_kind == "file":
+        root.write_bytes(b"not a directory")
+
+    with pytest.raises(RepositoryParseError):
+        SafeSourceReader(root)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "../../outside.py",
+        "/absolute.py",
+        "C:/outside.py",
+        "src\\file.py",
+        "src/../file.py",
+        "./file.py",
+        "src//file.py",
+        "",
+        "bad\x00.py",
+    ],
+)
+def test_path_invalid_is_rejected_before_the_open_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    def forbidden_open(root: Path, parts: tuple[str, ...]):
+        raise AssertionError(f"open boundary reached for {root!s} and {parts!r}")
+
+    replace_platform_opener(monkeypatch, forbidden_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(source_candidate(relative_path))
+
+    assert raised.value.kind is ParseIssueKind.PATH_INVALID
+
+
+def test_reader_reconstructs_valid_nested_posix_path_under_resolved_repository_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"answer = 42\n"
+    file = write_inventory_file(tmp_path, "src/nested/app.py", data, "python")
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+    platform_opener = getattr(reader_module, platform_opener_name())
+
+    def recording_open(root: Path, parts: tuple[str, ...]):
+        calls.append((root, parts))
+        assert platform_opener is not None
+        return platform_opener(root, parts)
+
+    replace_platform_opener(monkeypatch, recording_open)
+
+    source = SafeSourceReader(tmp_path / ".").read(file)
+
+    assert source.original_bytes == data
+    assert calls == [
+        (tmp_path.resolve(), ("src", "nested", "app.py")),
+        (tmp_path.resolve(), ("src", "nested", "app.py")),
+    ]
+
+
+def test_reader_reports_missing_file_as_read_error(tmp_path: Path) -> None:
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(source_candidate("missing.py"))
+
+    assert raised.value.kind is ParseIssueKind.READ_ERROR
+
+
+def test_reader_reports_unreadable_open_as_read_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = write_inventory_file(tmp_path, "blocked.py", b"pass\n", "python")
+
+    def denied_open(root: Path, parts: tuple[str, ...]):
+        raise PermissionError("denied")
+
+    replace_platform_opener(monkeypatch, denied_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.READ_ERROR
+
+
+def test_file_changed_size_is_rejected_before_content_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = source_candidate("changed.py", size_bytes=1)
+    (tmp_path / file.relative_path).write_bytes(b"longer")
+    platform_opener = getattr(reader_module, platform_opener_name())
+
+    class ReadForbidden:
+        def __init__(self, stream: object) -> None:
+            self._stream = stream
+
+        def fileno(self) -> int:
+            return self._stream.fileno()  # type: ignore[no-any-return, union-attr]
+
+        def read(self, size: int = -1) -> bytes:
+            raise AssertionError("changed-size content must not be read")
+
+        def __enter__(self) -> "ReadForbidden":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._stream.close()  # type: ignore[union-attr]
+
+    def guarded_open(root: Path, parts: tuple[str, ...]):
+        assert platform_opener is not None
+        return ReadForbidden(platform_opener(root, parts))
+
+    replace_platform_opener(monkeypatch, guarded_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.FILE_CHANGED
+
+
+def test_file_changed_short_read_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "short.py"
+    file = write_inventory_file(tmp_path, target.name, b"abcd", "python")
+    platform_opener = getattr(reader_module, platform_opener_name())
+    calls = 0
+
+    def mutating_open(root: Path, parts: tuple[str, ...]):
+        nonlocal calls
+        assert platform_opener is not None
+        stream = platform_opener(root, parts)
+        calls += 1
+        if calls == 1:
+            return MutatingReadStream(stream, before_read=lambda: target.write_bytes(b"ab"))
+        return stream
+
+    replace_platform_opener(monkeypatch, mutating_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.FILE_CHANGED
+
+
+def test_file_changed_overflow_probe_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "overflow.py"
+    file = write_inventory_file(tmp_path, target.name, b"abc", "python")
+    platform_opener = getattr(reader_module, platform_opener_name())
+    calls = 0
+
+    def append_byte() -> None:
+        with target.open("ab") as destination:
+            destination.write(b"!")
+
+    def mutating_open(root: Path, parts: tuple[str, ...]):
+        nonlocal calls
+        assert platform_opener is not None
+        stream = platform_opener(root, parts)
+        calls += 1
+        if calls == 1:
+            return MutatingReadStream(stream, before_read=append_byte)
+        return stream
+
+    replace_platform_opener(monkeypatch, mutating_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.FILE_CHANGED
+
+
+def test_file_changed_post_read_identity_mismatch_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "swapped.py"
+    replacement = tmp_path / "replacement.py"
+    file = write_inventory_file(tmp_path, target.name, b"old\n", "python")
+    replacement.write_bytes(b"new\n")
+    platform_opener = getattr(reader_module, platform_opener_name())
+    calls = 0
+
+    def replace_path() -> None:
+        os.replace(replacement, target)
+
+    def mutating_open(root: Path, parts: tuple[str, ...]):
+        nonlocal calls
+        assert platform_opener is not None
+        stream = platform_opener(root, parts)
+        calls += 1
+        if calls == 1:
+            return MutatingReadStream(stream, after_close=replace_path)
+        return stream
+
+    replace_platform_opener(monkeypatch, mutating_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.FILE_CHANGED
+
+
+def test_reader_rejects_non_regular_final_entry(tmp_path: Path) -> None:
+    (tmp_path / "directory.py").mkdir()
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(source_candidate("directory.py"))
+
+    assert raised.value.kind in {ParseIssueKind.LINK_UNSAFE, ParseIssueKind.READ_ERROR}
+
+
+def test_reader_returns_exact_regular_bytes_without_rescanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"def f():\n    return 1\n"
+    file = write_inventory_file(tmp_path, "app.py", data, "python")
+    scandir_calls: list[object] = []
+    original_scandir = os.scandir
+
+    def recording_scandir(path: object):
+        scandir_calls.append(path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", recording_scandir)
+
+    source = SafeSourceReader(tmp_path).read(file)
+
+    assert source == SourceBuffer(data, data, 0)
+    assert scandir_calls == []
+
+
+@pytest.mark.parametrize("data", [b"caf\xe9", "x".encode("utf-16"), "x".encode("utf-32")])
+def test_reader_rejects_non_utf8_without_replacement(tmp_path: Path, data: bytes) -> None:
+    file = write_inventory_file(tmp_path, "bad.py", data, "python")
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.DECODING_ERROR
+
+
+def test_reader_preserves_original_utf8_bom_offsets(tmp_path: Path) -> None:
+    data = codecs.BOM_UTF8 + b"def f():\n    pass\n"
+    file = write_inventory_file(tmp_path, "bom.py", data, "python")
+
+    source = SafeSourceReader(tmp_path).read(file)
+
+    assert source.original_bytes == data
+    assert source.parse_bytes == data[len(codecs.BOM_UTF8):]
+    assert source.bom_prefix_bytes == 3
+
+
+def test_reader_rejects_symlink_swap_without_reading_target(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"OUTSIDE_SECRET_SENTINEL")
+    file = write_inventory_file(repository, "linked.py", b"safe", "python")
+    target = repository / file.relative_path
+    target.unlink()
+    try:
+        target.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(repository).read(file)
+
+    assert raised.value.kind is ParseIssueKind.LINK_UNSAFE
+    assert "OUTSIDE_SECRET_SENTINEL" not in str(raised.value)
+
+
+def test_reparse_metadata_detects_windows_reparse_attribute() -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    class FakeStat:
+        st_file_attributes = reparse_flag
+
+    assert is_reparse_metadata(FakeStat())  # type: ignore[arg-type]
+
+
+def test_reader_fails_closed_when_platform_nonfollowing_opener_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = write_inventory_file(tmp_path, "app.py", b"pass\n", "python")
+
+    def forbidden_following_open(self: Path, *args: object, **kwargs: object):
+        raise AssertionError("Path.open fallback must never be used")
+
+    replace_platform_opener(monkeypatch, None)
+    monkeypatch.setattr(Path, "open", forbidden_following_open)
+
+    with pytest.raises(SourceReadError) as raised:
+        SafeSourceReader(tmp_path).read(file)
+
+    assert raised.value.kind is ParseIssueKind.LINK_UNSAFE
 
 
 @pytest.mark.parametrize(
