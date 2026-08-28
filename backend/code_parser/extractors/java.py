@@ -22,7 +22,6 @@ from backend.code_parser.reader import SourceBuffer
 from .base import (
     ENTER,
     ExtractionResult,
-    ScopeStack,
     bounded_node_text,
     iter_events,
     normalize_extraction,
@@ -37,6 +36,14 @@ _TYPE_DECLARATIONS = {
     "enum_declaration": SymbolKind.ENUM,
 }
 _TYPE_BODIES = {"class_body", "interface_body", "enum_body"}
+_QUALIFIED_NAME_NODES = {"identifier", "scoped_identifier"}
+_REFERENCE_TYPE_NODES = {
+    "annotated_type",
+    "array_type",
+    "generic_type",
+    "scoped_type_identifier",
+    "type_identifier",
+}
 _ASCII_WHITESPACE = b" \t\n\r\f\v"
 _ELLIPSIS = "…"
 _ELLIPSIS_BYTES = _ELLIPSIS.encode("utf-8")
@@ -85,8 +92,16 @@ def _clause_types(
         None,
     )
     if type_list is not None:
-        return tuple(capture(child) for child in type_list.named_children)
-    return tuple(capture(child) for child in clause.named_children)
+        return tuple(
+            capture(child)
+            for child in type_list.named_children
+            if child.type in _REFERENCE_TYPE_NODES
+        )
+    return tuple(
+        capture(child)
+        for child in clause.named_children
+        if child.type in _REFERENCE_TYPE_NODES
+    )
 
 
 def _type_relations(
@@ -125,6 +140,7 @@ def _parameter_type(
 def _formal_parameter(
     node: Node,
     capture: Callable[[Node], str],
+    capture_range: Callable[[int, int], str],
 ) -> ParameterInfo | None:
     name = node.child_by_field_name("name")
     type_node = node.child_by_field_name("type")
@@ -166,7 +182,11 @@ def _formal_parameter(
         ]
         if len(named) < 2:
             return None
-        return ParameterInfo(capture(named[-1]), capture(named[0]), None)
+        return ParameterInfo(
+            capture_range(named[1].start_byte, node.end_byte),
+            capture(named[0]),
+            None,
+        )
 
     if name is None:
         return None
@@ -180,12 +200,13 @@ def _formal_parameter(
 def _parameters(
     node: Node | None,
     capture: Callable[[Node], str],
+    capture_range: Callable[[int, int], str],
 ) -> tuple[ParameterInfo, ...]:
     if node is None:
         return ()
     parameters: list[ParameterInfo] = []
     for child in node.named_children:
-        parameter = _formal_parameter(child, capture)
+        parameter = _formal_parameter(child, capture, capture_range)
         if parameter is not None:
             parameters.append(parameter)
     return tuple(parameters)
@@ -241,7 +262,7 @@ def _import_info(
         (
             child
             for child in node.named_children
-            if child.type not in {"asterisk", "annotation", "marker_annotation"}
+            if child.type in _QUALIFIED_NAME_NODES
         ),
         None,
     )
@@ -266,7 +287,7 @@ class JavaExtractor:
         imports: list[ImportInfo] = []
         calls: list[CallSite] = []
         scopes: list[_LexicalScope] = []
-        callable_scopes = ScopeStack()
+        ownership_scopes: list[str | None] = []
         captured_truncated_text = False
 
         def capture(node: Node) -> str:
@@ -295,7 +316,14 @@ class JavaExtractor:
         for child in tree.root_node.named_children:
             if child.type != "package_declaration":
                 continue
-            name_node = next(iter(child.named_children), None)
+            name_node = next(
+                (
+                    item
+                    for item in child.named_children
+                    if item.type in _QUALIFIED_NAME_NODES
+                ),
+                None,
+            )
             if name_node is not None:
                 package_name = capture(name_node)
             break
@@ -307,12 +335,12 @@ class JavaExtractor:
                     name = node.child_by_field_name("name")
                     if name is not None:
                         scopes.pop()
-                        callable_scopes.pop()
+                        ownership_scopes.pop()
                 elif node.type in {"constructor_declaration", "method_declaration"}:
                     name = node.child_by_field_name("name")
                     if name is not None and node.parent is not None and node.parent.type in _TYPE_BODIES:
                         scopes.pop()
-                        callable_scopes.pop()
+                        ownership_scopes.pop()
                 continue
 
             type_kind = _TYPE_DECLARATIONS.get(node.type)
@@ -338,7 +366,7 @@ class JavaExtractor:
                     )
                 )
                 scopes.append(_LexicalScope(qualified, "type"))
-                callable_scopes.push(qualified, is_callable=False)
+                ownership_scopes.append(None)
                 continue
 
             if node.type in {"constructor_declaration", "method_declaration"}:
@@ -349,7 +377,11 @@ class JavaExtractor:
                     continue
                 name = capture(name_node)
                 qualified, parent = _qualified_name(scopes, package_name, name)
-                parameters = _parameters(node.child_by_field_name("parameters"), capture)
+                parameters = _parameters(
+                    node.child_by_field_name("parameters"),
+                    capture,
+                    capture_range,
+                )
                 return_node = node.child_by_field_name("type")
                 kind = (
                     SymbolKind.CONSTRUCTOR
@@ -371,7 +403,7 @@ class JavaExtractor:
                     )
                 )
                 scopes.append(_LexicalScope(qualified, "callable"))
-                callable_scopes.push(qualified, is_callable=True)
+                ownership_scopes.append(qualified)
                 continue
 
             if node.type == "field_declaration":
@@ -389,7 +421,7 @@ class JavaExtractor:
                 if arguments is not None:
                     calls.append(
                         CallSite(
-                            callable_scopes.nearest_callable,
+                            ownership_scopes[-1] if ownership_scopes else None,
                             capture_range(node.start_byte, arguments.start_byte),
                             CallKind.CALL,
                             source_location(node, source),
@@ -402,7 +434,7 @@ class JavaExtractor:
                 if type_node is not None:
                     calls.append(
                         CallSite(
-                            callable_scopes.nearest_callable,
+                            ownership_scopes[-1] if ownership_scopes else None,
                             capture(type_node),
                             CallKind.CONSTRUCTOR,
                             source_location(node, source),

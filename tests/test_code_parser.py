@@ -912,6 +912,72 @@ def test_java_extractor_leaves_initializer_block_calls_unowned() -> None:
     ]
 
 
+def test_java_extractor_local_type_is_a_call_ownership_barrier() -> None:
+    data = b'''class C {
+    void outer() {
+        class Local {
+            { init(); }
+            Object value = make();
+            void inner() { run(); }
+        }
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.caller_qualified_name, item.callee_text) for item in result.calls] == [
+        (None, "init"),
+        (None, "make"),
+        ("C.outer.Local.inner", "run"),
+    ]
+
+
+def test_java_extractor_preserves_qualified_receiver_parameter_pattern() -> None:
+    data = b'''class Outer {
+    class Inner {
+        Inner(Outer Outer.this) {}
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+    constructor = next(
+        item for item in result.symbols if item.kind is SymbolKind.CONSTRUCTOR
+    )
+
+    assert constructor.parameters == (
+        ParameterInfo("Outer.this", "Outer", None),
+    )
+
+
+def test_java_extractor_filters_comments_and_package_annotations_from_names() -> None:
+    data = b'''@Deprecated
+package /* package note */ com.example;
+
+import /* import note */ java.util.List;
+
+class Child extends /* base note */ Base {}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [(item.qualified_name, item.base_types) for item in result.symbols] == [
+        ("com.example.Child", ("Base",)),
+    ]
+    assert [(item.module, item.bindings) for item in result.imports] == [
+        ("java.util.List", ()),
+    ]
+    assert all(
+        "note" not in value and "Deprecated" not in value
+        for value in (
+            result.symbols[0].qualified_name,
+            *result.symbols[0].base_types,
+            result.imports[0].module,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "field_order", "field_to_mutate", "replacement"),
     [
