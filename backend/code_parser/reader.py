@@ -99,6 +99,23 @@ def _require_posix_primitives() -> None:
         raise _source_error(ParseIssueKind.LINK_UNSAFE)
 
 
+def _open_verified_posix_directory(
+    directory_fd: int,
+    component: str,
+    directory_flags: int,
+    before: os.stat_result,
+) -> int:
+    next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+    try:
+        opened = os.fstat(next_fd)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_stat_identity(before, opened):
+            raise _source_error(ParseIssueKind.FILE_CHANGED)
+        return next_fd
+    except BaseException:
+        os.close(next_fd)
+        raise
+
+
 def _open_verified_posix(root: Path, parts: tuple[str, ...]) -> BinaryIO:
     """Open a regular child using root-relative, non-following POSIX descriptors."""
 
@@ -129,11 +146,12 @@ def _open_verified_posix(root: Path, parts: tuple[str, ...]) -> BinaryIO:
                 or not stat.S_ISDIR(before.st_mode)
             ):
                 raise _source_error(ParseIssueKind.LINK_UNSAFE)
-            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
-            opened = os.fstat(next_fd)
-            if not stat.S_ISDIR(opened.st_mode) or not _same_stat_identity(before, opened):
-                os.close(next_fd)
-                raise _source_error(ParseIssueKind.FILE_CHANGED)
+            next_fd = _open_verified_posix_directory(
+                directory_fd,
+                component,
+                directory_flags,
+                before,
+            )
             os.close(directory_fd)
             directory_fd = next_fd
 
@@ -168,6 +186,19 @@ class _WindowsMetadata:
     size: int
 
 
+_WINDOWS_DIRECTORY_ATTRIBUTE = 0x00000010
+_WINDOWS_FILE_READ_DATA = 0x00000001
+_WINDOWS_FILE_TRAVERSE = 0x00000020
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
+_WINDOWS_SYNCHRONIZE = 0x00100000
+_WINDOWS_ROOT_ACCESS = (
+    _WINDOWS_FILE_TRAVERSE | _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE
+)
+_WINDOWS_FINAL_ACCESS = (
+    _WINDOWS_FILE_READ_DATA | _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE
+)
+
+
 @functools.lru_cache(maxsize=1)
 def _load_windows_api() -> SimpleNamespace:
     try:
@@ -191,8 +222,39 @@ def _load_windows_api() -> SimpleNamespace:
             ("nFileIndexLow", wintypes.DWORD),
         ]
 
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class IoStatusUnion(ctypes.Union):
+        _fields_ = [
+            ("Status", ctypes.c_long),
+            ("Pointer", wintypes.LPVOID),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("result",)
+        _fields_ = [
+            ("result", IoStatusUnion),
+            ("Information", ctypes.c_size_t),
+        ]
+
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
         create_file = kernel32.CreateFileW
         create_file.argtypes = [
             wintypes.LPCWSTR,
@@ -213,6 +275,22 @@ def _load_windows_api() -> SimpleNamespace:
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
+        nt_open_file = ntdll.NtOpenFile
+        nt_open_file.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(ObjectAttributes),
+            ctypes.POINTER(IoStatusBlock),
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        nt_open_file.restype = ctypes.c_long
+        status_to_dos_error = ntdll.RtlNtStatusToDosError
+        status_to_dos_error.argtypes = [wintypes.ULONG]
+        status_to_dos_error.restype = wintypes.ULONG
+        open_osfhandle = msvcrt.open_osfhandle
+        if not callable(open_osfhandle):
+            raise AttributeError("open_osfhandle")
     except (AttributeError, OSError) as error:
         raise _source_error(ParseIssueKind.LINK_UNSAFE) from error
 
@@ -221,9 +299,15 @@ def _load_windows_api() -> SimpleNamespace:
         wintypes=wintypes,
         msvcrt=msvcrt,
         information_type=ByHandleFileInformation,
+        unicode_string_type=UnicodeString,
+        object_attributes_type=ObjectAttributes,
+        io_status_block_type=IoStatusBlock,
         create_file=create_file,
         get_information=get_information,
         close_handle=close_handle,
+        nt_open_file=nt_open_file,
+        status_to_dos_error=status_to_dos_error,
+        open_osfhandle=open_osfhandle,
         invalid_handle=ctypes.c_void_p(-1).value,
     )
 
@@ -235,7 +319,14 @@ def _windows_extended_path(path: Path) -> str:
     return "\\\\?\\" + text
 
 
-def _open_windows_handle(path: Path, desired_access: int) -> int:
+def _raise_windows_open_error(error: OSError) -> None:
+    unsafe_codes = {681, 1920, 4390, 4392, 4393, 4394}
+    if getattr(error, "winerror", None) in unsafe_codes:
+        raise _source_error(ParseIssueKind.LINK_UNSAFE) from error
+    raise _source_error(ParseIssueKind.READ_ERROR) from error
+
+
+def _open_windows_root_handle(path: Path, desired_access: int) -> int:
     api = _load_windows_api()
     share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
     open_existing = 3
@@ -252,11 +343,55 @@ def _open_windows_handle(path: Path, desired_access: int) -> int:
     )
     if handle is None or handle == api.invalid_handle:
         error = api.ctypes.WinError(api.ctypes.get_last_error())
-        unsafe_codes = {681, 1920, 4390, 4392, 4393, 4394}
-        if getattr(error, "winerror", None) in unsafe_codes:
-            raise _source_error(ParseIssueKind.LINK_UNSAFE) from error
-        raise _source_error(ParseIssueKind.READ_ERROR) from error
+        _raise_windows_open_error(error)
+        raise AssertionError("unreachable")
     return int(handle)
+
+
+def _open_windows_relative_handle(
+    parent_handle: int,
+    component: str,
+    desired_access: int,
+    *,
+    directory: bool,
+) -> int:
+    api = _load_windows_api()
+    name_buffer = api.ctypes.create_unicode_buffer(component)
+    name_length = len(component.encode("utf-16-le"))
+    object_name = api.unicode_string_type(
+        name_length,
+        name_length + 2,
+        api.ctypes.cast(name_buffer, api.wintypes.LPWSTR),
+    )
+    object_attributes = api.object_attributes_type(
+        api.ctypes.sizeof(api.object_attributes_type),
+        api.wintypes.HANDLE(parent_handle),
+        api.ctypes.pointer(object_name),
+        0x00000040,
+        None,
+        None,
+    )
+    io_status = api.io_status_block_type()
+    handle = api.wintypes.HANDLE()
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_options = 0x00200000 | 0x00000020
+    open_options |= 0x00000001 if directory else 0x00000040
+    status = api.nt_open_file(
+        api.ctypes.byref(handle),
+        desired_access,
+        api.ctypes.byref(object_attributes),
+        api.ctypes.byref(io_status),
+        share_read_write_delete,
+        open_options,
+    )
+    if status < 0:
+        error_code = api.status_to_dos_error(api.wintypes.ULONG(status).value)
+        error = api.ctypes.WinError(error_code)
+        _raise_windows_open_error(error)
+        raise AssertionError("unreachable")
+    if handle.value is None:
+        raise _source_error(ParseIssueKind.LINK_UNSAFE)
+    return int(handle.value)
 
 
 def _close_windows_handle(handle: int) -> None:
@@ -284,20 +419,156 @@ def _windows_identity(metadata: _WindowsMetadata) -> tuple[int, int]:
     return metadata.volume_serial, metadata.file_index
 
 
-def _verify_windows_parents(root: Path, parts: tuple[str, ...]) -> None:
-    file_read_attributes = 0x00000080
-    directory_attribute = 0x00000010
-    for count in range(1, len(parts)):
-        handle = _open_windows_handle(root.joinpath(*parts[:count]), file_read_attributes)
+def _require_windows_directory(metadata: _WindowsMetadata) -> None:
+    if is_reparse_metadata(metadata) or not (
+        metadata.st_file_attributes & _WINDOWS_DIRECTORY_ATTRIBUTE
+    ):
+        raise _source_error(ParseIssueKind.LINK_UNSAFE)
+
+
+def _require_windows_regular(metadata: _WindowsMetadata) -> None:
+    if is_reparse_metadata(metadata) or (
+        metadata.st_file_attributes & _WINDOWS_DIRECTORY_ATTRIBUTE
+    ):
+        raise _source_error(ParseIssueKind.LINK_UNSAFE)
+
+
+def _open_checked_windows_root(root: Path) -> int:
+    before_handle = _open_windows_root_handle(root, _WINDOWS_ROOT_ACCESS)
+    try:
+        before = _windows_handle_metadata(before_handle)
+        _require_windows_directory(before)
+        _windows_identity(before)
+    finally:
+        _close_windows_handle(before_handle)
+
+    opened_handle = _open_windows_root_handle(root, _WINDOWS_ROOT_ACCESS)
+    try:
+        opened = _windows_handle_metadata(opened_handle)
+        _require_windows_directory(opened)
+        if _windows_identity(before) != _windows_identity(opened):
+            raise _source_error(ParseIssueKind.FILE_CHANGED)
+        return opened_handle
+    except BaseException:
+        _close_windows_handle(opened_handle)
+        raise
+
+
+def _open_checked_windows_relative(
+    parent_handle: int,
+    component: str,
+    desired_access: int,
+    *,
+    directory: bool,
+) -> tuple[int, _WindowsMetadata]:
+    before_handle = _open_windows_relative_handle(
+        parent_handle,
+        component,
+        _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE,
+        directory=directory,
+    )
+    try:
+        before = _windows_handle_metadata(before_handle)
+        if directory:
+            _require_windows_directory(before)
+        else:
+            _require_windows_regular(before)
+        _windows_identity(before)
+    finally:
+        _close_windows_handle(before_handle)
+
+    opened_handle = _open_windows_relative_handle(
+        parent_handle,
+        component,
+        desired_access,
+        directory=directory,
+    )
+    try:
+        opened = _windows_handle_metadata(opened_handle)
+        if directory:
+            _require_windows_directory(opened)
+        else:
+            _require_windows_regular(opened)
+        if _windows_identity(before) != _windows_identity(opened):
+            raise _source_error(ParseIssueKind.FILE_CHANGED)
+        return opened_handle, opened
+    except BaseException:
+        _close_windows_handle(opened_handle)
+        raise
+
+
+def _windows_handle_to_stream(handle: int) -> BinaryIO:
+    api = _load_windows_api()
+    open_osfhandle = getattr(api, "open_osfhandle", None)
+    if not callable(open_osfhandle):
+        _close_windows_handle(handle)
+        raise _source_error(ParseIssueKind.LINK_UNSAFE)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        file_descriptor = open_osfhandle(handle, flags)
+    except (AttributeError, OSError, ValueError) as error:
+        _close_windows_handle(handle)
+        raise _source_error(ParseIssueKind.LINK_UNSAFE) from error
+    try:
+        return os.fdopen(file_descriptor, "rb", buffering=0)
+    except (OSError, ValueError):
+        os.close(file_descriptor)
+        raise
+
+
+class _WindowsVerifiedStream:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        retained_directories: list[int],
+        final_component: str,
+        final_identity: tuple[int, int],
+    ) -> None:
+        self._stream = stream
+        self._retained_directories = retained_directories
+        self._final_component = final_component
+        self._final_identity = final_identity
+        self._closed = False
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def verify_path(self, expected_size: int) -> None:
+        if self._closed or not self._retained_directories:
+            raise _source_error(ParseIssueKind.LINK_UNSAFE)
+        parent_handle = self._retained_directories[-1]
+        handle = _open_windows_relative_handle(
+            parent_handle,
+            self._final_component,
+            _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE,
+            directory=False,
+        )
         try:
             metadata = _windows_handle_metadata(handle)
-            if is_reparse_metadata(metadata) or not (
-                metadata.st_file_attributes & directory_attribute
-            ):
-                raise _source_error(ParseIssueKind.LINK_UNSAFE)
-            _windows_identity(metadata)
+            _require_windows_regular(metadata)
+            if metadata.size != expected_size or _windows_identity(metadata) != self._final_identity:
+                raise _source_error(ParseIssueKind.FILE_CHANGED)
         finally:
             _close_windows_handle(handle)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.close()
+        finally:
+            while self._retained_directories:
+                _close_windows_handle(self._retained_directories.pop())
+
+    def __enter__(self) -> "_WindowsVerifiedStream":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
 
 def _open_verified_windows(root: Path, parts: tuple[str, ...]) -> BinaryIO:
@@ -306,45 +577,45 @@ def _open_verified_windows(root: Path, parts: tuple[str, ...]) -> BinaryIO:
     if not _IS_WINDOWS:
         raise _source_error(ParseIssueKind.LINK_UNSAFE)
 
-    file_read_attributes = 0x00000080
-    generic_read = 0x80000000
-    directory_attribute = 0x00000010
-    path = root.joinpath(*parts)
-    _verify_windows_parents(root, parts)
-
-    before_handle = _open_windows_handle(path, file_read_attributes)
+    retained_directories: list[int] = []
+    final_handle: int | None = None
     try:
-        before = _windows_handle_metadata(before_handle)
-    finally:
-        _close_windows_handle(before_handle)
-    if is_reparse_metadata(before) or before.st_file_attributes & directory_attribute:
-        raise _source_error(ParseIssueKind.LINK_UNSAFE)
+        root_handle = _open_checked_windows_root(root)
+        retained_directories.append(root_handle)
+        for component in parts[:-1]:
+            directory_handle, _ = _open_checked_windows_relative(
+                retained_directories[-1],
+                component,
+                _WINDOWS_ROOT_ACCESS,
+                directory=True,
+            )
+            retained_directories.append(directory_handle)
 
-    opened_handle = _open_windows_handle(path, generic_read)
-    try:
-        opened = _windows_handle_metadata(opened_handle)
-        if is_reparse_metadata(opened) or opened.st_file_attributes & directory_attribute:
-            raise _source_error(ParseIssueKind.LINK_UNSAFE)
-        if _windows_identity(before) != _windows_identity(opened):
-            raise _source_error(ParseIssueKind.FILE_CHANGED)
-        _verify_windows_parents(root, parts)
-
-        api = _load_windows_api()
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        file_descriptor = api.msvcrt.open_osfhandle(opened_handle, flags)
-        opened_handle = 0
-        try:
-            return os.fdopen(file_descriptor, "rb", buffering=0)
-        except (OSError, ValueError):
-            os.close(file_descriptor)
-            raise
+        final_handle, final_metadata = _open_checked_windows_relative(
+            retained_directories[-1],
+            parts[-1],
+            _WINDOWS_FINAL_ACCESS,
+            directory=False,
+        )
+        stream_handle = final_handle
+        final_handle = None
+        stream = _windows_handle_to_stream(stream_handle)
+        return _WindowsVerifiedStream(
+            stream,
+            retained_directories,
+            parts[-1],
+            _windows_identity(final_metadata),
+        )
     except SourceReadError:
         raise
-    except (OSError, ValueError) as error:
+    except (AttributeError, OSError, ValueError) as error:
         raise _source_error(ParseIssueKind.READ_ERROR) from error
     finally:
-        if opened_handle:
-            _close_windows_handle(opened_handle)
+        if final_handle is not None:
+            _close_windows_handle(final_handle)
+        if final_handle is not None or "stream" not in locals():
+            while retained_directories:
+                _close_windows_handle(retained_directories.pop())
 
 
 _PlatformOpener = Callable[[Path, tuple[str, ...]], BinaryIO]
@@ -411,6 +682,7 @@ class SafeSourceReader:
             raise _source_error(ParseIssueKind.LINK_UNSAFE)
 
         try:
+            verified_with_retained_parent = False
             with opener(self.repository_path, parts) as source:
                 before = os.fstat(source.fileno())
                 _require_regular(before)
@@ -428,18 +700,32 @@ class SafeSourceReader:
                 if after.st_size != file.size_bytes or not _same_stat_identity(before, after):
                     raise _source_error(ParseIssueKind.FILE_CHANGED)
 
-            try:
-                with opener(self.repository_path, parts) as current_source:
-                    current = os.fstat(current_source.fileno())
-                    _require_regular(current)
-                    if current.st_size != file.size_bytes or not _same_stat_identity(
-                        before, current
-                    ):
-                        raise _source_error(ParseIssueKind.FILE_CHANGED)
-            except SourceReadError as error:
-                if error.kind in {ParseIssueKind.READ_ERROR, ParseIssueKind.FILE_CHANGED}:
-                    raise _source_error(ParseIssueKind.FILE_CHANGED) from error
-                raise
+                verify_path = getattr(source, "verify_path", None)
+                if callable(verify_path):
+                    try:
+                        verify_path(file.size_bytes)
+                    except SourceReadError as error:
+                        if error.kind in {
+                            ParseIssueKind.READ_ERROR,
+                            ParseIssueKind.FILE_CHANGED,
+                        }:
+                            raise _source_error(ParseIssueKind.FILE_CHANGED) from error
+                        raise
+                    verified_with_retained_parent = True
+
+            if not verified_with_retained_parent:
+                try:
+                    with opener(self.repository_path, parts) as current_source:
+                        current = os.fstat(current_source.fileno())
+                        _require_regular(current)
+                        if current.st_size != file.size_bytes or not _same_stat_identity(
+                            before, current
+                        ):
+                            raise _source_error(ParseIssueKind.FILE_CHANGED)
+                except SourceReadError as error:
+                    if error.kind in {ParseIssueKind.READ_ERROR, ParseIssueKind.FILE_CHANGED}:
+                        raise _source_error(ParseIssueKind.FILE_CHANGED) from error
+                    raise
         except SourceReadError:
             raise
         except (OSError, RuntimeError, TypeError, ValueError) as error:

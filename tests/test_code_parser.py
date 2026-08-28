@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 
 import pytest
 from tree_sitter import Language
@@ -373,10 +374,10 @@ def test_reader_reconstructs_valid_nested_posix_path_under_resolved_repository_r
     source = SafeSourceReader(tmp_path / ".").read(file)
 
     assert source.original_bytes == data
+    expected_calls = 1 if os.name == "nt" else 2
     assert calls == [
         (tmp_path.resolve(), ("src", "nested", "app.py")),
-        (tmp_path.resolve(), ("src", "nested", "app.py")),
-    ]
+    ] * expected_calls
 
 
 def test_reader_reports_missing_file_as_read_error(tmp_path: Path) -> None:
@@ -622,6 +623,233 @@ def test_reader_fails_closed_when_platform_nonfollowing_opener_is_unavailable(
         SafeSourceReader(tmp_path).read(file)
 
     assert raised.value.kind is ParseIssueKind.LINK_UNSAFE
+
+
+class FakeWindowsBinaryStream:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def fileno(self) -> int:
+        return 31
+
+    def read(self, size: int = -1) -> bytes:
+        return b"safe"[:size]
+
+
+def windows_metadata(
+    identity: int,
+    *,
+    directory: bool = False,
+    reparse: bool = False,
+    size: int = 0,
+) -> reader_module._WindowsMetadata:
+    attributes = 0x10 if directory else 0
+    if reparse:
+        attributes |= getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return reader_module._WindowsMetadata(attributes, 7, identity, size)
+
+
+def install_windows_walk_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_by_handle: dict[int, reader_module._WindowsMetadata],
+    *,
+    root_handles: tuple[int, ...],
+    relative_handles: tuple[int, ...],
+) -> tuple[
+    list[tuple[Path, int]],
+    list[tuple[int, str, int, bool]],
+    list[int],
+    FakeWindowsBinaryStream,
+]:
+    root_results = iter(root_handles)
+    relative_results = iter(relative_handles)
+    root_calls: list[tuple[Path, int]] = []
+    relative_calls: list[tuple[int, str, int, bool]] = []
+    closed_handles: list[int] = []
+    binary_stream = FakeWindowsBinaryStream()
+
+    def open_root(path: Path, desired_access: int) -> int:
+        root_calls.append((path, desired_access))
+        return next(root_results)
+
+    def open_relative(
+        parent_handle: int,
+        component: str,
+        desired_access: int,
+        *,
+        directory: bool,
+    ) -> int:
+        relative_calls.append((parent_handle, component, desired_access, directory))
+        return next(relative_results)
+
+    monkeypatch.setattr(reader_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(reader_module, "_open_windows_root_handle", open_root)
+    monkeypatch.setattr(reader_module, "_open_windows_relative_handle", open_relative)
+    monkeypatch.setattr(
+        reader_module,
+        "_windows_handle_metadata",
+        lambda handle: metadata_by_handle[handle],
+    )
+    monkeypatch.setattr(reader_module, "_close_windows_handle", closed_handles.append)
+    monkeypatch.setattr(
+        reader_module,
+        "_windows_handle_to_stream",
+        lambda handle: binary_stream,
+    )
+    return root_calls, relative_calls, closed_handles, binary_stream
+
+
+def test_windows_adapter_retains_root_and_parents_without_absolute_final_reopen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        10: windows_metadata(1, directory=True),
+        11: windows_metadata(1, directory=True),
+        20: windows_metadata(2, directory=True),
+        21: windows_metadata(2, directory=True),
+        30: windows_metadata(3, size=4),
+        31: windows_metadata(3, size=4),
+        32: windows_metadata(3, size=4),
+    }
+    root_calls, relative_calls, closed, binary_stream = install_windows_walk_fakes(
+        monkeypatch,
+        metadata,
+        root_handles=(10, 11),
+        relative_handles=(20, 21, 30, 31, 32),
+    )
+
+    source = reader_module._open_verified_windows(
+        Path("C:/repository"),
+        ("src", "app.py"),
+    )
+
+    assert [call[0] for call in root_calls] == [Path("C:/repository")] * 2
+    assert [(call[0], call[1], call[3]) for call in relative_calls] == [
+        (11, "src", True),
+        (11, "src", True),
+        (21, "app.py", False),
+        (21, "app.py", False),
+    ]
+    assert closed == [10, 20, 30]
+    assert 11 not in closed and 21 not in closed
+
+    source.verify_path(4)  # type: ignore[attr-defined]
+
+    assert [call[0] for call in root_calls] == [Path("C:/repository")] * 2
+    assert relative_calls[-1][0:2] == (21, "app.py")
+    assert closed == [10, 20, 30, 32]
+
+    source.close()
+
+    assert binary_stream.closed
+    assert closed == [10, 20, 30, 32, 21, 11]
+
+
+def test_windows_adapter_rejects_root_replacement_and_closes_both_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        10: windows_metadata(1, directory=True),
+        11: windows_metadata(9, directory=True),
+    }
+    _, _, closed, _ = install_windows_walk_fakes(
+        monkeypatch,
+        metadata,
+        root_handles=(10, 11),
+        relative_handles=(),
+    )
+
+    with pytest.raises(SourceReadError) as raised:
+        reader_module._open_verified_windows(Path("C:/repository"), ("app.py",))
+
+    assert raised.value.kind is ParseIssueKind.FILE_CHANGED
+    assert closed == [10, 11]
+
+
+@pytest.mark.parametrize(
+    ("opened_parent", "expected_kind"),
+    [
+        (windows_metadata(2, directory=True, reparse=True), ParseIssueKind.LINK_UNSAFE),
+        (windows_metadata(9, directory=True), ParseIssueKind.FILE_CHANGED),
+    ],
+)
+def test_windows_adapter_rejects_parent_junction_or_identity_race(
+    monkeypatch: pytest.MonkeyPatch,
+    opened_parent: reader_module._WindowsMetadata,
+    expected_kind: ParseIssueKind,
+) -> None:
+    metadata = {
+        10: windows_metadata(1, directory=True),
+        11: windows_metadata(1, directory=True),
+        20: windows_metadata(2, directory=True),
+        21: opened_parent,
+    }
+    _, _, closed, _ = install_windows_walk_fakes(
+        monkeypatch,
+        metadata,
+        root_handles=(10, 11),
+        relative_handles=(20, 21),
+    )
+
+    with pytest.raises(SourceReadError) as raised:
+        reader_module._open_verified_windows(
+            Path("C:/repository"),
+            ("src", "app.py"),
+        )
+
+    assert raised.value.kind is expected_kind
+    assert closed == [10, 20, 21, 11]
+
+
+def test_windows_missing_open_osfhandle_primitive_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(
+        reader_module,
+        "_load_windows_api",
+        lambda: SimpleNamespace(open_osfhandle=None),
+    )
+    monkeypatch.setattr(reader_module, "_close_windows_handle", closed.append)
+
+    with pytest.raises(SourceReadError) as raised:
+        reader_module._windows_handle_to_stream(31)
+
+    assert raised.value.kind is ParseIssueKind.LINK_UNSAFE
+    assert str(raised.value) == "Source path cannot be opened safely."
+    assert closed == [31]
+
+
+def test_posix_descriptor_is_closed_when_opened_identity_validation_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DirectoryMetadata:
+        st_mode = stat.S_IFDIR | 0o755
+        st_dev = 1
+        st_ino = 2
+
+    closed: list[int] = []
+    monkeypatch.setattr(reader_module.os, "open", lambda *args, **kwargs: 91)
+    monkeypatch.setattr(reader_module.os, "fstat", lambda descriptor: DirectoryMetadata())
+    monkeypatch.setattr(reader_module.os, "close", closed.append)
+
+    def identity_failure(first: object, second: object) -> bool:
+        raise SourceReadError(ParseIssueKind.FILE_CHANGED, "changed")
+
+    monkeypatch.setattr(reader_module, "_same_stat_identity", identity_failure)
+
+    with pytest.raises(SourceReadError):
+        reader_module._open_verified_posix_directory(
+            7,
+            "child",
+            0,
+            DirectoryMetadata(),  # type: ignore[arg-type]
+        )
+
+    assert closed == [91]
 
 
 @pytest.mark.parametrize(
