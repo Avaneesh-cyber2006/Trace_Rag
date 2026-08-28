@@ -6,9 +6,20 @@ import stat
 from types import SimpleNamespace
 
 import pytest
-from tree_sitter import Language
+from tree_sitter import Language, Parser
 import tree_sitter_python
 
+from backend.code_parser.extractors.base import (
+    ENTER,
+    EXIT,
+    ExtractionResult,
+    ScopeStack,
+    bounded_node_text,
+    iter_events,
+    normalize_extraction,
+    normalize_modifiers,
+    source_location,
+)
 from backend.code_parser.exceptions import (
     CodeParserError,
     InvalidParseInventory,
@@ -73,6 +84,175 @@ def test_source_location_is_frozen_and_uses_declared_field_order() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         location.end_byte = 4  # type: ignore[misc]
+
+
+def parse_python_fixture(data: bytes):
+    parser = Parser(Language(tree_sitter_python.language()))
+    return parser.parse(data)
+
+
+def test_source_location_uses_original_ascii_byte_offsets_and_half_open_points() -> None:
+    data = b"def target():\n    pass\n"
+    tree = parse_python_fixture(data)
+    node = tree.root_node.named_children[0]
+
+    location = source_location(node, SourceBuffer(data, data, 0))
+
+    assert location == SourceLocation(0, 22, 1, 0, 2, 8)
+    assert data[location.start_byte : location.end_byte] == b"def target():\n    pass"
+
+
+def test_source_location_counts_unicode_columns_as_utf8_bytes() -> None:
+    data = 'label = "é"; target = 1\n'.encode("utf-8")
+    tree = parse_python_fixture(data)
+    node = tree.root_node.named_children[-1]
+
+    location = source_location(node, SourceBuffer(data, data, 0))
+
+    assert location == SourceLocation(14, 24, 1, 14, 1, 24)
+    assert data[location.start_byte : location.end_byte] == b"target = 1"
+
+
+def test_source_location_restores_bom_offsets_only_on_first_line() -> None:
+    parse_bytes = b"def target():\n    pass\n"
+    original_bytes = codecs.BOM_UTF8 + parse_bytes
+    tree = parse_python_fixture(parse_bytes)
+    node = tree.root_node.named_children[0]
+
+    location = source_location(node, SourceBuffer(original_bytes, parse_bytes, 3))
+
+    assert location == SourceLocation(3, 25, 1, 3, 2, 8)
+    assert original_bytes[location.start_byte : location.end_byte] == b"def target():\n    pass"
+
+
+def test_bounded_text_strips_only_surrounding_ascii_whitespace() -> None:
+    data = b" \tvalue  with\tinternal spacing\r\n"
+    node = parse_python_fixture(data).root_node
+
+    bounded = bounded_node_text(node, SourceBuffer(data, data, 0))
+
+    assert bounded.text == "value  with\tinternal spacing"
+    assert bounded.was_truncated is False
+
+
+def test_bounded_text_preserves_values_at_the_1000_byte_limit() -> None:
+    value = "a" * 1000
+    data = value.encode("utf-8")
+    node = parse_python_fixture(data).root_node
+
+    bounded = bounded_node_text(node, SourceBuffer(data, data, 0))
+
+    assert bounded.text == value
+    assert bounded.was_truncated is False
+    assert len(bounded.text.encode("utf-8")) == 1000
+
+
+def test_bounded_text_truncates_multibyte_values_at_a_valid_utf8_boundary() -> None:
+    value = "é" * 600
+    data = value.encode("utf-8")
+    node = parse_python_fixture(data).root_node
+
+    bounded = bounded_node_text(node, SourceBuffer(data, data, 0))
+
+    assert bounded.was_truncated is True
+    assert bounded.text == ("é" * 498) + "…"
+    assert len(bounded.text.encode("utf-8")) == 999
+    assert bounded.text.encode("utf-8").decode("utf-8") == bounded.text
+
+
+def test_iter_events_is_source_ordered_and_handles_deep_real_trees_iteratively() -> None:
+    data = (b"value = (" * 400) + b"1" + (b")" * 400)
+    root = parse_python_fixture(data).root_node
+
+    events = list(iter_events(root))
+
+    assert events[0].kind is ENTER
+    assert events[0].node == root
+    assert events[-1].kind is EXIT
+    assert events[-1].node == root
+    assert len(events) == 2 * sum(1 for _ in iter_events(root) if _.kind is ENTER)
+    assert [event.node.type for event in events[:4]] == [
+        "module",
+        "expression_statement",
+        "assignment",
+        "identifier",
+    ]
+
+
+def test_scope_stack_keeps_the_nearest_named_callable_across_anonymous_nodes() -> None:
+    scopes = ScopeStack()
+
+    scopes.push("Outer", is_callable=False)
+    scopes.push("Outer.method", is_callable=True)
+    scopes.push("Outer.method.callback", is_callable=False)
+    assert scopes.nearest_callable == "Outer.method"
+
+    assert scopes.pop() == "Outer.method.callback"
+    scopes.push("Outer.method.inner", is_callable=True)
+    assert scopes.nearest_callable == "Outer.method.inner"
+    assert scopes.pop() == "Outer.method.inner"
+    assert scopes.pop() == "Outer.method"
+    assert scopes.nearest_callable is None
+
+
+def extraction_location(start_byte: int, end_byte: int) -> SourceLocation:
+    return SourceLocation(start_byte, end_byte, 1, start_byte, 1, end_byte)
+
+
+def test_normalize_extraction_deduplicates_first_values_and_sorts_by_design_keys() -> None:
+    first_symbol = SymbolInfo(
+        "same", SymbolKind.FUNCTION, "first.same", None, extraction_location(20, 24), (), None,
+        ("ASYNC", "public", "unknown", "async"), (), (),
+    )
+    duplicate_symbol = SymbolInfo(
+        "same", SymbolKind.FUNCTION, "second.same", None, extraction_location(20, 24), (), None,
+        ("final",), (), (),
+    )
+    earlier_symbol = SymbolInfo(
+        "classy", SymbolKind.CLASS, "classy", None, extraction_location(3, 9), (), None,
+        (), (), (),
+    )
+    first_import = ImportInfo(
+        "z.module", (ImportBinding("item", None),), False, ("STATIC", "unknown"),
+        extraction_location(30, 38),
+    )
+    duplicate_import = ImportInfo(
+        "z.module", (ImportBinding("item", None),), False, ("final",), extraction_location(30, 38),
+    )
+    earlier_import = ImportInfo("a.module", (), False, (), extraction_location(4, 8))
+    first_call = CallSite("first.same", "run", CallKind.CALL, extraction_location(40, 43))
+    duplicate_call = CallSite("first.same", "run", CallKind.CALL, extraction_location(40, 43))
+    earlier_call = CallSite(None, "build", CallKind.CONSTRUCTOR, extraction_location(2, 7))
+    first_issue = ParseIssue(ParseIssueKind.SYNTAX_ERROR, "first", extraction_location(50, 51))
+    duplicate_issue = ParseIssue(ParseIssueKind.SYNTAX_ERROR, "second", extraction_location(50, 51))
+    earlier_issue = ParseIssue(ParseIssueKind.MISSING_NODE, "missing", extraction_location(1, 2))
+    locationless_issue = ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "later", None)
+
+    normalized = normalize_extraction(
+        ExtractionResult(
+            (first_symbol, duplicate_symbol, earlier_symbol),
+            (first_import, duplicate_import, earlier_import),
+            (first_call, duplicate_call, earlier_call),
+            (first_issue, duplicate_issue, earlier_issue, locationless_issue),
+        )
+    )
+
+    assert [symbol.qualified_name for symbol in normalized.symbols] == ["classy", "first.same"]
+    assert normalized.symbols[1].modifiers == ("public", "async")
+    assert [item.module for item in normalized.imports] == ["a.module", "z.module"]
+    assert normalized.imports[1].modifiers == ("static",)
+    assert [item.callee_text for item in normalized.calls] == ["build", "run"]
+    assert [(item.kind, item.message) for item in normalized.issues] == [
+        (ParseIssueKind.MISSING_NODE, "missing"),
+        (ParseIssueKind.SYNTAX_ERROR, "first"),
+        (ParseIssueKind.EXTRACTION_ERROR, "later"),
+    ]
+
+
+def test_modifier_order_is_fixed_and_ignores_unknown_values() -> None:
+    assert normalize_modifiers(
+        ("generator", "PRIVATE", "readonly", "async", "static", "private", "unknown")
+    ) == ("private", "static", "async", "readonly", "generator")
 
 
 @pytest.mark.parametrize(
