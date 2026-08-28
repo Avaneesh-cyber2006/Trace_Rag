@@ -1,3 +1,4 @@
+import ast
 import codecs
 from dataclasses import FrozenInstanceError
 import os
@@ -9,6 +10,7 @@ import pytest
 from tree_sitter import Language, Parser
 import tree_sitter_python
 
+from backend.code_parser.extractors import base as extractor_base
 from backend.code_parser.extractors.base import (
     ENTER,
     EXIT,
@@ -84,6 +86,13 @@ def test_source_location_is_frozen_and_uses_declared_field_order() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         location.end_byte = 4  # type: ignore[misc]
+
+
+def test_extractor_base_parses_at_the_python_311_grammar_boundary() -> None:
+    assert extractor_base.__file__ is not None
+    source = Path(extractor_base.__file__).read_text(encoding="utf-8")
+
+    ast.parse(source, filename=extractor_base.__file__, feature_version=(3, 11))
 
 
 def parse_python_fixture(data: bytes):

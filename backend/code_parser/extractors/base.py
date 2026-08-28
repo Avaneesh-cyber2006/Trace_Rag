@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Protocol
+from typing import Callable, Protocol, TypeVar
 
 from tree_sitter import Node, Tree
 
@@ -24,6 +24,7 @@ _MAX_TEXT_BYTES = 1000
 _ELLIPSIS = "…"
 _ELLIPSIS_BYTES = _ELLIPSIS.encode("utf-8")
 _ASCII_WHITESPACE = b" \t\n\r\f\v"
+_T = TypeVar("_T")
 
 
 class TraversalEventKind(str, Enum):
@@ -199,9 +200,9 @@ def _normalize_import(item: ImportInfo) -> ImportInfo:
     return replace(item, modifiers=normalize_modifiers(item.modifiers))
 
 
-def _deduplicate[T](values: Iterable[T], key) -> list[T]:
+def _deduplicate(values: Iterable[_T], key: Callable[[_T], object]) -> list[_T]:
     seen: set[object] = set()
-    unique: list[T] = []
+    unique: list[_T] = []
     for value in values:
         identity = key(value)
         if identity not in seen:
