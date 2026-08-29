@@ -78,15 +78,6 @@ def test_code_parser_enum_values_are_stable() -> None:
     assert [item.value for item in ParsedLanguage] == [
         "python", "java", "javascript", "typescript", "tsx"
     ]
-
-
-def test_reader_declares_supported_cross_module_internal_exports() -> None:
-    assert reader_module.__all__ == [
-        "SafeSourceReader",
-        "SourceBuffer",
-        "SourceReadError",
-    ]
-    assert not hasattr(code_parser_package, "SafeSourceReader")
     assert [item.value for item in SymbolKind] == [
         "class", "interface", "function", "method", "constructor", "enum", "constant"
     ]
@@ -98,6 +89,15 @@ def test_reader_declares_supported_cross_module_internal_exports() -> None:
         "path_invalid", "link_unsafe", "decoding_error", "parser_unavailable",
         "extraction_error",
     ]
+
+
+def test_reader_declares_supported_cross_module_internal_exports() -> None:
+    assert reader_module.__all__ == [
+        "SafeSourceReader",
+        "SourceBuffer",
+        "SourceReadError",
+    ]
+    assert not hasattr(code_parser_package, "SafeSourceReader")
 
 
 def test_source_location_is_frozen_and_uses_declared_field_order() -> None:
