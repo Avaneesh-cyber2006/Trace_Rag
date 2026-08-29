@@ -3979,6 +3979,19 @@ def test_source_digest_is_deterministic_and_retains_no_source_bytes(
     assert all(not isinstance(getattr(first, field.name), bytes) for field in fields(first))
 
 
+def test_scanner_parser_pipeline_preserves_chunker_prerequisites(
+    tmp_path: Path,
+) -> None:
+    namespace = "tracerag-repository-v1:github:https://github.com/acme/example"
+    data = b"def run():\r\n    return 1\r\n"
+    (tmp_path / "app.py").write_bytes(data)
+    scanned = FileScanner().scan(tmp_path, repository_namespace=namespace)
+    parsed = CodeParser().parse_inventory(scanned)
+    assert scanned.repository_namespace == namespace
+    assert parsed.repository_namespace == namespace
+    assert parsed.files[0].source_sha256 == hashlib.sha256(data).hexdigest()
+
+
 def test_module_2_integration_parses_scanner_inventory_without_rescanning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
