@@ -157,6 +157,7 @@ class PythonExtractor:
         callable_scopes = ScopeStack()
         pushed_scopes: set[tuple[int, int, str]] = set()
         pushed_barriers: set[tuple[int, int, str]] = set()
+        pushed_decorators: set[tuple[int, int, str]] = set()
         barrier_depth = 0
         captured_truncated_text = False
         syntax_issues = collect_syntax_issues(tree, source)
@@ -187,6 +188,9 @@ class PythonExtractor:
             node = event.node
             node_key = (node.start_byte, node.end_byte, node.type)
             if event.kind is not ENTER:
+                if node_key in pushed_decorators:
+                    pushed_decorators.remove(node_key)
+                    callable_scopes.pop()
                 if node_key in pushed_barriers:
                     pushed_barriers.remove(node_key)
                     callable_scopes.pop()
@@ -195,6 +199,15 @@ class PythonExtractor:
                     pushed_scopes.remove(node_key)
                     scopes.pop()
                     callable_scopes.pop()
+                continue
+
+            if node.type == "decorator":
+                callable_scopes.push(
+                    "",
+                    is_callable=False,
+                    is_ownership_barrier=True,
+                )
+                pushed_decorators.add(node_key)
                 continue
 
             if node.type == "class_definition":

@@ -42,6 +42,9 @@ _FUNCTION_VALUES = frozenset(
     {"arrow_function", "function_expression", "generator_function"}
 )
 _NON_SYMBOL_DECLARATION_SCOPES = frozenset({"internal_module", "module"})
+_MODIFIER_CONTEXT_BOUNDARIES = frozenset(
+    {"class_body", "program", "statement_block"}
+)
 _DIRECT_MODIFIERS = frozenset(
     {
         "abstract",
@@ -141,35 +144,15 @@ def _qualified_name(
     return bound(name if parent is None else f"{parent}.{name}"), parent
 
 
-def _export_modifiers(node: Node) -> tuple[str, ...]:
-    ancestor = node.parent
-    while ancestor is not None and ancestor.type not in {
-        "class_body",
-        "program",
-        "statement_block",
-    }:
-        if ancestor.type == "export_statement":
-            return tuple(
-                child.type
-                for child in ancestor.children
-                if child.type in {"export", "default"}
-            )
-        ancestor = ancestor.parent
-    return ()
-
-
-def _ambient_modifiers(node: Node) -> tuple[str, ...]:
-    ancestor = node.parent
-    while ancestor is not None and ancestor.type not in {
-        "class_body",
-        "program",
-        "statement_block",
-    }:
-        if ancestor.type == "ambient_declaration":
-            return tuple(
-                child.type for child in ancestor.children if child.type == "declare"
-            )
-        ancestor = ancestor.parent
+def _modifier_context(node: Node) -> tuple[str, ...]:
+    if node.type == "export_statement":
+        return tuple(
+            child.type
+            for child in node.children
+            if child.type in {"export", "default"}
+        )
+    if node.type == "ambient_declaration":
+        return tuple(child.type for child in node.children if child.type == "declare")
     return ()
 
 
@@ -189,12 +172,11 @@ def _direct_modifiers(node: Node) -> tuple[str, ...]:
     return tuple(modifiers)
 
 
-def _modifiers(node: Node) -> tuple[str, ...]:
-    return (
-        *_direct_modifiers(node),
-        *_ambient_modifiers(node),
-        *_export_modifiers(node),
-    )
+def _modifiers(
+    node: Node,
+    contextual_modifiers: tuple[str, ...],
+) -> tuple[str, ...]:
+    return (*_direct_modifiers(node), *contextual_modifiers)
 
 
 def _semantic_named_children(node: Node) -> tuple[Node, ...]:
@@ -535,6 +517,8 @@ class EcmaScriptExtractor:
         pushed_ownership_barriers: set[_SCOPE_KEY] = set()
         pushed_decorators: set[_SCOPE_KEY] = set()
         decorator_owners: list[str | None] = []
+        contextual_modifiers: tuple[str, ...] = ()
+        modifier_context_restore: dict[_SCOPE_KEY, tuple[str, ...]] = {}
         qualification_barrier_depth = 0
         extracted_class_bodies: set[_SCOPE_KEY] = set()
         captured_truncated_text = False
@@ -581,6 +565,8 @@ class EcmaScriptExtractor:
             node = event.node
             key = _node_key(node)
             if event.kind is not ENTER:
+                if key in modifier_context_restore:
+                    contextual_modifiers = modifier_context_restore.pop(key)
                 if key in pushed_decorators:
                     pushed_decorators.remove(key)
                     decorator_owners.pop()
@@ -594,10 +580,20 @@ class EcmaScriptExtractor:
                     ownership_scopes.pop()
                 continue
 
+            if node.type in _MODIFIER_CONTEXT_BOUNDARIES:
+                modifier_context_restore[key] = contextual_modifiers
+                contextual_modifiers = ()
+            else:
+                added_modifiers = _modifier_context(node)
+                if added_modifiers:
+                    modifier_context_restore[key] = contextual_modifiers
+                    contextual_modifiers = (
+                        *contextual_modifiers,
+                        *added_modifiers,
+                    )
+
             if node.type == "decorator":
-                decorator_owners.append(
-                    ownership_scopes[-2] if len(ownership_scopes) > 1 else None
-                )
+                decorator_owners.append(None)
                 pushed_decorators.add(key)
                 continue
 
@@ -639,7 +635,7 @@ class EcmaScriptExtractor:
                         source_location(node, source),
                         (),
                         None,
-                        _modifiers(node),
+                        _modifiers(node, contextual_modifiers),
                         base_types,
                         implemented_types,
                     )
@@ -672,7 +668,7 @@ class EcmaScriptExtractor:
                         source_location(node, source),
                         (),
                         None,
-                        _modifiers(node),
+                        _modifiers(node, contextual_modifiers),
                         _interface_bases(node, capture),
                         (),
                     )
@@ -705,7 +701,7 @@ class EcmaScriptExtractor:
                         source_location(node, source),
                         _parameters(node, capture, node_sets.typed_declarations),
                         _return_type(node, capture, node_sets.typed_declarations),
-                        _modifiers(node),
+                        _modifiers(node, contextual_modifiers),
                         (),
                         (),
                     )
@@ -749,7 +745,7 @@ class EcmaScriptExtractor:
                         source_location(node, source),
                         _parameters(node, capture, node_sets.typed_declarations),
                         _return_type(node, capture, node_sets.typed_declarations),
-                        _modifiers(node),
+                        _modifiers(node, contextual_modifiers),
                         (),
                         (),
                     )
@@ -776,7 +772,7 @@ class EcmaScriptExtractor:
                         source_location(node, source),
                         _parameters(value, capture, node_sets.typed_declarations),
                         _return_type(value, capture, node_sets.typed_declarations),
-                        (*_direct_modifiers(value), *_export_modifiers(node)),
+                        (*_direct_modifiers(value), *contextual_modifiers),
                         (),
                         (),
                     )
@@ -855,7 +851,7 @@ class EcmaScriptExtractor:
                             source_location(declarator, source),
                             (),
                             None,
-                            _modifiers(node),
+                            _modifiers(node, contextual_modifiers),
                             (),
                             (),
                         )

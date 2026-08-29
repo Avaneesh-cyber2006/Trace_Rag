@@ -2170,6 +2170,96 @@ def test_ecmascript_call_ownership_lookup_is_constant_per_call(monkeypatch) -> N
     assert parent_reads <= len(calls)
 
 
+def test_ecmascript_modifier_lookup_is_constant_per_declaration(monkeypatch) -> None:
+    """Contextual modifiers must come from traversal state, never parent walks."""
+
+    from backend.code_parser.extractors import ecmascript as ecmascript_module
+
+    parent_reads = 0
+
+    class CountingNode:
+        def __init__(
+            self,
+            node_type: str,
+            start_byte: int,
+            *,
+            parent: object | None = None,
+            name: object | None = None,
+        ) -> None:
+            self.type = node_type
+            self.start_byte = start_byte
+            self.end_byte = start_byte + 1
+            self.children = ()
+            self._parent = parent
+            self._name = name
+
+        @property
+        def parent(self) -> object | None:
+            nonlocal parent_reads
+            parent_reads += 1
+            return self._parent
+
+        def child_by_field_name(self, field: str) -> object | None:
+            return self._name if field == "name" else None
+
+    ancestor: object = CountingNode("program", 10_000)
+    for depth in range(64):
+        ancestor = CountingNode("wrapper", 9_000 + depth, parent=ancestor)
+
+    declarations = tuple(
+        CountingNode(
+            "function_declaration",
+            index * 2,
+            parent=ancestor,
+            name=CountingNode("identifier", index * 2),
+        )
+        for index in range(64)
+    )
+    events = tuple(
+        event
+        for declaration in declarations
+        for event in (
+            SimpleNamespace(kind=ENTER, node=declaration),
+            SimpleNamespace(kind=EXIT, node=declaration),
+        )
+    )
+
+    monkeypatch.setattr(
+        ecmascript_module,
+        "collect_syntax_issues",
+        lambda tree, source: (),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "iter_events",
+        lambda root: iter(events),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "is_trustworthy_capture",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "bounded_node_text",
+        lambda node, source: extractor_base.BoundedText("fn", False),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "source_location",
+        lambda node, source: extraction_location(node.start_byte, node.end_byte),
+    )
+
+    result = ecmascript_module.EcmaScriptExtractor().extract(
+        SimpleNamespace(root_node=object()),
+        SourceBuffer(b"", b"", 0),
+    )
+
+    assert len(result.symbols) == len(declarations)
+    assert all(symbol.modifiers == () for symbol in result.symbols)
+    assert parent_reads <= len(declarations)
+
+
 def test_capture_trust_does_not_rescan_syntax_issue_locations() -> None:
     class NonIterableIssues(tuple):
         def __iter__(self):
@@ -2310,6 +2400,44 @@ def test_typescript_parameter_decorator_call_is_outside_method_ownership() -> No
     assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
         (None, "dec"),
         ("C.method", "body"),
+    ]
+
+
+def test_python_nested_decorator_calls_are_universally_unowned() -> None:
+    data = b'''def outer():
+    @register(factory())
+    def inner():
+        body()
+    return after()
+'''
+
+    result = extract_python_fixture(data)
+
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "register"),
+        (None, "factory"),
+        ("outer.inner", "body"),
+        ("outer", "after"),
+    ]
+
+
+def test_typescript_nested_class_decorator_calls_are_universally_unowned() -> None:
+    data = b'''function outer() {
+    @dec(factory())
+    class Inner {
+        method() { body(); }
+    }
+    return after();
+}
+'''
+
+    result = extract_typescript_fixture(data)
+
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "dec"),
+        (None, "factory"),
+        ("outer.Inner.method", "body"),
+        ("outer", "after"),
     ]
 
 
