@@ -3010,6 +3010,7 @@ def test_get_extractor_rejects_keys_outside_the_closed_registry() -> None:
             (
                 "repository_path", "total_files_requested", "success_files", "partial_files",
                 "failed_files", "skipped_files", "files", "skipped",
+                "repository_namespace",
             ),
             "success_files",
             2,
@@ -3855,6 +3856,29 @@ def orchestration_file(
         category=category,
         size_bytes=size_bytes,
     )
+
+
+def test_code_parse_inventory_namespace_defaults_to_none() -> None:
+    result = CodeParseInventory("/repo", 0, 0, 0, 0, 0, (), ())
+    assert tuple(result.__dataclass_fields__)[-1] == "repository_namespace"
+    assert result.repository_namespace is None
+
+
+@pytest.mark.parametrize("namespace", ("opaque:A", "opaque:a", ""))
+def test_parser_copies_repository_namespace_exactly(
+    tmp_path: Path, namespace: str
+) -> None:
+    (tmp_path / "app.py").write_bytes(b"value = 1\n")
+    scanned = FileScanner().scan(tmp_path, repository_namespace=namespace)
+    parsed = CodeParser().parse_inventory(scanned)
+    assert parsed.repository_namespace == namespace
+
+
+def test_parser_rejects_non_string_repository_namespace(tmp_path: Path) -> None:
+    inventory = orchestration_inventory(tmp_path, ())
+    malformed = replace(inventory, repository_namespace=object())
+    with pytest.raises(InvalidParseInventory, match="Invalid file inventory"):
+        CodeParser().parse_inventory(malformed)
 
 
 def test_module_2_integration_parses_scanner_inventory_without_rescanning(

@@ -137,3 +137,4 @@ class CodeParseInventory:
     skipped_files: int
     files: tuple[ParsedFile, ...]
     skipped: tuple[SkippedParseFile, ...]
+    repository_namespace: str | None = None

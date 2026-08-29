@@ -59,6 +59,10 @@ def _validate_inventory(file_inventory: object) -> FileInventory:
     if (
         any(type(counter) is not int or counter < 0 for counter in counters)
         or any(not isinstance(items, tuple) for items in collections)
+        or not isinstance(
+            file_inventory.repository_namespace,
+            (str, type(None)),
+        )
         or file_inventory.included_files != len(file_inventory.files)
         or file_inventory.ignored_files != len(file_inventory.ignored)
         or file_inventory.total_files_seen
@@ -194,6 +198,7 @@ class CodeParser:
             skipped_files=len(skipped),
             files=files,
             skipped=skipped,
+            repository_namespace=inventory.repository_namespace,
         )
         logger.info(
             "Code parse inventory complete: %d success, %d partial, %d failed, %d skipped",
