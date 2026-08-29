@@ -12,9 +12,11 @@ This document is design only. It adds no production package, tests, dependencies
 
 The design is based on the contracts at `main` commit `8d5b7ea`.
 
-Module 2 supplies a frozen `FileInventory` with a resolved `repository_path` and sorted `ScannedFile` values. Each `ScannedFile` has a POSIX `relative_path`, filename, normalized extension, language hint, `FileCategory`, and scan-time `size_bytes`. Module 2 does not retain content or a digest and describes its inventory as a snapshot.
+Module 1 supplies a stable repository-origin identity through `RepositoryInfo.repo_url`, derived from its validated normalized GitHub repository URL. The calling pipeline canonicalizes that identity as the opaque namespace `"tracerag-repository-v1:github:" + repository.repo_url.casefold()`. Case-folding matches Module 1's current case-insensitive normalized-origin comparison. The namespace is stable across clones, worktrees, branches, commits, machines, and local paths; a GitHub rename or transfer intentionally changes it.
 
-Module 3 accepts only `FileInventory`, considers `SOURCE` and `TEST` entries, and returns a frozen `CodeParseInventory`. A `ParsedFile` contains `relative_path`, `ParsedLanguage`, `ParseStatus`, sorted `SymbolInfo`, `ImportInfo`, `CallSite`, and `ParseIssue` tuples. A `SymbolInfo` provides `SymbolKind`, syntactic qualified and parent names, parameters, declared types, modifiers, type relationships, and an exact `SourceLocation`.
+Module 2 supplies a frozen `FileInventory` with a resolved `repository_path`, an additive `repository_namespace: str | None = None`, and sorted `ScannedFile` values. Each `ScannedFile` has a POSIX `relative_path`, filename, normalized extension, language hint, `FileCategory`, and scan-time `size_bytes`. Module 2 does not retain content or a digest and describes its inventory as a snapshot. It accepts the already canonical namespace from its caller and stores it unchanged; it does not import Module 1, parse a GitHub URL, or recreate namespace normalization.
+
+Module 3 accepts only `FileInventory`, considers `SOURCE` and `TEST` entries, copies `FileInventory.repository_namespace` unchanged into an additive `CodeParseInventory.repository_namespace: str | None = None`, and otherwise returns the existing frozen parse inventory. A `ParsedFile` contains `relative_path`, `ParsedLanguage`, `ParseStatus`, sorted `SymbolInfo`, `ImportInfo`, `CallSite`, and `ParseIssue` tuples. A `SymbolInfo` provides `SymbolKind`, syntactic qualified and parent names, parameters, declared types, modifiers, type relationships, and an exact `SourceLocation`.
 
 `SourceLocation` addresses original file bytes as a half-open `[start_byte, end_byte)` range. Lines are one-based and columns are zero-based UTF-8 byte columns. Module 3 parses a BOM-free view when necessary but translates ranges back to the original byte buffer, including the three-byte BOM offset on line one.
 
@@ -43,12 +45,15 @@ Inventory validation is fatal and occurs before source reads. Module 4 requires:
 
 - both values to be instances of their public frozen models with internally consistent counters and tuple collections;
 - exact equality of `repository_path` after Module 2/3 normalization;
+- a nonempty `repository_namespace` on both inventories and exact equality between them;
 - unique `relative_path` values in both relevant file collections;
 - every `ParsedFile` to join to exactly one `ScannedFile` by the case-preserving POSIX relative path;
 - the matched scanner entry to be `SOURCE` or `TEST` and compatible with the parsed language/extension rules already used by Module 3;
 - Module 3 file and skip counters to form their documented partition.
 
 A local `dict[str, ScannedFile]` is built once for O(1) joins. It is not exposed in output. Combining inventories from different roots or inconsistent snapshots raises `InvalidChunkInventory`; it is never treated as a recoverable file issue.
+
+The namespace is repository identity; `repository_path` remains only the local safe-reading root. Absolute paths, inode/mtime, random UUIDs, Python `hash()`, checkout commit, branch, and worktree path are forbidden as identity inputs. Modules 2 and 3 treat the namespace as an opaque pipeline value and perform only generic compatibility-level type/shape handling. Module 4 owns the presence/equality requirement.
 
 ## 4. Snapshot Consistency
 
@@ -178,6 +183,7 @@ class ChunkedFile:
 @dataclass(frozen=True, slots=True)
 class CodeChunkInventory:
     repository_path: str
+    repository_namespace: str
     total_files_requested: int
     success_files: int
     partial_files: int
@@ -199,6 +205,7 @@ Language, path, imports, parse status, and source digest live once on `ChunkedFi
 ```text
 [
   "tracerag-code-chunk-v1",
+  repository_namespace,
   relative_path,
   kind.value,
   symbol_kind.value-or-empty,
@@ -212,7 +219,7 @@ Language, path, imports, parse status, and source digest live once on `ChunkedFi
 
 JSON array types and escaping make boundaries unambiguous. No random UUID, Python `hash()`, timestamps, inode, global output index, file ordering, import metadata, source digest, or content is included.
 
-The ID represents a structural source location. If bytes change but path, selected role, symbol identity, byte range, and fragment index remain unchanged, `chunk_id` remains stable while `content_hash` changes. Moving or resizing a symbol changes its ID because its authoritative citation range changed. Inserting an unrelated file or reordering input does not change IDs. Overloads at different byte ranges remain distinct.
+The ID represents a repository-namespaced structural source location. Equivalent clones/worktrees of the same normalized repository produce the same ID for the same provenance, while identical files and ranges in different repositories produce different IDs. If bytes change but namespace, path, selected role, symbol identity, byte range, and fragment index remain unchanged, `chunk_id` remains stable while `content_hash` changes. Moving or resizing a symbol changes its ID because its authoritative citation range changed. Inserting an unrelated file or reordering input does not change IDs. Overloads at different byte ranges remain distinct.
 
 ## 10. Content Hashes
 
@@ -466,6 +473,8 @@ Required acceptance areas are:
 - source disappearance, size change, same-size content mutation, symlink/reparse swap, path escape, read failure, and unsupported safe-open platform;
 - repeated runs produce identical file/chunk/issue order, IDs, hashes, locations, statuses, and counters;
 - insertion of an unrelated earlier file does not alter existing IDs, while moving/resizing a symbol does;
+- the same repository namespace and structural provenance across different clone/local paths produces the same ID;
+- different repository namespaces with identical source, relative path, and range produce different IDs;
 - content change at the same identity/range preserves `chunk_id` and changes `content_hash` when tested with constructed valid snapshots;
 - no source execution, second parser, tokenizer, external service, or new dependency.
 
@@ -482,6 +491,7 @@ It does not alter Module 2 filtering, add generated-code heuristics, retain ASTs
 - **Fingerprint:** Module 3 must add original-byte `source_sha256`; safe reread plus size is insufficient.
 - **Implementation gate:** Module 4 implementation is blocked on that separately approved compatibility patch.
 - **Inputs:** accept both inventories in pipeline order; Module 3 supplies structure and Module 2 supplies safe-read evidence.
+- **Repository namespace:** derive `tracerag-repository-v1:github:` plus the case-folded Module 1 normalized `repo_url` in the calling pipeline; propagate it opaquely through additive Module 2/3 inventory fields and retain it once on `CodeChunkInventory`.
 - **Reader:** deliberately reuse/promote Module 3's hardened reader as a supported internal boundary; do not duplicate or immediately relocate it.
 - **Primary content:** every chunk is one exact contiguous verified source slice.
 - **Selection:** callable and constant symbols are primary; leaf types are whole; parents with selected descendants become exact residual context.
@@ -492,7 +502,7 @@ It does not alter Module 2 filtering, add generated-code heuristics, retain ASTs
 - **Constants:** each conservative Module 3 constant remains an independent symbol chunk.
 - **Sizes:** provider-independent 4 KiB target and 8 KiB maximum, configurable with only two fields.
 - **Splitting:** child boundaries first, then line-aware exact fragments; UTF-8-safe hard cuts only for overlong lines.
-- **Identity:** `chunk_id` hashes canonical structural provenance without content; edits can preserve identity when range/metadata do.
+- **Identity:** `chunk_id` hashes repository namespace plus canonical structural provenance without content; edits can preserve identity when range/metadata do, but equivalent structures in different repositories cannot collide.
 - **Content evidence:** `content_hash` separately hashes exact slice bytes; equal hashes do not cause deduplication.
 - **Storage:** retain chunk text in Module 4 output; avoid repeated future I/O and stale verification.
 - **Ordering/complexity:** explicit stable keys and stack-based interval containment target `O(bytes + symbols log symbols)` per file.
@@ -501,7 +511,7 @@ It does not alter Module 2 filtering, add generated-code heuristics, retain ASTs
 
 ### Critical
 
-Approval and delivery of the Module 3 compatibility patch adding `ParsedFile.source_sha256` and documenting the supported cross-module safe-reader contract are prerequisites. Until then, Module 4 cannot prove same-size snapshot consistency and must not be implemented.
+Approval and delivery of the compatibility milestone are prerequisites: Module 3 adds `ParsedFile.source_sha256` and documents the supported cross-module safe-reader contract; Module 2 accepts/stores the opaque repository namespace; Module 3 copies it into `CodeParseInventory`. Until these contracts exist, Module 4 cannot prove same-size snapshot consistency or construct repository-namespaced chunk IDs and must not be implemented.
 
 ### Important
 
