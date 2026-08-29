@@ -115,3 +115,61 @@ Pruned directory contents are never discovered and do not inflate the counters. 
 Repository contents remain untrusted static data. The scanner never imports repository modules, evaluates configuration, reads environment values, executes Git or shell commands, invokes package managers/builds/tests, installs dependencies, calls a network service or LLM, or parses ASTs. It uses only the Python standard library.
 
 An inventory is a snapshot. Files may be replaced after scanning, so later consumers must reconstruct paths from `repository_path` plus `relative_path`, repeat containment/link checks, and handle filesystem races. Module 2 provides a deterministic language hint but does not promise a complete-file encoding, parse source structure, detect every secret, infer all generated code, or implement Module 3+ behavior.
+
+## Module 3 — Code Parser
+
+The Code Parser consumes an existing Module 2 `FileInventory` and returns an immutable, deterministic `CodeParseInventory`. It considers only the inventory's source and test entries, reads and parses them one file at a time, and does not rescan repository directories.
+
+Continuing from the Module 1 and Module 2 example:
+
+```python
+from backend.code_parser import CodeParser
+from backend.file_scanner import FileScanner
+
+inventory = FileScanner().scan(repository.local_path)
+parsed = CodeParser().parse_inventory(inventory)
+```
+
+The equivalent convenience API is `parse_code_inventory(inventory)`. Both APIs accept only a `FileInventory`; they do not accept a repository URL or path in place of that inventory.
+
+### Supported syntax and outcomes
+
+Version 1 supports exactly these installed grammar modes:
+
+- Python (`.py`)
+- Java (`.java`)
+- JavaScript/JSX (`.js` and `.jsx`)
+- TypeScript (`.ts`)
+- TSX (`.tsx`)
+
+Grammar selection validates the inventory's language hint and extension together. A contradictory pair or another source/test language is a normal unsupported-language skip. Configuration, build, database, documentation, and other non-code categories are outside the parsing request rather than reported as skipped.
+
+Every requested source/test file has exactly one mutually exclusive outcome: `SUCCESS`, `PARTIAL`, `FAILED`, or skipped as unsupported. A clean parse is `SUCCESS`. A parse that retains trustworthy structural metadata while also reporting syntax, missing-node, or extraction issues is `PARTIAL`. A read, containment, identity, decoding, parser, or extraction failure—or malformed syntax with no trustworthy structural item—is `FAILED`. Recoverable failures stay isolated to their file, and issue messages do not expose source text or raw parser exceptions.
+
+Each parsed file can contain symbols, parameters, declared types and defaults, normalized modifiers, direct inheritance/implementation syntax, static import evidence, syntactic call sites, lexical caller names, and issues. Defaults, annotations, callee expressions, imports, and type names are captured only as bounded syntax; they are never evaluated or resolved. Comments and docstrings are not retained.
+
+A `SourceLocation` always addresses the original file bytes as `[start_byte, end_byte)`: the start byte is inclusive, the end byte is exclusive, lines are 1-based, and columns are 0-based UTF-8 byte columns. UTF-8 BOM adjustment preserves those original-byte coordinates. These are byte columns, not Unicode character or display columns.
+
+### Dependencies and offline boundary
+
+Module 3 uses a reviewed, exact compatibility set of installed Tree-sitter wheels:
+
+```text
+tree-sitter==0.25.2
+tree-sitter-python==0.25.0
+tree-sitter-java==0.23.5
+tree-sitter-javascript==0.25.0
+tree-sitter-typescript==0.23.2
+```
+
+Package installation is a deployment/development step. Normal parsing is offline: it uses only these installed wheels, performs no network access, and performs no runtime grammar downloads or compilation. The analyzed repository cannot select a grammar module or native library.
+
+Treat the five pins as one compatibility unit when updating them. Change all five in one reviewed change, create a clean environment, install the proposed exact set, run `tests/test_code_parser_dependencies.py`, and then run all Python, Java, JavaScript/JSX, TypeScript, and TSX fixtures. Stop and revert the update if grammar import, initialization, ABI/API use, expected root nodes, syntax-error behavior, or any language fixture regresses; do not silently change versions or parser APIs.
+
+### Security and scope boundaries
+
+Repository contents remain untrusted static data. Module 3 does not execute repository code, dynamically import repository modules, evaluate decorators/defaults/annotations, run shell commands, package managers, builds, or tests, deserialize repository objects, call Git, a network service, or an LLM, or read grammars from the repository. It repeats containment, link/reparse-point, regular-file, size, exact-read, identity, and strict UTF-8 checks. When the platform cannot provide the required non-following filesystem primitive or stable identity evidence, parsing fails closed for the affected file.
+
+Processing is deliberately one file at a time. The result retains immutable structural metadata only: no complete source bytes or text and no Tree-sitter tree or node is retained after that file completes.
+
+Version 1 performs no cross-file resolution of imports, calls, symbols, base types, or implementations. It builds no dependency, inheritance, or call graph and defines no repository-global symbol IDs. Module 4 and later concerns are explicit non-goals: no chunking, no RAG, no embeddings, vector database, retrieval, graph construction, API, authentication, or frontend is implemented here.

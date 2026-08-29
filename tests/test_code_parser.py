@@ -3680,3 +3680,37 @@ def test_registry_rejects_invalid_static_configuration_without_exposing_metadata
         ParserRegistry(specs=specs)
 
     assert str(error.value) == message
+
+
+def test_readme_documents_module_3() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    required_fragments = (
+        "Module 3 — Code Parser",
+        "CodeParser",
+        "parse_inventory",
+        "FileInventory",
+        "CodeParseInventory",
+        "Python",
+        "Java",
+        "JavaScript/JSX",
+        "TypeScript",
+        "TSX",
+        "[start_byte, end_byte)",
+        "PARTIAL",
+        "unsupported",
+        "tree-sitter==0.25.2",
+        "tree-sitter-python==0.25.0",
+        "tree-sitter-java==0.23.5",
+        "tree-sitter-javascript==0.25.0",
+        "tree-sitter-typescript==0.23.2",
+        "offline",
+        "does not execute repository code",
+        "no cross-file resolution",
+        "no chunking",
+        "no RAG",
+    )
+
+    assert all(fragment in readme for fragment in required_fragments)
