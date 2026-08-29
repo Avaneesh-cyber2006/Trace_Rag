@@ -2,6 +2,7 @@ import ast
 import codecs
 from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 import gc
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -3891,6 +3892,33 @@ def test_parser_rejects_non_string_repository_namespace(tmp_path: Path) -> None:
     malformed = replace(inventory, repository_namespace=object())
     with pytest.raises(InvalidParseInventory, match="Invalid file inventory"):
         CodeParser().parse_inventory(malformed)
+
+
+@pytest.mark.parametrize(
+    ("filename", "data"),
+    (
+        ("app.py", b"def run():\n    return 1\n"),
+        ("App.java", b"class App { int run() { return 1; } }\n"),
+        ("app.js", b"function run() { return 1; }\n"),
+        ("app.ts", b"function run(): number { return 1; }\n"),
+        ("app.tsx", b"function App() { return <div />; }\n"),
+    ),
+)
+def test_successful_parse_hashes_exact_original_bytes(
+    tmp_path: Path, filename: str, data: bytes
+) -> None:
+    (tmp_path / filename).write_bytes(data)
+    parsed = CodeParser().parse_inventory(FileScanner().scan(tmp_path)).files[0]
+    assert parsed.status is ParseStatus.SUCCESS
+    assert parsed.source_sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_partial_parse_hashes_complete_original_bytes(tmp_path: Path) -> None:
+    data = b"def good():\n    return 1\n\ndef broken(\n"
+    (tmp_path / "app.py").write_bytes(data)
+    parsed = CodeParser().parse_inventory(FileScanner().scan(tmp_path)).files[0]
+    assert parsed.status is ParseStatus.PARTIAL
+    assert parsed.source_sha256 == hashlib.sha256(data).hexdigest()
 
 
 def test_module_2_integration_parses_scanner_inventory_without_rescanning(

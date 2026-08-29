@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 import logging
 
 from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
@@ -233,6 +234,8 @@ class CodeParser:
                 raise
             return _failed_file(relative_path, spec.language, error.kind, message)
 
+        source_sha256 = sha256(source.original_bytes).hexdigest()
+
         try:
             handle = self._registry.get_parser(spec)
         except ParserUnavailable:
@@ -256,6 +259,7 @@ class CodeParser:
                 imports=normalized.imports,
                 calls=normalized.calls,
                 issues=normalized.issues,
+                source_sha256=source_sha256,
             )
         except (
             InvalidParseInventory,
