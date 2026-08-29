@@ -1,13 +1,15 @@
 import ast
 import codecs
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
+import gc
 import os
 from pathlib import Path
 import stat
 from types import SimpleNamespace
+import weakref
 
 import pytest
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Node, Parser, Tree
 import tree_sitter_java
 import tree_sitter_javascript
 import tree_sitter_python
@@ -38,6 +40,8 @@ from backend.code_parser.registry import (
     ParserSpec,
     ParserUnavailable,
 )
+import backend.code_parser.parser as parser_module
+from backend.code_parser.parser import CodeParser
 import backend.code_parser.reader as reader_module
 from backend.code_parser.reader import (
     SafeSourceReader,
@@ -45,7 +49,7 @@ from backend.code_parser.reader import (
     SourceReadError,
     is_reparse_metadata,
 )
-from backend.file_scanner.models import FileCategory, ScannedFile
+from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
 from backend.code_parser.models import (
     CallKind,
     CallSite,
@@ -2956,6 +2960,445 @@ def test_registry_instances_do_not_share_cached_parser_instances() -> None:
     second = second_registry.get_parser(spec)
 
     assert first.parser is not second.parser
+
+
+def orchestration_inventory(
+    root: Path,
+    files: tuple[ScannedFile, ...],
+) -> FileInventory:
+    return FileInventory(
+        repository_path=str(root),
+        total_files_seen=len(files),
+        included_files=len(files),
+        ignored_files=0,
+        files=files,
+        ignored=(),
+        skipped_directories=(),
+    )
+
+
+def orchestration_file(
+    relative_path: str,
+    *,
+    language: str | None,
+    extension: str,
+    category: FileCategory = FileCategory.SOURCE,
+    size_bytes: int = 0,
+) -> ScannedFile:
+    return ScannedFile(
+        relative_path=relative_path,
+        filename=relative_path.rsplit("/", maxsplit=1)[-1],
+        extension=extension,
+        language=language,
+        category=category,
+        size_bytes=size_bytes,
+    )
+
+
+def test_inventory_validation_rejects_non_inventory_and_inconsistent_counters(
+    tmp_path: Path,
+) -> None:
+    valid = orchestration_inventory(tmp_path, ())
+    invalid_values = (
+        None,
+        replace(valid, included_files=1),
+        replace(valid, ignored_files=1),
+        replace(valid, total_files_seen=1),
+    )
+
+    for invalid in invalid_values:
+        with pytest.raises(InvalidParseInventory) as raised:
+            CodeParser().parse_inventory(invalid)  # type: ignore[arg-type]
+        assert str(raised.value) == "Invalid file inventory."
+
+
+def test_inventory_validation_rejects_missing_repository_root(tmp_path: Path) -> None:
+    inventory = orchestration_inventory(tmp_path / "missing", ())
+
+    with pytest.raises(RepositoryParseError):
+        CodeParser().parse_inventory(inventory)
+
+
+def test_category_selection_unsupported_and_contradictory_candidates(
+    tmp_path: Path,
+) -> None:
+    source_data = b"def source():\n    pass\n"
+    test_data = b"def test_source():\n    pass\n"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "app.py").write_bytes(source_data)
+    (tmp_path / "tests" / "test_app.py").write_bytes(test_data)
+    files = (
+        orchestration_file(
+            "notes/readme.py", language="python", extension=".py",
+            category=FileCategory.DOCUMENTATION,
+        ),
+        orchestration_file(
+            "settings.py", language="python", extension=".py",
+            category=FileCategory.CONFIG,
+        ),
+        orchestration_file(
+            "build.py", language="python", extension=".py",
+            category=FileCategory.BUILD,
+        ),
+        orchestration_file(
+            "tests/wrong.ts", language="python", extension=".ts",
+            category=FileCategory.TEST,
+        ),
+        orchestration_file("src/unknown.go", language="go", extension=".go"),
+        orchestration_file(
+            "tests/test_app.py", language="python", extension=".py",
+            category=FileCategory.TEST, size_bytes=len(test_data),
+        ),
+        orchestration_file(
+            "src/app.py", language="python", extension=".py",
+            size_bytes=len(source_data),
+        ),
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+
+    assert result.total_files_requested == 4
+    assert [(file.relative_path, file.status) for file in result.files] == [
+        ("src/app.py", ParseStatus.SUCCESS),
+        ("tests/test_app.py", ParseStatus.SUCCESS),
+    ]
+    assert result.skipped == (
+        SkippedParseFile("src/unknown.go", ParseSkipReason.UNSUPPORTED_LANGUAGE),
+        SkippedParseFile("tests/wrong.ts", ParseSkipReason.UNSUPPORTED_LANGUAGE),
+    )
+    assert (result.success_files, result.partial_files, result.failed_files) == (2, 0, 0)
+    assert result.skipped_files == 2
+
+
+def test_per_file_failure_keeps_malformed_scanned_path_nonfatal(tmp_path: Path) -> None:
+    invalid = orchestration_file(
+        "../escape.py", language="python", extension=".py", size_bytes=0
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, (invalid,)))
+
+    assert result.files == (
+        ParsedFile(
+            "../escape.py",
+            ParsedLanguage.PYTHON,
+            ParseStatus.FAILED,
+            (),
+            (),
+            (),
+            (ParseIssue(ParseIssueKind.PATH_INVALID, "Invalid source path.", None),),
+        ),
+    )
+    assert result.failed_files == 1
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_message"),
+    [
+        (ParseIssueKind.READ_ERROR, "Unable to read source file."),
+        (ParseIssueKind.FILE_CHANGED, "Source file changed after scanning."),
+        (ParseIssueKind.PATH_INVALID, "Invalid source path."),
+        (ParseIssueKind.LINK_UNSAFE, "Source path cannot be opened safely."),
+        (ParseIssueKind.DECODING_ERROR, "Source file is not valid UTF-8."),
+    ],
+)
+def test_per_file_failure_translates_reader_errors_to_fixed_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: ParseIssueKind,
+    expected_message: str,
+) -> None:
+    class FailingReader:
+        def __init__(self, repository_path: str) -> None:
+            assert repository_path == str(tmp_path)
+
+        def read(self, file: ScannedFile) -> SourceBuffer:
+            raise SourceReadError(kind, "repository-controlled secret")
+
+    monkeypatch.setattr(parser_module, "SafeSourceReader", FailingReader)
+    candidate = orchestration_file("app.py", language="python", extension=".py")
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, (candidate,)))
+
+    assert result.files == (
+        ParsedFile(
+            "app.py",
+            ParsedLanguage.PYTHON,
+            ParseStatus.FAILED,
+            (),
+            (),
+            (),
+            (ParseIssue(kind, expected_message, None),),
+        ),
+    )
+    assert "secret" not in result.files[0].issues[0].message
+
+
+def test_per_file_failure_isolates_unavailable_grammar_from_sibling_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    java_data = b"class Broken {}\n"
+    python_data = b"pass\n"
+    (tmp_path / "Broken.java").write_bytes(java_data)
+    (tmp_path / "good.py").write_bytes(python_data)
+
+    def unavailable_language() -> Language:
+        raise RuntimeError("grammar loader detail")
+
+    registry = ParserRegistry(
+        specs=(
+            ParserSpec(
+                "java", ParsedLanguage.JAVA, ".java", "java", unavailable_language
+            ),
+            ParserSpec(
+                "python", ParsedLanguage.PYTHON, ".py", "python",
+                lambda: Language(tree_sitter_python.language()),
+            ),
+        )
+    )
+    monkeypatch.setattr(parser_module, "ParserRegistry", lambda: registry)
+    files = (
+        orchestration_file(
+            "good.py", language="python", extension=".py", size_bytes=len(python_data)
+        ),
+        orchestration_file(
+            "Broken.java", language="java", extension=".java", size_bytes=len(java_data)
+        ),
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+
+    assert [(file.relative_path, file.status) for file in result.files] == [
+        ("Broken.java", ParseStatus.FAILED),
+        ("good.py", ParseStatus.SUCCESS),
+    ]
+    assert result.files[0].issues == (
+        ParseIssue(
+            ParseIssueKind.PARSER_UNAVAILABLE,
+            "Parser initialization is unavailable.",
+            None,
+        ),
+    )
+    assert (result.success_files, result.failed_files) == (1, 1)
+
+
+def test_per_file_failure_isolates_unexpected_extractor_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    java_data = b"class Broken {}\n"
+    python_data = b"pass\n"
+    (tmp_path / "Broken.java").write_bytes(java_data)
+    (tmp_path / "good.py").write_bytes(python_data)
+    original_get_extractor = parser_module.get_extractor
+
+    class ExplodingExtractor:
+        def extract(self, tree: Tree, source: SourceBuffer) -> ExtractionResult:
+            raise RuntimeError("source text must not escape")
+
+    def extractor_for(key: str):
+        return ExplodingExtractor() if key == "java" else original_get_extractor(key)
+
+    monkeypatch.setattr(parser_module, "get_extractor", extractor_for)
+    files = (
+        orchestration_file(
+            "good.py", language="python", extension=".py", size_bytes=len(python_data)
+        ),
+        orchestration_file(
+            "Broken.java", language="java", extension=".java", size_bytes=len(java_data)
+        ),
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+
+    assert [(file.relative_path, file.status) for file in result.files] == [
+        ("Broken.java", ParseStatus.FAILED),
+        ("good.py", ParseStatus.SUCCESS),
+    ]
+    assert result.files[0].issues == (
+        ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "Extraction failed.", None),
+    )
+    assert "source text" not in result.files[0].issues[0].message
+
+
+def test_deterministic_inventory_order_normalization_and_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, data in (("a.py", b"P"), ("B.py", b"F"), ("c.py", b"S")):
+        (tmp_path / name).write_bytes(data)
+    early = SymbolInfo(
+        "early", SymbolKind.CLASS, "early", None, extraction_location(1, 2), (), None,
+        (), (), (),
+    )
+    first = SymbolInfo(
+        "same", SymbolKind.FUNCTION, "first.same", None, extraction_location(10, 12),
+        (), None, ("PUBLIC",), (), (),
+    )
+    duplicate = replace(first, qualified_name="discarded.same", modifiers=("private",))
+    syntax_issue = ParseIssue(
+        ParseIssueKind.SYNTAX_ERROR, "Syntax error in source file.",
+        extraction_location(20, 21),
+    )
+    extraction_issue = ParseIssue(
+        ParseIssueKind.EXTRACTION_ERROR, "Extraction failed.", None
+    )
+
+    class OrderedExtractor:
+        def extract(self, tree: Tree, source: SourceBuffer) -> ExtractionResult:
+            if source.original_bytes == b"P":
+                return ExtractionResult((duplicate, early, first), (), (), (syntax_issue,))
+            if source.original_bytes == b"F":
+                return ExtractionResult((), (), (), (extraction_issue,))
+            return ExtractionResult((first, duplicate, early), (), (), ())
+
+    monkeypatch.setattr(parser_module, "get_extractor", lambda key: OrderedExtractor())
+    files = (
+        orchestration_file("C.go", language="go", extension=".go", size_bytes=0),
+        orchestration_file("c.py", language="python", extension=".py", size_bytes=1),
+        orchestration_file("B.py", language="python", extension=".py", size_bytes=1),
+        orchestration_file(
+            "a.py", language="python", extension=".py", category=FileCategory.TEST,
+            size_bytes=1,
+        ),
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+
+    assert [file.relative_path for file in result.files] == ["a.py", "B.py", "c.py"]
+    assert [file.relative_path for file in result.skipped] == ["C.go"]
+    assert [symbol.qualified_name for symbol in result.files[0].symbols] == [
+        "early", "discarded.same"
+    ]
+    assert result.files[0].symbols[1].modifiers == ("private",)
+    assert [symbol.qualified_name for symbol in result.files[2].symbols] == [
+        "early", "first.same"
+    ]
+    assert result.files[2].symbols[1].modifiers == ("public",)
+    assert [file.status for file in result.files] == [
+        ParseStatus.PARTIAL, ParseStatus.FAILED, ParseStatus.SUCCESS
+    ]
+    assert (
+        result.total_files_requested,
+        result.success_files,
+        result.partial_files,
+        result.failed_files,
+        result.skipped_files,
+    ) == (4, 1, 1, 1, 1)
+    assert result.total_files_requested == (
+        result.success_files
+        + result.partial_files
+        + result.failed_files
+        + result.skipped_files
+    )
+    assert len(result.files) == result.success_files + result.partial_files + result.failed_files
+    assert len(result.skipped) == result.skipped_files
+
+
+def test_one_file_at_a_time_parse_once_and_no_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+    source_references: list[weakref.ReferenceType[object]] = []
+    tree_references: list[weakref.ReferenceType[object]] = []
+
+    class TransientSource:
+        def __init__(self, relative_path: str) -> None:
+            self.original_bytes = ("SOURCE_PAYLOAD:" + relative_path).encode()
+            self.parse_bytes = self.original_bytes
+            self.bom_prefix_bytes = 0
+
+    class TransientTree:
+        pass
+
+    class RecordingReader:
+        def __init__(self, repository_path: str) -> None:
+            assert repository_path == str(tmp_path)
+
+        def read(self, file: ScannedFile) -> TransientSource:
+            gc.collect()
+            assert all(reference() is None for reference in source_references)
+            assert all(reference() is None for reference in tree_references)
+            source = TransientSource(file.relative_path)
+            source_references.append(weakref.ref(source))
+            events.append(("read", file.relative_path))
+            return source
+
+    class RecordingParser:
+        def parse(self, data: bytes) -> TransientTree:
+            relative_path = data.decode().removeprefix("SOURCE_PAYLOAD:")
+            events.append(("parse", relative_path))
+            tree = TransientTree()
+            tree_references.append(weakref.ref(tree))
+            return tree
+
+    spec = SimpleNamespace(
+        language=ParsedLanguage.PYTHON,
+        extractor_key="python",
+    )
+    recording_parser = RecordingParser()
+
+    class RecordingRegistry:
+        def select(self, file: ScannedFile):
+            return spec
+
+        def get_parser(self, selected: object):
+            assert selected is spec
+            return SimpleNamespace(parser=recording_parser)
+
+    class RecordingExtractor:
+        def extract(
+            self,
+            tree: TransientTree,
+            source: TransientSource,
+        ) -> ExtractionResult:
+            relative_path = source.original_bytes.decode().removeprefix("SOURCE_PAYLOAD:")
+            events.append(("extract", relative_path))
+            return ExtractionResult((), (), (), ())
+
+    def forbidden_scandir(path: object):
+        raise AssertionError(f"orchestration must not scan {path!r}")
+
+    monkeypatch.setattr(parser_module, "SafeSourceReader", RecordingReader)
+    monkeypatch.setattr(parser_module, "ParserRegistry", RecordingRegistry)
+    monkeypatch.setattr(parser_module, "get_extractor", lambda key: RecordingExtractor())
+    monkeypatch.setattr(os, "scandir", forbidden_scandir)
+    files = (
+        orchestration_file("b.py", language="python", extension=".py"),
+        orchestration_file("a.py", language="python", extension=".py"),
+    )
+
+    result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+    gc.collect()
+
+    assert events == [
+        ("read", "a.py"),
+        ("parse", "a.py"),
+        ("extract", "a.py"),
+        ("read", "b.py"),
+        ("parse", "b.py"),
+        ("extract", "b.py"),
+    ]
+    assert all(reference() is None for reference in source_references)
+    assert all(reference() is None for reference in tree_references)
+
+    def retained_values(value: object):
+        yield value
+        if is_dataclass(value):
+            for field in fields(value):
+                yield from retained_values(getattr(value, field.name))
+        elif isinstance(value, tuple):
+            for item in value:
+                yield from retained_values(item)
+
+    retained = tuple(retained_values(result))
+    assert not any(isinstance(value, (bytes, Node, Tree, TransientTree)) for value in retained)
+    assert not any(
+        isinstance(value, str) and value.startswith("SOURCE_PAYLOAD:")
+        for value in retained
+    )
 
 
 @pytest.mark.parametrize(
