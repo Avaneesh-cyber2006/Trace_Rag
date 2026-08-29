@@ -333,7 +333,7 @@ def is_trustworthy_capture(
     syntax_issues: tuple[ParseIssue, ...],
     *required_nodes: Node | None,
 ) -> bool:
-    """Allow captures outside invalid spans, or complete captures nested in one."""
+    """Reject internally damaged captures; allow complete captures nested in errors."""
 
     try:
         location = source_location(node, source)
@@ -345,12 +345,12 @@ def is_trustworthy_capture(
         if issue.location is not None
         and issue.kind in {ParseIssueKind.SYNTAX_ERROR, ParseIssueKind.MISSING_NODE}
     )
-    wholly_invalid = any(
+    nested_in_invalid = any(
         invalid.start_byte <= location.start_byte
         and location.end_byte <= invalid.end_byte
         for invalid in invalid_locations
     )
-    if not wholly_invalid:
+    if not node.has_error and not nested_in_invalid:
         return True
     if node.is_error or node.is_missing or node.has_error:
         return False

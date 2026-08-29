@@ -1822,6 +1822,69 @@ def test_malformed_supported_source_retains_complete_metadata_as_partial_parse(
     assert all("broken" not in issue.message.lower() for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("extractor_key", "data", "kept_name", "rejected_names"),
+    [
+        (
+            "python",
+            b"def good():\n    pass\ndef broken(x=):\n    pass\n",
+            "good",
+            {"broken"},
+        ),
+        (
+            "java",
+            b"class Good {}\nclass Broken { void nope( { } }\n",
+            "Good",
+            {"Broken", "nope"},
+        ),
+        (
+            "javascript",
+            b"function good() {}\nfunction broken(x = ) {}\n",
+            "good",
+            {"broken"},
+        ),
+        (
+            "typescript",
+            b"interface Good {}\nfunction broken(x: ) {}\n",
+            "Good",
+            {"broken"},
+        ),
+        (
+            "tsx",
+            b"function Good() { return <div />; }\n"
+            b"function Broken(x: ) { return <span />; }\n",
+            "Good",
+            {"Broken"},
+        ),
+    ],
+)
+def test_malformed_declaration_is_absent_while_known_good_symbol_survives(
+    extractor_key: str,
+    data: bytes,
+    kept_name: str,
+    rejected_names: set[str],
+) -> None:
+    if extractor_key == "python":
+        tree = parse_python_fixture(data)
+    elif extractor_key == "java":
+        tree = parse_java_fixture(data)
+    elif extractor_key == "javascript":
+        tree = parse_javascript_fixture(data)
+    elif extractor_key == "typescript":
+        tree = parse_typescript_fixture(data)
+    else:
+        tree = Parser(Language(tree_sitter_typescript.language_tsx())).parse(data)
+
+    result = get_extractor(extractor_key).extract(tree, SourceBuffer(data, data, 0))
+    extracted_names = {symbol.name for symbol in result.symbols}
+
+    assert tree.root_node.has_error
+    assert kept_name in extracted_names
+    assert extracted_names.isdisjoint(rejected_names)
+    assert result.issues
+    assert extractor_base.classify_parse_status(result) is ParseStatus.PARTIAL
+
+
 def test_syntax_issue_locations_use_original_bom_bytes_and_missing_nodes() -> None:
     parse_bytes = b"class A {"
     original_bytes = codecs.BOM_UTF8 + parse_bytes
@@ -1997,6 +2060,26 @@ def test_syntax_issue_invalid_span_retains_only_a_complete_nested_call() -> None
     assert incomplete.imports == ()
     assert incomplete.calls == ()
     assert extractor_base.classify_parse_status(incomplete) is ParseStatus.FAILED
+
+
+def test_malformed_tsx_call_with_internal_syntax_is_absent_and_failed() -> None:
+    data = b"ok(foo = );"
+    tree = Parser(Language(tree_sitter_typescript.language_tsx())).parse(data)
+
+    result = get_extractor("tsx").extract(tree, SourceBuffer(data, data, 0))
+
+    assert tree.root_node.has_error
+    assert result.symbols == ()
+    assert result.imports == ()
+    assert result.calls == ()
+    assert result.issues == (
+        ParseIssue(
+            ParseIssueKind.SYNTAX_ERROR,
+            "Syntax error in source file.",
+            SourceLocation(7, 8, 1, 7, 1, 8),
+        ),
+    )
+    assert extractor_base.classify_parse_status(result) is ParseStatus.FAILED
 
 
 @pytest.mark.parametrize(
