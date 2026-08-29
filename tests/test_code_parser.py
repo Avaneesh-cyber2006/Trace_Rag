@@ -78,6 +78,15 @@ def test_code_parser_enum_values_are_stable() -> None:
     assert [item.value for item in ParsedLanguage] == [
         "python", "java", "javascript", "typescript", "tsx"
     ]
+
+
+def test_reader_declares_supported_cross_module_internal_exports() -> None:
+    assert reader_module.__all__ == [
+        "SafeSourceReader",
+        "SourceBuffer",
+        "SourceReadError",
+    ]
+    assert not hasattr(code_parser_package, "SafeSourceReader")
     assert [item.value for item in SymbolKind] == [
         "class", "interface", "function", "method", "constructor", "enum", "constant"
     ]

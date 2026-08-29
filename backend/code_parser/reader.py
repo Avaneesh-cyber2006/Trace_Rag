@@ -1,4 +1,8 @@
-"""Fail-closed source-byte reader for parser inventory candidates."""
+"""Fail-closed source reading shared by trusted backend pipeline modules.
+
+``SafeSourceReader``, ``SourceBuffer``, and ``SourceReadError`` form the
+supported internal cross-module boundary.  Filesystem helpers remain private.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +22,9 @@ from .exceptions import RepositoryParseError
 from .models import ParseIssueKind
 
 
+__all__ = ["SafeSourceReader", "SourceBuffer", "SourceReadError"]
+
+
 _PATH_INVALID_MESSAGE = "Invalid source path."
 _LINK_UNSAFE_MESSAGE = "Source path cannot be opened safely."
 _READ_ERROR_MESSAGE = "Unable to read source file."
@@ -29,6 +36,8 @@ _IS_WINDOWS = os.name == "nt"
 
 @dataclass(frozen=True, slots=True)
 class SourceBuffer:
+    """Exact verified bytes and the BOM-adjusted parser view."""
+
     original_bytes: bytes
     parse_bytes: bytes
     bom_prefix_bytes: int
@@ -657,6 +666,8 @@ def _validate_relative_path(relative_path: object) -> tuple[str, ...]:
 
 
 class SafeSourceReader:
+    """Read one inventory-provided source through the fail-closed boundary."""
+
     def __init__(self, repository_path: Path | str) -> None:
         if isinstance(repository_path, str) and not repository_path:
             raise RepositoryParseError("Unable to establish the repository root.")
