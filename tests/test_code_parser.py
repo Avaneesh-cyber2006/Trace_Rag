@@ -4248,6 +4248,7 @@ def test_per_file_failure_translates_reader_errors_to_fixed_outcomes(
             (ParseIssue(kind, expected_message, None),),
         ),
     )
+    assert result.files[0].source_sha256 is None
     assert "secret" not in result.files[0].issues[0].message
 
 
@@ -4297,6 +4298,7 @@ def test_per_file_failure_isolates_unavailable_grammar_from_sibling_language(
             None,
         ),
     )
+    assert result.files[0].source_sha256 == hashlib.sha256(java_data).hexdigest()
     assert (result.success_files, result.failed_files) == (1, 1)
 
 
@@ -4336,6 +4338,7 @@ def test_per_file_failure_isolates_unexpected_extractor_exception(
     assert result.files[0].issues == (
         ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "Extraction failed.", None),
     )
+    assert result.files[0].source_sha256 == hashlib.sha256(java_data).hexdigest()
     assert "source text" not in result.files[0].issues[0].message
 
 

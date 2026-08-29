@@ -100,6 +100,8 @@ def _failed_file(
     language: ParsedLanguage,
     kind: ParseIssueKind,
     message: str,
+    *,
+    source_sha256: str | None = None,
 ) -> ParsedFile:
     return ParsedFile(
         relative_path=relative_path,
@@ -109,6 +111,7 @@ def _failed_file(
         imports=(),
         calls=(),
         issues=(ParseIssue(kind, message, None),),
+        source_sha256=source_sha256,
     )
 
 
@@ -244,6 +247,7 @@ class CodeParser:
                 spec.language,
                 ParseIssueKind.PARSER_UNAVAILABLE,
                 _PARSER_UNAVAILABLE_MESSAGE,
+                source_sha256=source_sha256,
             )
 
         try:
@@ -273,6 +277,7 @@ class CodeParser:
                 spec.language,
                 ParseIssueKind.EXTRACTION_ERROR,
                 _EXTRACTION_ERROR_MESSAGE,
+                source_sha256=source_sha256,
             )
 
 
