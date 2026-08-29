@@ -2,6 +2,7 @@ import ast
 import codecs
 from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 import gc
+import logging
 import os
 from pathlib import Path
 import stat
@@ -15,6 +16,7 @@ import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
 
+import backend.code_parser as code_parser_package
 from backend.code_parser.extractors import get_extractor
 from backend.code_parser.extractors import base as extractor_base
 from backend.code_parser.extractors.base import (
@@ -49,6 +51,7 @@ from backend.code_parser.reader import (
     SourceReadError,
     is_reparse_metadata,
 )
+from backend.file_scanner import FileScanner
 from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
 from backend.code_parser.models import (
     CallKind,
@@ -2228,6 +2231,56 @@ def test_fatal_errors_share_code_parser_base(error_type: type[Exception]) -> Non
     assert issubclass(error_type, CodeParserError)
 
 
+def test_public_exports_expose_the_complete_code_parser_contract() -> None:
+    expected = {
+        "CallKind",
+        "CallSite",
+        "CodeParseInventory",
+        "CodeParser",
+        "CodeParserError",
+        "ImportBinding",
+        "ImportInfo",
+        "InvalidParseInventory",
+        "ParameterInfo",
+        "ParsedFile",
+        "ParsedLanguage",
+        "ParseIssue",
+        "ParseIssueKind",
+        "ParserConfigurationError",
+        "ParseSkipReason",
+        "ParseStatus",
+        "RepositoryParseError",
+        "SkippedParseFile",
+        "SourceLocation",
+        "SymbolInfo",
+        "SymbolKind",
+        "parse_code_inventory",
+    }
+
+    assert set(code_parser_package.__all__) == expected
+    assert {name for name in expected if hasattr(code_parser_package, name)} == expected
+
+
+def test_convenience_api_delegates_the_given_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = orchestration_inventory(tmp_path, ())
+    result = object()
+    received: list[FileInventory] = []
+
+    def parse_inventory(self: CodeParser, value: FileInventory) -> object:
+        received.append(value)
+        return result
+
+    monkeypatch.setattr(CodeParser, "parse_inventory", parse_inventory)
+
+    actual = code_parser_package.parse_code_inventory(inventory)
+
+    assert actual is result
+    assert received == [inventory]
+
+
 def scanned_file(
     relative_path: str,
     *,
@@ -2992,6 +3045,197 @@ def orchestration_file(
         language=language,
         category=category,
         size_bytes=size_bytes,
+    )
+
+
+def test_module_2_integration_parses_scanner_inventory_without_rescanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixtures = {
+        "app.py": b"def run():\n    pass\n",
+        "Example.java": b"class Example {}\n",
+        "browser.js": b"function render() {}\n",
+        "types.ts": b"interface Service {}\n",
+        "view.tsx": b"const view = <div />;\n",
+        "unsupported.go": b"package main\n",
+        "settings.toml": b"enabled = true\n",
+        "README.md": b"# Fixture\n",
+    }
+    for relative_path, data in fixtures.items():
+        tmp_path.joinpath(relative_path).write_bytes(data)
+
+    inventory = FileScanner().scan(tmp_path)
+
+    def forbidden_scan(self: FileScanner, repository_path: Path | str) -> FileInventory:
+        raise AssertionError(f"Module 3 must not rescan {repository_path!r}")
+
+    monkeypatch.setattr(FileScanner, "scan", forbidden_scan)
+
+    result = CodeParser().parse_inventory(inventory)
+
+    assert result.total_files_requested == 6
+    assert (result.success_files, result.partial_files, result.failed_files) == (5, 0, 0)
+    assert result.skipped == (
+        SkippedParseFile(
+            "unsupported.go",
+            ParseSkipReason.UNSUPPORTED_LANGUAGE,
+        ),
+    )
+    assert {file.relative_path: file.language for file in result.files} == {
+        "app.py": ParsedLanguage.PYTHON,
+        "browser.js": ParsedLanguage.JAVASCRIPT,
+        "Example.java": ParsedLanguage.JAVA,
+        "types.ts": ParsedLanguage.TYPESCRIPT,
+        "view.tsx": ParsedLanguage.TSX,
+    }
+    assert not ({"settings.toml", "README.md"} & {
+        file.relative_path for file in result.files
+    })
+
+
+def test_logging_reports_sanitized_lifecycle_metadata_without_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    safe_data = b'''# SOURCE_SENTINEL\ndef safe(\n    value: ANNOTATION_SENTINEL = "DEFAULT_SENTINEL",\n):\n    return CALLEE_SENTINEL(value)\n'''
+    invalid_data = b"\xffRAW_BYTES_SENTINEL"
+    exploding_data = b"class Exploding {}\n"
+    (tmp_path / "safe.py").write_bytes(safe_data)
+    (tmp_path / "invalid.py").write_bytes(invalid_data)
+    (tmp_path / "Exploding.java").write_bytes(exploding_data)
+    original_get_extractor = parser_module.get_extractor
+
+    class ExplodingExtractor:
+        def extract(self, tree: Tree, source: SourceBuffer) -> ExtractionResult:
+            raise RuntimeError("EXCEPTION_SENTINEL")
+
+    def extractor_for(key: str):
+        if key == "java":
+            return ExplodingExtractor()
+        return original_get_extractor(key)
+
+    monkeypatch.setattr(parser_module, "get_extractor", extractor_for)
+    files = (
+        orchestration_file(
+            "safe.py", language="python", extension=".py", size_bytes=len(safe_data)
+        ),
+        orchestration_file(
+            "invalid.py", language="python", extension=".py",
+            size_bytes=len(invalid_data),
+        ),
+        orchestration_file(
+            "Exploding.java", language="java", extension=".java",
+            size_bytes=len(exploding_data),
+        ),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="backend.code_parser.parser"):
+        result = CodeParser().parse_inventory(orchestration_inventory(tmp_path, files))
+
+    messages = [record.getMessage() for record in caplog.records]
+    combined = "\n".join(messages)
+    assert result.success_files == 1
+    assert result.failed_files == 2
+    assert "Code parse inventory start: 3 files requested" in messages
+    assert "Code parse inventory complete: 1 success, 0 partial, 2 failed, 0 skipped" in messages
+    assert any(
+        "safe.py" in message
+        and "status=success" in message
+        and "symbols=1" in message
+        and "calls=1" in message
+        for message in messages
+    )
+    assert any(
+        "invalid.py" in message and "decoding_error" in message
+        for message in messages
+    )
+    assert any(
+        "Exploding.java" in message and "extraction_error" in message
+        for message in messages
+    )
+    assert {record.levelno for record in caplog.records} >= {
+        logging.INFO,
+        logging.DEBUG,
+        logging.WARNING,
+    }
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+    for sentinel in (
+        "SOURCE_SENTINEL",
+        "ANNOTATION_SENTINEL",
+        "DEFAULT_SENTINEL",
+        "CALLEE_SENTINEL",
+        "RAW_BYTES_SENTINEL",
+        "EXCEPTION_SENTINEL",
+    ):
+        assert sentinel not in combined
+
+
+def test_logging_uses_error_only_for_fatal_root_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    inventory = orchestration_inventory(tmp_path / "missing", ())
+
+    with caplog.at_level(logging.DEBUG, logger="backend.code_parser.parser"):
+        with pytest.raises(RepositoryParseError):
+            CodeParser().parse_inventory(inventory)
+
+    errors = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+    ]
+    assert errors == ["Code parse inventory failed: repository root unavailable"]
+    assert str(tmp_path) not in "\n".join(errors)
+
+
+def test_logging_sanitizes_control_characters_in_relative_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingReader:
+        def __init__(self, repository_path: str) -> None:
+            assert repository_path == str(tmp_path)
+
+        def read(self, file: ScannedFile) -> SourceBuffer:
+            raise SourceReadError(ParseIssueKind.READ_ERROR, "untrusted detail")
+
+    monkeypatch.setattr(parser_module, "SafeSourceReader", FailingReader)
+    candidate = orchestration_file(
+        "line\nbreak.py",
+        language="python",
+        extension=".py",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="backend.code_parser.parser"):
+        CodeParser().parse_inventory(orchestration_inventory(tmp_path, (candidate,)))
+
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "line?break.py" in combined
+    assert "line\nbreak.py" not in combined
+    assert "untrusted detail" not in combined
+
+
+def test_logging_reports_skipped_status_and_zero_extraction_counts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    candidate = orchestration_file(
+        "unsupported.go",
+        language="go",
+        extension=".go",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="backend.code_parser.parser"):
+        CodeParser().parse_inventory(orchestration_inventory(tmp_path, (candidate,)))
+
+    assert (
+        "Code parse file complete: unsupported.go status=skipped "
+        "symbols=0 imports=0 calls=0 issues=0"
+        in [record.getMessage() for record in caplog.records]
     )
 
 

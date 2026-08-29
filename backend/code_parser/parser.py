@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
 
 from .exceptions import (
@@ -24,6 +26,8 @@ from .models import (
 from .reader import SafeSourceReader, SourceReadError
 from .registry import ParserRegistry, ParserSpec, ParserUnavailable
 
+
+logger = logging.getLogger(__name__)
 
 _INVALID_INVENTORY_MESSAGE = "Invalid file inventory."
 _PARSER_UNAVAILABLE_MESSAGE = "Parser initialization is unavailable."
@@ -78,6 +82,14 @@ def _candidate_sort_key(file: object) -> tuple[str, str]:
     return relative_path.casefold(), relative_path
 
 
+def _sanitized_log_path(relative_path: str) -> str:
+    sanitized = "".join(
+        character if character.isprintable() else "?"
+        for character in relative_path
+    )
+    return sanitized or "<invalid>"
+
+
 def _failed_file(
     relative_path: str,
     language: ParsedLanguage,
@@ -95,43 +107,85 @@ def _failed_file(
     )
 
 
+def _log_parsed_file(file: ParsedFile) -> None:
+    relative_path = _sanitized_log_path(file.relative_path)
+    logger.debug(
+        "Code parse file complete: %s status=%s symbols=%d imports=%d calls=%d issues=%d",
+        relative_path,
+        file.status.value,
+        len(file.symbols),
+        len(file.imports),
+        len(file.calls),
+        len(file.issues),
+    )
+    for kind in dict.fromkeys(issue.kind for issue in file.issues):
+        logger.warning(
+            "Code parse recoverable issue: %s (%s)",
+            relative_path,
+            kind.value,
+        )
+
+
 class CodeParser:
     """Parse immutable scanner inventories without enumerating the repository."""
 
     def __init__(self) -> None:
-        self._registry = ParserRegistry()
+        try:
+            self._registry = ParserRegistry()
+        except ParserConfigurationError:
+            logger.error("Code parser initialization failed: invalid registry")
+            raise
 
     def parse_inventory(self, file_inventory: FileInventory) -> CodeParseInventory:
-        inventory = _validate_inventory(file_inventory)
-        reader = SafeSourceReader(inventory.repository_path)
+        try:
+            inventory = _validate_inventory(file_inventory)
+        except InvalidParseInventory:
+            logger.error("Code parse inventory failed: invalid inventory")
+            raise
         candidates = tuple(
             sorted(
                 (file for file in inventory.files if _is_code_candidate(file)),
                 key=_candidate_sort_key,
             )
         )
+        logger.info("Code parse inventory start: %d files requested", len(candidates))
+        try:
+            reader = SafeSourceReader(inventory.repository_path)
+        except RepositoryParseError:
+            logger.error("Code parse inventory failed: repository root unavailable")
+            raise
         parsed_files: list[ParsedFile] = []
         skipped_files: list[SkippedParseFile] = []
 
         for file in candidates:
             spec = self._select(file)
             relative_path = _relative_path(file)
+            log_path = _sanitized_log_path(relative_path)
             if spec is None:
+                logger.debug("Parser selection: %s (unsupported)", log_path)
                 skipped_files.append(
                     SkippedParseFile(
                         relative_path,
                         ParseSkipReason.UNSUPPORTED_LANGUAGE,
                     )
                 )
+                logger.debug(
+                    "Code parse file complete: %s status=skipped "
+                    "symbols=0 imports=0 calls=0 issues=0",
+                    log_path,
+                )
                 continue
-            parsed_files.append(self._parse_supported(file, relative_path, spec, reader))
+            logger.debug("Parser selection: %s (%s)", log_path, spec.language.value)
+            parsed_file = self._parse_supported(file, relative_path, spec, reader)
+            parsed_files.append(parsed_file)
+            _log_parsed_file(parsed_file)
 
         files = tuple(parsed_files)
         skipped = tuple(skipped_files)
         success_files = sum(file.status is ParseStatus.SUCCESS for file in files)
         partial_files = sum(file.status is ParseStatus.PARTIAL for file in files)
         failed_files = sum(file.status is ParseStatus.FAILED for file in files)
-        return CodeParseInventory(
+        result = CodeParseInventory(
             repository_path=inventory.repository_path,
             total_files_requested=len(candidates),
             success_files=success_files,
@@ -141,6 +195,14 @@ class CodeParser:
             files=files,
             skipped=skipped,
         )
+        logger.info(
+            "Code parse inventory complete: %d success, %d partial, %d failed, %d skipped",
+            result.success_files,
+            result.partial_files,
+            result.failed_files,
+            result.skipped_files,
+        )
+        return result
 
     def _select(self, file: object) -> ParserSpec | None:
         if not isinstance(file, ScannedFile):
@@ -203,3 +265,9 @@ class CodeParser:
                 ParseIssueKind.EXTRACTION_ERROR,
                 _EXTRACTION_ERROR_MESSAGE,
             )
+
+
+def parse_code_inventory(file_inventory: FileInventory) -> CodeParseInventory:
+    """Parse a scanner inventory with a new isolated parser instance."""
+
+    return CodeParser().parse_inventory(file_inventory)
