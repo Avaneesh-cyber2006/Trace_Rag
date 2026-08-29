@@ -292,7 +292,7 @@ git commit -m "feat: select structural chunk intervals"
 
 - [ ] **Step 1: Write RED partition tests**
 
-For class/method, outer/inner callable, nested type, interface method, enum method, and constants, concatenate candidates in byte order and assert exact slice ownership with no overlap. For `SUCCESS`, cover imports, comments, BOM preamble, package/module declarations, initialization, top-level statements, uncovered declarations, empty files, and whitespace-only gaps. Assert no missing non-whitespace coverage outside selected structure and do not trim retained gap boundaries.
+For class/method, outer/inner callable, nested type, interface method, enum method, and constants, concatenate candidates in byte order and assert exact slice ownership with no overlap. Add an explicit `OuterClass -> InnerClass -> method()` fixture and a deeper `OuterClass -> InnerClass -> NestedClass -> method()` fixture where only the method is a selected whole-symbol descendant. Assert the method range is represented exactly once, no ancestor-owned `CONTEXT` intersects it, no candidate ranges overlap, all eligible non-whitespace `SUCCESS` bytes remain covered, and candidate slices/coverage reconstruct the exact original-byte ranges without trimming, repetition, or normalization. For `SUCCESS`, also cover imports, comments, BOM preamble, package/module declarations, initialization, top-level statements, uncovered declarations, empty files, and whitespace-only gaps.
 
 - [ ] **Step 2: Verify RED**
 
@@ -302,7 +302,9 @@ Expected: parent/file gaps are absent.
 
 - [ ] **Step 3: Implement exact complements**
 
-Subtract the union of direct selected child ranges from meaningful parents, emitting non-whitespace gaps as owner-backed `CONTEXT`. For successful files, subtract top-level structural candidates from `[0, len(source))` and emit non-whitespace file context with `owner=None`. Determine whitespace by strict UTF-8 decoding and `str.isspace()` without trimming or syntax classification.
+For each meaningful parent, subtract the union of **all selected descendant ranges** contained within that parent, not merely directly selected children. Obtain covered ranges efficiently from the existing normalized containment forest and ordered interval traversal; do not add an all-pairs descendant scan or depth recursion. Emit non-whitespace gaps as owner-backed `CONTEXT`, and require every owned context span to be disjoint from every selected descendant candidate at every nesting depth.
+
+After owned symbol/context candidates have been finalized into one non-overlapping structural partition, compute `SUCCESS` file fallback by subtracting the union of **all ranges already covered by finalized candidates** from `[0, len(source))`. Emit only non-whitespace uncovered spans as `owner=None` `CONTEXT`. Determine whitespace by strict UTF-8 decoding and `str.isspace()` without trimming or syntax classification. The complete candidate set must remain pairwise non-overlapping while covering every eligible non-whitespace successful-file byte.
 
 - [ ] **Step 4: Run GREEN and invariant check**
 
@@ -623,7 +625,7 @@ git commit -m "test: lock code chunker security boundary"
 
 - [ ] **Step 1: Add deterministic operation-count tests**
 
-Generate deeply nested and wide synthetic `SymbolInfo` tuples. Instrument interval comparisons/stack operations to prove linear work after sorting and ensure no recursion error at depth above Python's recursion limit. Instrument scanner joins to demonstrate one dictionary build plus O(1) lookup per parsed file. Use a multi-file reader spy holding weak references/counters to assert the prior `SourceBuffer` is not retained when the next file read begins; inspect public outputs for no full-file source/AST retention.
+Generate deeply nested and wide synthetic `SymbolInfo` tuples. Instrument interval comparisons/stack operations to prove linear work after sorting and ensure no recursion error at depth above Python's recursion limit. Instrument scanner joins to demonstrate one dictionary build plus O(1) lookup per parsed file. Use weak references only if the existing Module 3 `SourceBuffer` supports them; otherwise use an equivalent multi-file reader/lifetime tracking spy or counter that proves the previous full source buffer is not retained when the next file read begins. Inspect public outputs for no full-file source/AST retention. Do not modify Module 2/3 contracts, `SourceBuffer`, or security implementation solely to enable this test.
 
 - [ ] **Step 2: Verify scaling test behavior**
 
