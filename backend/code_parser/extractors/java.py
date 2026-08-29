@@ -23,6 +23,7 @@ from .base import (
     ENTER,
     ExtractionResult,
     bounded_node_text,
+    bounded_utf8_text,
     collect_syntax_issues,
     is_trustworthy_capture,
     iter_events,
@@ -38,6 +39,11 @@ _TYPE_DECLARATIONS = {
     "enum_declaration": SymbolKind.ENUM,
 }
 _TYPE_BODIES = {"class_body", "interface_body", "enum_body"}
+_NON_SYMBOL_TYPE_DECLARATIONS = {
+    "annotation_type_declaration",
+    "record_declaration",
+}
+_ANONYMOUS_TYPE_BODY_PARENTS = {"enum_constant", "object_creation_expression"}
 _QUALIFIED_NAME_NODES = {"identifier", "scoped_identifier"}
 _REFERENCE_TYPE_NODES = {
     "annotated_type",
@@ -76,11 +82,12 @@ def _qualified_name(
     scopes: list[_LexicalScope],
     package_name: str,
     name: str,
+    bound: Callable[[str], str],
 ) -> tuple[str, str | None]:
     if scopes:
         parent = scopes[-1].qualified_name
-        return f"{parent}.{name}", parent
-    return (f"{package_name}.{name}" if package_name else name), None
+        return bound(f"{parent}.{name}"), parent
+    return bound(f"{package_name}.{name}" if package_name else name), None
 
 
 def _clause_types(
@@ -126,6 +133,7 @@ def _parameter_type(
     type_node: Node | None,
     dimensions: Node | None,
     capture: Callable[[Node], str],
+    bound: Callable[[str], str],
     *,
     spread: bool = False,
 ) -> str | None:
@@ -136,13 +144,14 @@ def _parameter_type(
         value += "..."
     if dimensions is not None:
         value += capture(dimensions)
-    return value
+    return bound(value)
 
 
 def _formal_parameter(
     node: Node,
     capture: Callable[[Node], str],
     capture_range: Callable[[int, int], str],
+    bound: Callable[[str], str],
 ) -> ParameterInfo | None:
     name = node.child_by_field_name("name")
     type_node = node.child_by_field_name("type")
@@ -172,7 +181,7 @@ def _formal_parameter(
             return None
         return ParameterInfo(
             capture(name),
-            _parameter_type(type_node, dimensions, capture, spread=True),
+            _parameter_type(type_node, dimensions, capture, bound, spread=True),
             None,
         )
 
@@ -194,7 +203,7 @@ def _formal_parameter(
         return None
     return ParameterInfo(
         capture(name),
-        _parameter_type(type_node, dimensions, capture),
+        _parameter_type(type_node, dimensions, capture, bound),
         None,
     )
 
@@ -203,12 +212,13 @@ def _parameters(
     node: Node | None,
     capture: Callable[[Node], str],
     capture_range: Callable[[int, int], str],
+    bound: Callable[[str], str],
 ) -> tuple[ParameterInfo, ...]:
     if node is None:
         return ()
     parameters: list[ParameterInfo] = []
     for child in node.named_children:
-        parameter = _formal_parameter(child, capture, capture_range)
+        parameter = _formal_parameter(child, capture, capture_range, bound)
         if parameter is not None:
             parameters.append(parameter)
     return tuple(parameters)
@@ -219,6 +229,7 @@ def _field_constants(
     scopes: list[_LexicalScope],
     source: SourceBuffer,
     capture: Callable[[Node], str],
+    bound: Callable[[str], str],
 ) -> tuple[SymbolInfo, ...]:
     if (
         not scopes
@@ -237,7 +248,7 @@ def _field_constants(
         if name_node is None or name_node.type != "identifier":
             continue
         name = capture(name_node)
-        qualified, parent = _qualified_name(scopes, "", name)
+        qualified, parent = _qualified_name(scopes, "", name, bound)
         symbols.append(
             SymbolInfo(
                 name,
@@ -291,6 +302,8 @@ class JavaExtractor:
         scopes: list[_LexicalScope] = []
         ownership_scopes: list[str | None] = []
         pushed_scopes: set[tuple[int, int, str]] = set()
+        pushed_barriers: set[tuple[int, int, str]] = set()
+        barrier_depth = 0
         captured_truncated_text = False
         syntax_issues = collect_syntax_issues(tree, source)
 
@@ -299,6 +312,18 @@ class JavaExtractor:
             bounded = bounded_node_text(node, source)
             captured_truncated_text |= bounded.was_truncated
             return bounded.text
+
+        def bound(value: str) -> str:
+            nonlocal captured_truncated_text
+            bounded = bounded_utf8_text(value)
+            captured_truncated_text |= bounded.was_truncated
+            return bounded.text
+
+        def push_barrier(node_key: tuple[int, int, str]) -> None:
+            nonlocal barrier_depth
+            ownership_scopes.append(None)
+            barrier_depth += 1
+            pushed_barriers.add(node_key)
 
         def capture_range(start_byte: int, end_byte: int) -> str:
             nonlocal captured_truncated_text
@@ -338,21 +363,39 @@ class JavaExtractor:
             node = event.node
             node_key = (node.start_byte, node.end_byte, node.type)
             if event.kind is not ENTER:
+                if node_key in pushed_barriers:
+                    pushed_barriers.remove(node_key)
+                    ownership_scopes.pop()
+                    barrier_depth -= 1
                 if node_key in pushed_scopes:
                     pushed_scopes.remove(node_key)
                     scopes.pop()
                     ownership_scopes.pop()
                 continue
 
+            if node.type in _NON_SYMBOL_TYPE_DECLARATIONS or (
+                node.type == "class_body"
+                and node.parent is not None
+                and node.parent.type in _ANONYMOUS_TYPE_BODY_PARENTS
+            ):
+                push_barrier(node_key)
+                continue
+
             type_kind = _TYPE_DECLARATIONS.get(node.type)
             if type_kind is not None:
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
+                if barrier_depth or name_node is None or not is_trustworthy_capture(
                     node, source, syntax_issues, name_node
                 ):
+                    push_barrier(node_key)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, package_name, name)
+                qualified, parent = _qualified_name(
+                    scopes,
+                    package_name,
+                    name,
+                    bound,
+                )
                 bases, implemented = _type_relations(node, capture)
                 symbols.append(
                     SymbolInfo(
@@ -374,19 +417,32 @@ class JavaExtractor:
                 continue
 
             if node.type in {"constructor_declaration", "method_declaration"}:
-                if node.parent is None or node.parent.type not in _TYPE_BODIES:
+                if (
+                    node.parent is None
+                    or node.parent.type not in _TYPE_BODIES
+                    or barrier_depth
+                    or not scopes
+                    or scopes[-1].kind != "type"
+                ):
                     continue
                 name_node = node.child_by_field_name("name")
                 if name_node is None or not is_trustworthy_capture(
                     node, source, syntax_issues, name_node
                 ):
+                    push_barrier(node_key)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, package_name, name)
+                qualified, parent = _qualified_name(
+                    scopes,
+                    package_name,
+                    name,
+                    bound,
+                )
                 parameters = _parameters(
                     node.child_by_field_name("parameters"),
                     capture,
                     capture_range,
+                    bound,
                 )
                 return_node = node.child_by_field_name("type")
                 kind = (
@@ -414,8 +470,14 @@ class JavaExtractor:
                 continue
 
             if node.type == "field_declaration":
-                if is_trustworthy_capture(node, source, syntax_issues):
-                    symbols.extend(_field_constants(node, scopes, source, capture))
+                if not barrier_depth and is_trustworthy_capture(
+                    node,
+                    source,
+                    syntax_issues,
+                ):
+                    symbols.extend(
+                        _field_constants(node, scopes, source, capture, bound)
+                    )
                 continue
 
             if node.type == "import_declaration":

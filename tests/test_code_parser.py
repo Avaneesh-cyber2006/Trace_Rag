@@ -2089,6 +2089,260 @@ def test_malformed_tsx_call_with_internal_syntax_is_absent_and_failed() -> None:
     assert extractor_base.classify_parse_status(result) is ParseStatus.FAILED
 
 
+def test_ecmascript_call_ownership_lookup_is_constant_per_call(monkeypatch) -> None:
+    """A parent-walk implementation makes this counter grow calls x depth."""
+
+    from backend.code_parser.extractors import ecmascript as ecmascript_module
+
+    parent_reads = 0
+
+    class CountingNode:
+        def __init__(
+            self,
+            node_type: str,
+            start_byte: int,
+            *,
+            parent: object | None = None,
+            function: object | None = None,
+        ) -> None:
+            self.type = node_type
+            self.start_byte = start_byte
+            self.end_byte = start_byte + 1
+            self._parent = parent
+            self._function = function
+
+        @property
+        def parent(self) -> object | None:
+            nonlocal parent_reads
+            parent_reads += 1
+            return self._parent
+
+        def child_by_field_name(self, name: str) -> object | None:
+            return self._function if name == "function" else None
+
+    ancestor: object | None = None
+    for depth in range(64):
+        ancestor = CountingNode("parent", depth, parent=ancestor)
+
+    calls = tuple(
+        CountingNode(
+            "call_expression",
+            index,
+            parent=ancestor,
+            function=CountingNode("member_expression", index),
+        )
+        for index in range(64)
+    )
+    events = tuple(SimpleNamespace(kind=ENTER, node=node) for node in calls)
+
+    monkeypatch.setattr(
+        ecmascript_module,
+        "collect_syntax_issues",
+        lambda tree, source: (),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "iter_events",
+        lambda root: iter(events),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "is_trustworthy_capture",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "bounded_node_text",
+        lambda node, source: extractor_base.BoundedText("target", False),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "source_location",
+        lambda node, source: extraction_location(node.start_byte, node.end_byte),
+    )
+
+    result = ecmascript_module.EcmaScriptExtractor().extract(
+        SimpleNamespace(root_node=object()),
+        SourceBuffer(b"", b"", 0),
+    )
+
+    assert len(result.calls) == len(calls)
+    assert parent_reads <= len(calls)
+
+
+def test_capture_trust_does_not_rescan_syntax_issue_locations() -> None:
+    class NonIterableIssues(tuple):
+        def __iter__(self):
+            raise AssertionError("capture trust rescanned syntax issues")
+
+    data = b"ok();"
+    call = parse_javascript_fixture(data).root_node.named_children[0].named_children[0]
+    function = call.child_by_field_name("function")
+
+    assert extractor_base.is_trustworthy_capture(
+        call,
+        SourceBuffer(data, data, 0),
+        NonIterableIssues(),
+        function,
+    )
+
+
+@pytest.mark.parametrize(
+    ("extract_fixture", "data", "symbol_count"),
+    [
+        (
+            extract_python_fixture,
+            b"".join(
+                (b"    " * depth) + b"def abcdefghij():\n"
+                for depth in range(110)
+            )
+            + (b"    " * 110)
+            + b"pass\n",
+            110,
+        ),
+        (
+            extract_java_fixture,
+            (b"class Abcdefghij {" * 110) + (b"}" * 110),
+            110,
+        ),
+        (
+            extract_javascript_fixture,
+            (b"function abcdefghij(){" * 110) + (b"}" * 110),
+            110,
+        ),
+    ],
+    ids=("python", "java", "javascript"),
+)
+def test_qualified_name_metadata_stays_within_the_utf8_byte_bound(
+    extract_fixture,
+    data: bytes,
+    symbol_count: int,
+) -> None:
+    result = extract_fixture(data)
+    qualified_name_bytes = [
+        len(value.encode("utf-8"))
+        for symbol in result.symbols
+        for value in (symbol.qualified_name, symbol.parent_qualified_name)
+        if value is not None
+    ]
+
+    assert len(result.symbols) == symbol_count
+    assert all(size <= 1000 for size in qualified_name_bytes)
+    assert sum(qualified_name_bytes) <= symbol_count * 2 * 1000
+    assert any(issue.kind is ParseIssueKind.EXTRACTION_ERROR for issue in result.issues)
+
+
+def test_rejected_python_class_is_a_symbol_and_call_ownership_barrier() -> None:
+    data = b"class Broken(:\n    def good(self):\n        ok()\n"
+
+    result = extract_python_fixture(data)
+
+    assert result.symbols == ()
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "ok"),
+    ]
+
+
+def test_java_anonymous_class_is_a_symbol_and_call_ownership_barrier() -> None:
+    data = (
+        b"class A { void outer(){ Object x = new Object(){ "
+        b"void run(){ go(); } }; } }"
+    )
+
+    result = extract_java_fixture(data)
+
+    assert [(symbol.kind, symbol.qualified_name) for symbol in result.symbols] == [
+        (SymbolKind.CLASS, "A"),
+        (SymbolKind.METHOD, "A.outer"),
+    ]
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        ("A.outer", "Object"),
+        (None, "go"),
+    ]
+
+
+def test_java_unsupported_record_is_a_symbol_and_call_ownership_barrier() -> None:
+    data = b"record R(int x) { void m(){ go(); } }"
+
+    result = extract_java_fixture(data)
+
+    assert result.symbols == ()
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "go"),
+    ]
+
+
+def test_typescript_namespace_is_a_symbol_and_call_ownership_barrier() -> None:
+    data = b"namespace N { export function f(){ go(); } }"
+
+    result = extract_typescript_fixture(data)
+
+    assert result.symbols == ()
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "go"),
+    ]
+
+
+def test_python_local_class_bases_and_initializers_are_unowned() -> None:
+    data = b'''def outer():
+    class Local(factory()):
+        VALUE = make()
+        def method(self):
+            inside()
+    return done()
+'''
+
+    result = extract_python_fixture(data)
+
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "factory"),
+        (None, "make"),
+        ("outer.Local.method", "inside"),
+        ("outer", "done"),
+    ]
+
+
+def test_typescript_parameter_decorator_call_is_outside_method_ownership() -> None:
+    data = b"class C { method(@dec() x: string) { body(); } }"
+
+    result = extract_typescript_fixture(data)
+
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "dec"),
+        ("C.method", "body"),
+    ]
+
+
+def test_java_vararg_type_stays_within_the_utf8_byte_bound() -> None:
+    data = b"class C { void run(" + (b"A" * 1000) + b"... values) {} }"
+
+    result = extract_java_fixture(data)
+    parameter = result.symbols[1].parameters[0]
+
+    assert parameter.type_name is not None
+    assert len(parameter.type_name.encode("utf-8")) <= 1000
+    assert parameter.type_name.endswith("…")
+    assert any(issue.kind is ParseIssueKind.EXTRACTION_ERROR for issue in result.issues)
+
+
+def test_extraction_result_is_frozen_slotted_and_retains_only_metadata() -> None:
+    result = ExtractionResult((), (), (), ())
+
+    assert tuple(result.__dataclass_fields__) == ("symbols", "imports", "calls", "issues")
+    assert not hasattr(result, "__dict__")
+    assert not any(
+        name in result.__dataclass_fields__
+        for name in ("source", "source_bytes", "source_text", "tree", "syntax_tree")
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.symbols = ()  # type: ignore[misc]
+
+
+def test_get_extractor_rejects_keys_outside_the_closed_registry() -> None:
+    with pytest.raises(ValueError, match="Unknown extractor key"):
+        get_extractor("../../repository-controlled")
+
+
 @pytest.mark.parametrize(
     ("value", "field_order", "field_to_mutate", "replacement"),
     [

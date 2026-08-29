@@ -25,6 +25,7 @@ from .base import (
     ExtractionResult,
     ScopeStack,
     bounded_node_text,
+    bounded_utf8_text,
     collect_syntax_issues,
     is_trustworthy_capture,
     iter_events,
@@ -42,9 +43,13 @@ class _LexicalScope:
     kind: str
 
 
-def _qualified_name(scopes: list[_LexicalScope], name: str) -> tuple[str, str | None]:
+def _qualified_name(
+    scopes: list[_LexicalScope],
+    name: str,
+    bound: Callable[[str], str],
+) -> tuple[str, str | None]:
     parent = scopes[-1].qualified_name if scopes else None
-    return (name if parent is None else f"{parent}.{name}"), parent
+    return bound(name if parent is None else f"{parent}.{name}"), parent
 
 
 def _parameters(node: Node, capture: Callable[[Node], str]) -> tuple[ParameterInfo, ...]:
@@ -151,6 +156,8 @@ class PythonExtractor:
         scopes: list[_LexicalScope] = []
         callable_scopes = ScopeStack()
         pushed_scopes: set[tuple[int, int, str]] = set()
+        pushed_barriers: set[tuple[int, int, str]] = set()
+        barrier_depth = 0
         captured_truncated_text = False
         syntax_issues = collect_syntax_issues(tree, source)
 
@@ -160,10 +167,30 @@ class PythonExtractor:
             captured_truncated_text |= bounded.was_truncated
             return bounded.text
 
+        def bound(value: str) -> str:
+            nonlocal captured_truncated_text
+            bounded = bounded_utf8_text(value)
+            captured_truncated_text |= bounded.was_truncated
+            return bounded.text
+
+        def push_barrier(node_key: tuple[int, int, str]) -> None:
+            nonlocal barrier_depth
+            callable_scopes.push(
+                "",
+                is_callable=False,
+                is_ownership_barrier=True,
+            )
+            barrier_depth += 1
+            pushed_barriers.add(node_key)
+
         for event in iter_events(tree.root_node):
             node = event.node
             node_key = (node.start_byte, node.end_byte, node.type)
             if event.kind is not ENTER:
+                if node_key in pushed_barriers:
+                    pushed_barriers.remove(node_key)
+                    callable_scopes.pop()
+                    barrier_depth -= 1
                 if node_key in pushed_scopes:
                     pushed_scopes.remove(node_key)
                     scopes.pop()
@@ -172,12 +199,13 @@ class PythonExtractor:
 
             if node.type == "class_definition":
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
+                if barrier_depth or name_node is None or not is_trustworthy_capture(
                     node, source, syntax_issues, name_node
                 ):
+                    push_barrier(node_key)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -193,18 +221,23 @@ class PythonExtractor:
                     )
                 )
                 scopes.append(_LexicalScope(qualified, "class"))
-                callable_scopes.push(qualified, is_callable=False)
+                callable_scopes.push(
+                    qualified,
+                    is_callable=False,
+                    is_ownership_barrier=True,
+                )
                 pushed_scopes.add(node_key)
                 continue
 
             if node.type == "function_definition":
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
+                if barrier_depth or name_node is None or not is_trustworthy_capture(
                     node, source, syntax_issues, name_node
                 ):
+                    push_barrier(node_key)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 directly_in_class = bool(scopes and scopes[-1].kind == "class")
                 if directly_in_class and name == "__init__":
                     kind = SymbolKind.CONSTRUCTOR
@@ -240,7 +273,9 @@ class PythonExtractor:
 
             if node.type == "assignment":
                 left = node.child_by_field_name("left")
-                constant_scope = not scopes or scopes[-1].kind == "class"
+                constant_scope = not barrier_depth and (
+                    not scopes or scopes[-1].kind == "class"
+                )
                 if (
                     left is not None
                     and left.type == "identifier"
@@ -249,7 +284,7 @@ class PythonExtractor:
                 ):
                     name = capture(left)
                     if name.isupper():
-                        qualified, parent = _qualified_name(scopes, name)
+                        qualified, parent = _qualified_name(scopes, name, bound)
                         symbols.append(
                             SymbolInfo(
                                 name,

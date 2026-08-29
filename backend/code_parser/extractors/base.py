@@ -71,6 +71,7 @@ class BaseExtractor(Protocol):
 class _ScopeEntry:
     qualified_name: str
     is_callable: bool
+    is_ownership_barrier: bool
 
 
 class ScopeStack:
@@ -79,8 +80,16 @@ class ScopeStack:
     def __init__(self) -> None:
         self._entries: list[_ScopeEntry] = []
 
-    def push(self, qualified_name: str, *, is_callable: bool) -> None:
-        self._entries.append(_ScopeEntry(qualified_name, is_callable))
+    def push(
+        self,
+        qualified_name: str,
+        *,
+        is_callable: bool,
+        is_ownership_barrier: bool = False,
+    ) -> None:
+        self._entries.append(
+            _ScopeEntry(qualified_name, is_callable, is_ownership_barrier)
+        )
 
     def pop(self) -> str:
         return self._entries.pop().qualified_name
@@ -90,6 +99,8 @@ class ScopeStack:
         for entry in reversed(self._entries):
             if entry.is_callable:
                 return entry.qualified_name
+            if entry.is_ownership_barrier:
+                return None
         return None
 
 
@@ -166,12 +177,13 @@ def source_location(node: Node, source: SourceBuffer) -> SourceLocation:
     return location
 
 
-def bounded_node_text(node: Node, source: SourceBuffer) -> BoundedText:
-    """Return stripped node text, retaining no more than 1,000 UTF-8 bytes."""
+def bounded_utf8_text(value: str) -> BoundedText:
+    """Bound generated metadata using the same UTF-8 policy as source slices."""
 
-    if not 0 <= node.start_byte <= node.end_byte <= len(source.parse_bytes):
-        raise ValueError("Tree-sitter node range is outside the source buffer.")
-    value = source.parse_bytes[node.start_byte : node.end_byte].strip(_ASCII_WHITESPACE)
+    return _bounded_utf8_bytes(value.encode("utf-8"))
+
+
+def _bounded_utf8_bytes(value: bytes) -> BoundedText:
     if len(value) <= _MAX_TEXT_BYTES:
         return BoundedText(value.decode("utf-8", errors="strict"), False)
 
@@ -183,6 +195,15 @@ def bounded_node_text(node: Node, source: SourceBuffer) -> BoundedText:
         except UnicodeDecodeError:
             prefix = prefix[:-1]
     return BoundedText(_ELLIPSIS, True)
+
+
+def bounded_node_text(node: Node, source: SourceBuffer) -> BoundedText:
+    """Return stripped node text, retaining no more than 1,000 UTF-8 bytes."""
+
+    if not 0 <= node.start_byte <= node.end_byte <= len(source.parse_bytes):
+        raise ValueError("Tree-sitter node range is outside the source buffer.")
+    value = source.parse_bytes[node.start_byte : node.end_byte].strip(_ASCII_WHITESPACE)
+    return _bounded_utf8_bytes(value)
 
 
 def normalize_modifiers(modifiers: Iterable[str]) -> tuple[str, ...]:
@@ -330,28 +351,18 @@ def collect_syntax_issues(tree: Tree, source: SourceBuffer) -> tuple[ParseIssue,
 def is_trustworthy_capture(
     node: Node,
     source: SourceBuffer,
-    syntax_issues: tuple[ParseIssue, ...],
+    _syntax_issues: tuple[ParseIssue, ...],
     *required_nodes: Node | None,
 ) -> bool:
     """Reject internally damaged captures; allow complete captures nested in errors."""
 
     try:
-        location = source_location(node, source)
+        source_location(node, source)
     except ValueError:
         return False
-    invalid_locations = tuple(
-        issue.location
-        for issue in syntax_issues
-        if issue.location is not None
-        and issue.kind in {ParseIssueKind.SYNTAX_ERROR, ParseIssueKind.MISSING_NODE}
-    )
-    nested_in_invalid = any(
-        invalid.start_byte <= location.start_byte
-        and location.end_byte <= invalid.end_byte
-        for invalid in invalid_locations
-    )
-    if not node.has_error and not nested_in_invalid:
-        return True
+    # A complete Tree-sitter node nested in an outer ERROR is intentionally usable.
+    # Whether the candidate itself contains damage is available directly on the node;
+    # rescanning every unrelated issue span would add no trust evidence.
     if node.is_error or node.is_missing or node.has_error:
         return False
     for required in required_nodes:

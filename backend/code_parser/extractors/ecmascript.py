@@ -25,6 +25,7 @@ from .base import (
     ENTER,
     ExtractionResult,
     bounded_node_text,
+    bounded_utf8_text,
     collect_syntax_issues,
     is_trustworthy_capture,
     iter_events,
@@ -40,6 +41,7 @@ _FUNCTION_DECLARATIONS = frozenset(
 _FUNCTION_VALUES = frozenset(
     {"arrow_function", "function_expression", "generator_function"}
 )
+_NON_SYMBOL_DECLARATION_SCOPES = frozenset({"internal_module", "module"})
 _DIRECT_MODIFIERS = frozenset(
     {
         "abstract",
@@ -133,9 +135,10 @@ def _same_node(first: Node | None, second: Node) -> bool:
 def _qualified_name(
     scopes: list[_LexicalScope],
     name: str,
+    bound: Callable[[str], str],
 ) -> tuple[str, str | None]:
     parent = scopes[-1].qualified_name if scopes else None
-    return (name if parent is None else f"{parent}.{name}"), parent
+    return bound(name if parent is None else f"{parent}.{name}"), parent
 
 
 def _export_modifiers(node: Node) -> tuple[str, ...]:
@@ -530,6 +533,9 @@ class EcmaScriptExtractor:
         ownership_scopes: list[str | None] = []
         pushed_scopes: set[_SCOPE_KEY] = set()
         pushed_ownership_barriers: set[_SCOPE_KEY] = set()
+        pushed_decorators: set[_SCOPE_KEY] = set()
+        decorator_owners: list[str | None] = []
+        qualification_barrier_depth = 0
         extracted_class_bodies: set[_SCOPE_KEY] = set()
         captured_truncated_text = False
         syntax_issues = collect_syntax_issues(tree, source)
@@ -537,6 +543,12 @@ class EcmaScriptExtractor:
         def capture(node: Node) -> str:
             nonlocal captured_truncated_text
             bounded = bounded_node_text(node, source)
+            captured_truncated_text |= bounded.was_truncated
+            return bounded.text
+
+        def bound(value: str) -> str:
+            nonlocal captured_truncated_text
+            bounded = bounded_utf8_text(value)
             captured_truncated_text |= bounded.was_truncated
             return bounded.text
 
@@ -554,43 +566,62 @@ class EcmaScriptExtractor:
             ownership_scopes.append(qualified_name if kind == "callable" else None)
             pushed_scopes.add(_node_key(node))
 
-        def call_owner(node: Node) -> str | None:
-            ancestor = node.parent
-            while ancestor is not None:
-                if ancestor.type == "decorator":
-                    decorated = ancestor.parent
-                    if decorated is not None and _node_key(decorated) in pushed_scopes:
-                        return ownership_scopes[-2] if len(ownership_scopes) > 1 else None
-                    return ownership_scopes[-1] if ownership_scopes else None
-                ancestor = ancestor.parent
+        def push_barrier(node: Node) -> None:
+            nonlocal qualification_barrier_depth
+            ownership_scopes.append(None)
+            qualification_barrier_depth += 1
+            pushed_ownership_barriers.add(_node_key(node))
+
+        def call_owner() -> str | None:
+            if decorator_owners:
+                return decorator_owners[-1]
             return ownership_scopes[-1] if ownership_scopes else None
 
         for event in iter_events(tree.root_node):
             node = event.node
             key = _node_key(node)
             if event.kind is not ENTER:
+                if key in pushed_decorators:
+                    pushed_decorators.remove(key)
+                    decorator_owners.pop()
                 if key in pushed_ownership_barriers:
                     pushed_ownership_barriers.remove(key)
                     ownership_scopes.pop()
+                    qualification_barrier_depth -= 1
                 if key in pushed_scopes:
                     pushed_scopes.remove(key)
                     scopes.pop()
                     ownership_scopes.pop()
                 continue
 
+            if node.type == "decorator":
+                decorator_owners.append(
+                    ownership_scopes[-2] if len(ownership_scopes) > 1 else None
+                )
+                pushed_decorators.add(key)
+                continue
+
             if node.type in node_sets.class_expressions:
-                ownership_scopes.append(None)
-                pushed_ownership_barriers.add(key)
+                push_barrier(node)
+                continue
+
+            if node.type in _NON_SYMBOL_DECLARATION_SCOPES:
+                push_barrier(node)
                 continue
 
             if node.type in node_sets.class_declarations:
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
-                    node, source, syntax_issues, name_node
+                if (
+                    qualification_barrier_depth
+                    or name_node is None
+                    or not is_trustworthy_capture(
+                        node, source, syntax_issues, name_node
+                    )
                 ):
+                    push_barrier(node)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 if node_sets.typed_declarations:
                     base_types, implemented_types = _typescript_class_relationships(
                         node,
@@ -621,12 +652,17 @@ class EcmaScriptExtractor:
 
             if node.type in node_sets.interface_declarations:
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
-                    node, source, syntax_issues, name_node
+                if (
+                    qualification_barrier_depth
+                    or name_node is None
+                    or not is_trustworthy_capture(
+                        node, source, syntax_issues, name_node
+                    )
                 ):
+                    push_barrier(node)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -649,12 +685,17 @@ class EcmaScriptExtractor:
 
             if node.type in _FUNCTION_DECLARATIONS:
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
-                    node, source, syntax_issues, name_node
+                if (
+                    qualification_barrier_depth
+                    or name_node is None
+                    or not is_trustworthy_capture(
+                        node, source, syntax_issues, name_node
+                    )
                 ):
+                    push_barrier(node)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -673,6 +714,9 @@ class EcmaScriptExtractor:
                 continue
 
             if node.type in node_sets.method_declarations:
+                if qualification_barrier_depth:
+                    push_barrier(node)
+                    continue
                 if (
                     node.parent is None
                     or _node_key(node.parent) not in extracted_class_bodies
@@ -681,12 +725,16 @@ class EcmaScriptExtractor:
                 ):
                     continue
                 name_node = node.child_by_field_name("name")
-                if name_node is None or not is_trustworthy_capture(
-                    node, source, syntax_issues, name_node
+                if (
+                    name_node is None
+                    or not is_trustworthy_capture(
+                        node, source, syntax_issues, name_node
+                    )
                 ):
+                    push_barrier(node)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 kind = (
                     SymbolKind.CONSTRUCTOR
                     if name == "constructor" and scopes[-1].kind == "class"
@@ -712,12 +760,13 @@ class EcmaScriptExtractor:
             stable_binding = _stable_function_binding(node)
             if stable_binding is not None:
                 name_node, value = stable_binding
-                if not is_trustworthy_capture(
+                if qualification_barrier_depth or not is_trustworthy_capture(
                     node, source, syntax_issues, name_node, value
                 ):
+                    push_barrier(node)
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -757,7 +806,7 @@ class EcmaScriptExtractor:
                 ):
                     continue
                 name = capture(name_node)
-                qualified, parent = _qualified_name(scopes, name)
+                qualified, parent = _qualified_name(scopes, name, bound)
                 symbols.append(
                     SymbolInfo(
                         name,
@@ -796,7 +845,7 @@ class EcmaScriptExtractor:
                     ):
                         continue
                     name = capture(name_node)
-                    qualified, parent = _qualified_name(scopes, name)
+                    qualified, parent = _qualified_name(scopes, name, bound)
                     symbols.append(
                         SymbolInfo(
                             name,
@@ -842,7 +891,7 @@ class EcmaScriptExtractor:
                     imports.append(imported)
                 calls.append(
                     CallSite(
-                        call_owner(node),
+                        call_owner(),
                         capture(function),
                         CallKind.CALL,
                         source_location(node, source),
@@ -857,7 +906,7 @@ class EcmaScriptExtractor:
                 ):
                     calls.append(
                         CallSite(
-                            call_owner(node),
+                            call_owner(),
                             capture(constructor),
                             CallKind.CONSTRUCTOR,
                             source_location(node, source),
