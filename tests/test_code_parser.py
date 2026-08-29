@@ -2976,7 +2976,10 @@ def test_get_extractor_rejects_keys_outside_the_closed_registry() -> None:
                 (),
                 (),
             ),
-            ("relative_path", "language", "status", "symbols", "imports", "calls", "issues"),
+            (
+                "relative_path", "language", "status", "symbols", "imports", "calls",
+                "issues", "source_sha256",
+            ),
             "status",
             ParseStatus.FAILED,
         ),
@@ -3862,6 +3865,15 @@ def test_code_parse_inventory_namespace_defaults_to_none() -> None:
     result = CodeParseInventory("/repo", 0, 0, 0, 0, 0, (), ())
     assert tuple(result.__dataclass_fields__)[-1] == "repository_namespace"
     assert result.repository_namespace is None
+
+
+def test_parsed_file_source_sha256_defaults_to_none() -> None:
+    result = ParsedFile(
+        "app.py", ParsedLanguage.PYTHON, ParseStatus.SUCCESS, (), (), (), ()
+    )
+    assert result.source_sha256 is None
+    assert not hasattr(result, "source_bytes")
+    assert not hasattr(result, "source_text")
 
 
 @pytest.mark.parametrize("namespace", ("opaque:A", "opaque:a", ""))

@@ -119,6 +119,7 @@ class ParsedFile:
     imports: tuple[ImportInfo, ...]
     calls: tuple[CallSite, ...]
     issues: tuple[ParseIssue, ...]
+    source_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
