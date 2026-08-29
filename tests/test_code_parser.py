@@ -3921,6 +3921,55 @@ def test_partial_parse_hashes_complete_original_bytes(tmp_path: Path) -> None:
     assert parsed.source_sha256 == hashlib.sha256(data).hexdigest()
 
 
+def parse_single_bytes(root: Path, filename: str, data: bytes) -> ParsedFile:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / filename).write_bytes(data)
+    return CodeParser().parse_inventory(FileScanner().scan(root)).files[0]
+
+
+def test_source_digest_includes_utf8_bom(tmp_path: Path) -> None:
+    data = codecs.BOM_UTF8 + b"def run():\n    pass\n"
+    parsed = parse_single_bytes(tmp_path, "app.py", data)
+    assert parsed.source_sha256 == hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize("data", (b"value = 1\n", b"value = 1\r\n"))
+def test_source_digest_preserves_original_newline_bytes(
+    tmp_path: Path, data: bytes
+) -> None:
+    parsed = parse_single_bytes(tmp_path, "app.py", data)
+    assert parsed.source_sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_lf_and_crlf_have_different_source_digests(tmp_path: Path) -> None:
+    lf = parse_single_bytes(tmp_path / "lf", "app.py", b"value = 1\n")
+    crlf = parse_single_bytes(tmp_path / "crlf", "app.py", b"value = 1\r\n")
+    assert lf.source_sha256 != crlf.source_sha256
+
+
+def test_one_byte_source_mutation_changes_digest(tmp_path: Path) -> None:
+    first = parse_single_bytes(tmp_path / "first", "app.py", b"value = 1\n")
+    second = parse_single_bytes(tmp_path / "second", "app.py", b"value = 10\n")
+    assert first.source_sha256 != second.source_sha256
+
+
+def test_equal_length_source_mutation_changes_digest(tmp_path: Path) -> None:
+    first = parse_single_bytes(tmp_path / "first", "app.py", b"value = 1\n")
+    second = parse_single_bytes(tmp_path / "second", "app.py", b"value = 2\n")
+    assert first.source_sha256 != second.source_sha256
+
+
+def test_source_digest_is_deterministic_and_retains_no_source_bytes(
+    tmp_path: Path,
+) -> None:
+    data = b"value = 1\n"
+    first = parse_single_bytes(tmp_path, "app.py", data)
+    second = CodeParser().parse_inventory(FileScanner().scan(tmp_path)).files[0]
+    assert first.source_sha256 == second.source_sha256
+    assert all(field.type != bytes for field in fields(ParsedFile))
+    assert all(not isinstance(getattr(first, field.name), bytes) for field in fields(first))
+
+
 def test_module_2_integration_parses_scanner_inventory_without_rescanning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
