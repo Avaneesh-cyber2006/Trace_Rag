@@ -62,3 +62,4 @@ class FileInventory:
     files: tuple[ScannedFile, ...]
     ignored: tuple[IgnoredFile, ...]
     skipped_directories: tuple[SkippedDirectory, ...]
+    repository_namespace: str | None = None

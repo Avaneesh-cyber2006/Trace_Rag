@@ -98,6 +98,30 @@ def test_empty_repository_returns_empty_inventory(tmp_path: Path) -> None:
     assert inventory.skipped_directories == ()
 
 
+def test_file_inventory_repository_namespace_defaults_to_none(tmp_path: Path) -> None:
+    result = FileScanner().scan(tmp_path)
+    assert tuple(result.__dataclass_fields__)[-1] == "repository_namespace"
+    assert result.repository_namespace is None
+
+
+@pytest.mark.parametrize("namespace", ("opaque:A", "opaque:a"))
+def test_scanner_retains_repository_namespace_exactly(
+    tmp_path: Path, namespace: str
+) -> None:
+    write_bytes(tmp_path / "app.py", b"answer = 42\n")
+    result = FileScanner().scan(tmp_path, repository_namespace=namespace)
+    assert result.repository_namespace == namespace
+
+
+def test_scan_repository_keeps_old_calls_and_propagates_new_keyword(
+    tmp_path: Path,
+) -> None:
+    assert scan_repository(tmp_path).repository_namespace is None
+    assert scan_repository(
+        tmp_path, repository_namespace="opaque:repo"
+    ).repository_namespace == "opaque:repo"
+
+
 @pytest.mark.parametrize(
     "filename",
     [".env", ".env.production", "APP.ENV", "app.env.local", "private.pem", "ID_RSA", "credentials.json", "service-account.json"],

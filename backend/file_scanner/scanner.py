@@ -40,7 +40,12 @@ class FileScanner:
             raise InvalidRepositoryPath("The repository path is not a directory.")
         return root
 
-    def scan(self, repository_path: Path | str) -> FileInventory:
+    def scan(
+        self,
+        repository_path: Path | str,
+        *,
+        repository_namespace: str | None = None,
+    ) -> FileInventory:
         logger.info("Starting repository scan")
         root = self._validate_repository_path(repository_path)
         logger.info("Repository root validated")
@@ -118,6 +123,7 @@ class FileScanner:
             files=tuple(files),
             ignored=tuple(ignored),
             skipped_directories=tuple(skipped),
+            repository_namespace=repository_namespace,
         )
         logger.info(
             "Repository scan complete: %d included, %d ignored",
@@ -131,5 +137,10 @@ def scan_repository(
     repository_path: Path | str,
     max_file_size_bytes: int = 1_000_000,
     binary_sample_size: int = 8192,
+    *,
+    repository_namespace: str | None = None,
 ) -> FileInventory:
-    return FileScanner(max_file_size_bytes, binary_sample_size).scan(repository_path)
+    return FileScanner(max_file_size_bytes, binary_sample_size).scan(
+        repository_path,
+        repository_namespace=repository_namespace,
+    )
