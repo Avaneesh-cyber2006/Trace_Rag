@@ -86,13 +86,19 @@ from backend.file_scanner import FileScanner
 from backend.repository_loader import RepositoryLoader
 
 repository = RepositoryLoader().load("https://github.com/pallets/flask")
-inventory = FileScanner(max_file_size_bytes=1_000_000).scan(repository.local_path)
+namespace = "tracerag-repository-v1:github:" + repository.repo_url.casefold()
+inventory = FileScanner(max_file_size_bytes=1_000_000).scan(
+    repository.local_path,
+    repository_namespace=namespace,
+)
 
 for file in inventory.files:
     print(file.relative_path, file.language, file.category.value)
 ```
 
 `FileScanner` defaults to a 1,000,000-byte maximum file size and an 8192-byte binary sample. Both limits are configurable positive integers. Files larger than the configured maximum are rejected from metadata alone and are never opened. Eligible files are read only once for a bounded prefix; Module 2 never loads complete contents merely to classify them.
+
+The optional `repository_namespace` is an opaque pipeline identity supplied by the caller and retained unchanged on `FileInventory`. Existing calls default it to `None`. Module 2 does not import Module 1, parse or normalize repository URLs, or construct this value itself.
 
 The intentional text allowlist covers common programming languages, JSON/YAML/TOML/XML and related configuration, SQL/Prisma, Markdown/reStructuredText/plain text, build manifests, and useful special files such as `Dockerfile`, `Makefile`, and `.gitignore`. Common dependency lockfiles are excluded while their manifests remain included. Unknown types and SVG files are excluded by default.
 
@@ -126,11 +132,18 @@ Continuing from the Module 1 and Module 2 example:
 from backend.code_parser import CodeParser
 from backend.file_scanner import FileScanner
 
-inventory = FileScanner().scan(repository.local_path)
+inventory = FileScanner().scan(
+    repository.local_path,
+    repository_namespace=namespace,
+)
 parsed = CodeParser().parse_inventory(inventory)
 ```
 
 The equivalent convenience API is `parse_code_inventory(inventory)`. Both APIs accept only a `FileInventory`; they do not accept a repository URL or path in place of that inventory.
+
+`CodeParseInventory.repository_namespace` copies the scanner inventory value unchanged. Each `ParsedFile.source_sha256` is lowercase SHA-256 over the exact complete bytes returned by the hardened reader, including an original UTF-8 BOM and original LF or CRLF bytes. The digest is present for successful and partial parses and for failures occurring after a verified read; it is `None` when no verified source buffer was obtained. No source bytes or decoded source text are retained in the public result.
+
+`SafeSourceReader`, `SourceBuffer`, and `SourceReadError` are a supported internal cross-module boundary imported directly from `backend.code_parser.reader`. They intentionally remain outside the top-level `backend.code_parser` public API.
 
 ### Supported syntax and outcomes
 
