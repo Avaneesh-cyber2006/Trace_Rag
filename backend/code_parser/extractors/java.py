@@ -226,6 +226,7 @@ def _parameters(
 
 def _field_constants(
     node: Node,
+    parent_node: Node | None,
     scopes: list[_LexicalScope],
     source: SourceBuffer,
     capture: Callable[[Node], str],
@@ -234,8 +235,8 @@ def _field_constants(
     if (
         not scopes
         or scopes[-1].kind != "type"
-        or node.parent is None
-        or node.parent.type not in _TYPE_BODIES
+        or parent_node is None
+        or parent_node.type not in _TYPE_BODIES
     ):
         return ()
     modifiers = _modifiers(node, capture)
@@ -303,6 +304,7 @@ class JavaExtractor:
         ownership_scopes: list[str | None] = []
         pushed_scopes: set[tuple[int, int, str]] = set()
         pushed_barriers: set[tuple[int, int, str]] = set()
+        traversal_ancestors: list[Node] = []
         barrier_depth = 0
         captured_truncated_text = False
         syntax_issues = collect_syntax_issues(tree, source)
@@ -371,12 +373,18 @@ class JavaExtractor:
                     pushed_scopes.remove(node_key)
                     scopes.pop()
                     ownership_scopes.pop()
+                traversal_ancestors.pop()
                 continue
+
+            parent_node = (
+                traversal_ancestors[-1] if traversal_ancestors else None
+            )
+            traversal_ancestors.append(node)
 
             if node.type in _NON_SYMBOL_TYPE_DECLARATIONS or (
                 node.type == "class_body"
-                and node.parent is not None
-                and node.parent.type in _ANONYMOUS_TYPE_BODY_PARENTS
+                and parent_node is not None
+                and parent_node.type in _ANONYMOUS_TYPE_BODY_PARENTS
             ):
                 push_barrier(node_key)
                 continue
@@ -418,8 +426,8 @@ class JavaExtractor:
 
             if node.type in {"constructor_declaration", "method_declaration"}:
                 if (
-                    node.parent is None
-                    or node.parent.type not in _TYPE_BODIES
+                    parent_node is None
+                    or parent_node.type not in _TYPE_BODIES
                     or barrier_depth
                     or not scopes
                     or scopes[-1].kind != "type"
@@ -476,7 +484,14 @@ class JavaExtractor:
                     syntax_issues,
                 ):
                     symbols.extend(
-                        _field_constants(node, scopes, source, capture, bound)
+                        _field_constants(
+                            node,
+                            parent_node,
+                            scopes,
+                            source,
+                            capture,
+                            bound,
+                        )
                     )
                 continue
 

@@ -2741,6 +2741,145 @@ def test_java_vararg_type_stays_within_the_utf8_byte_bound() -> None:
     assert any(issue.kind is ParseIssueKind.EXTRACTION_ERROR for issue in result.issues)
 
 
+class _ParentCountingJavaNode:
+    def __init__(self, node: Node, parent_reads: list[int]) -> None:
+        self._node = node
+        self._parent_reads = parent_reads
+
+    @property
+    def parent(self) -> Node | None:
+        self._parent_reads[0] += 1
+        return self._node.parent
+
+    def __getattr__(self, name: str):
+        return getattr(self._node, name)
+
+
+def _extract_java_with_parent_read_counter(
+    monkeypatch,
+    data: bytes,
+) -> tuple[ExtractionResult, list[int]]:
+    from backend.code_parser.extractors import java as java_module
+
+    tree = parse_java_fixture(data)
+    parent_reads = [0]
+    events = tuple(
+        SimpleNamespace(
+            kind=event.kind,
+            node=_ParentCountingJavaNode(event.node, parent_reads),
+        )
+        for event in iter_events(tree.root_node)
+    )
+    monkeypatch.setattr(java_module, "iter_events", lambda root: iter(events))
+
+    result = java_module.JavaExtractor().extract(
+        tree,
+        SourceBuffer(data, data, 0),
+    )
+    return result, parent_reads
+
+
+def test_deep_java_declarations_never_read_node_parent(monkeypatch) -> None:
+    depth = 64
+    data = (
+        b"package perf;\n"
+        + (b"class Layer {\n" * depth)
+        + b"static final int LIMIT = 1;\n"
+        + b"Layer() { construct(); }\n"
+        + b"void run() { execute(); new Worker(); }\n"
+        + (b"}\n" * depth)
+    )
+
+    result, parent_reads = _extract_java_with_parent_read_counter(
+        monkeypatch,
+        data,
+    )
+
+    deepest_type = "perf." + ".".join(("Layer",) * depth)
+    assert len(
+        [symbol for symbol in result.symbols if symbol.kind is SymbolKind.CLASS]
+    ) == depth
+    assert [
+        (symbol.kind, symbol.qualified_name, symbol.parent_qualified_name)
+        for symbol in result.symbols[-3:]
+    ] == [
+        (SymbolKind.CONSTANT, f"{deepest_type}.LIMIT", deepest_type),
+        (SymbolKind.CONSTRUCTOR, f"{deepest_type}.Layer", deepest_type),
+        (SymbolKind.METHOD, f"{deepest_type}.run", deepest_type),
+    ]
+    assert [
+        (call.caller_qualified_name, call.callee_text, call.kind)
+        for call in result.calls
+    ] == [
+        (f"{deepest_type}.Layer", "construct", CallKind.CALL),
+        (f"{deepest_type}.run", "execute", CallKind.CALL),
+        (f"{deepest_type}.run", "Worker", CallKind.CONSTRUCTOR),
+    ]
+    assert parent_reads == [0]
+
+
+def test_java_nested_context_preserves_members_and_ownership() -> None:
+    data = b'''package p;
+class Outer {
+    static final int TOP = initTop();
+    Outer() { start(); }
+    class Inner {
+        final int VALUE = make();
+        Inner() { construct(); }
+        void run() { work(); new Worker(); }
+    }
+    void outer() {
+        class Local {
+            final int LOCAL = localMake();
+            Local() { localCtor(); }
+            void go() { localCall(); }
+        }
+        after();
+    }
+}
+'''
+
+    result = extract_java_fixture(data)
+
+    assert [
+        (symbol.kind, symbol.qualified_name, symbol.parent_qualified_name)
+        for symbol in result.symbols
+    ] == [
+        (SymbolKind.CLASS, "p.Outer", None),
+        (SymbolKind.CONSTANT, "p.Outer.TOP", "p.Outer"),
+        (SymbolKind.CONSTRUCTOR, "p.Outer.Outer", "p.Outer"),
+        (SymbolKind.CLASS, "p.Outer.Inner", "p.Outer"),
+        (SymbolKind.CONSTANT, "p.Outer.Inner.VALUE", "p.Outer.Inner"),
+        (SymbolKind.CONSTRUCTOR, "p.Outer.Inner.Inner", "p.Outer.Inner"),
+        (SymbolKind.METHOD, "p.Outer.Inner.run", "p.Outer.Inner"),
+        (SymbolKind.METHOD, "p.Outer.outer", "p.Outer"),
+        (SymbolKind.CLASS, "p.Outer.outer.Local", "p.Outer.outer"),
+        (SymbolKind.CONSTANT, "p.Outer.outer.Local.LOCAL", "p.Outer.outer.Local"),
+        (
+            SymbolKind.CONSTRUCTOR,
+            "p.Outer.outer.Local.Local",
+            "p.Outer.outer.Local",
+        ),
+        (SymbolKind.METHOD, "p.Outer.outer.Local.go", "p.Outer.outer.Local"),
+    ]
+    assert [
+        (call.caller_qualified_name, call.callee_text, call.kind)
+        for call in result.calls
+    ] == [
+        (None, "initTop", CallKind.CALL),
+        ("p.Outer.Outer", "start", CallKind.CALL),
+        (None, "make", CallKind.CALL),
+        ("p.Outer.Inner.Inner", "construct", CallKind.CALL),
+        ("p.Outer.Inner.run", "work", CallKind.CALL),
+        ("p.Outer.Inner.run", "Worker", CallKind.CONSTRUCTOR),
+        (None, "localMake", CallKind.CALL),
+        ("p.Outer.outer.Local.Local", "localCtor", CallKind.CALL),
+        ("p.Outer.outer.Local.go", "localCall", CallKind.CALL),
+        ("p.Outer.outer", "after", CallKind.CALL),
+    ]
+    assert result.issues == ()
+
+
 def test_extraction_result_is_frozen_slotted_and_retains_only_metadata() -> None:
     result = ExtractionResult((), (), (), ())
 
