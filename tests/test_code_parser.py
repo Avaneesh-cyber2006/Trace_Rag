@@ -2260,6 +2260,294 @@ def test_ecmascript_modifier_lookup_is_constant_per_declaration(monkeypatch) -> 
     assert parent_reads <= len(declarations)
 
 
+class _ParentCountingEcmaNode:
+    def __init__(
+        self,
+        node_type: str,
+        start_byte: int,
+        parent_reads: list[int],
+        *,
+        parent: object | None = None,
+        text: str | None = None,
+        children: tuple[object, ...] = (),
+        named_children: tuple[object, ...] = (),
+        fields: dict[str, object] | None = None,
+    ) -> None:
+        self.type = node_type
+        self.start_byte = start_byte
+        self.end_byte = start_byte + 1
+        self.text = node_type if text is None else text
+        self.children = children
+        self.named_children = named_children
+        self._fields = {} if fields is None else fields
+        self._parent = parent
+        self._parent_reads = parent_reads
+
+    @property
+    def parent(self) -> object | None:
+        self._parent_reads[0] += 1
+        return self._parent
+
+    def child_by_field_name(self, field: str) -> object | None:
+        return self._fields.get(field)
+
+
+def _extract_fake_typescript_events(monkeypatch, events: tuple[object, ...]):
+    from backend.code_parser.extractors import ecmascript as ecmascript_module
+
+    monkeypatch.setattr(
+        ecmascript_module,
+        "collect_syntax_issues",
+        lambda tree, source: (),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "iter_events",
+        lambda root: iter(events),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "is_trustworthy_capture",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "bounded_node_text",
+        lambda node, source: extractor_base.BoundedText(node.text, False),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "source_location",
+        lambda node, source: extraction_location(node.start_byte, node.end_byte),
+    )
+    monkeypatch.setattr(
+        ecmascript_module,
+        "_string_value",
+        lambda node, source: None if node is None else (node.text, False),
+    )
+    return ecmascript_module.EcmaScriptExtractor(
+        mode=ecmascript_module.TYPESCRIPT
+    ).extract(
+        SimpleNamespace(root_node=object()),
+        SourceBuffer(b"", b"", 0),
+    )
+
+
+def test_deep_ecmascript_methods_and_fields_never_read_node_parent(monkeypatch) -> None:
+    parent_reads = [0]
+    offset = 0
+
+    def node(node_type: str, *, parent=None, text=None, children=(), fields=None):
+        nonlocal offset
+        offset += 2
+        return _ParentCountingEcmaNode(
+            node_type,
+            offset,
+            parent_reads,
+            parent=parent,
+            text=text,
+            children=children,
+            fields=fields,
+        )
+
+    program = node("program")
+    events: list[object] = [SimpleNamespace(kind=ENTER, node=program)]
+    enclosing: object = program
+    nested_functions: list[tuple[object, object]] = []
+    for depth in range(32):
+        name = node("identifier", text=f"f{depth}")
+        declaration = node(
+            "function_declaration",
+            parent=enclosing,
+            fields={"name": name},
+        )
+        body = node("statement_block", parent=declaration)
+        events.extend(
+            (
+                SimpleNamespace(kind=ENTER, node=declaration),
+                SimpleNamespace(kind=ENTER, node=body),
+            )
+        )
+        nested_functions.append((declaration, body))
+        enclosing = body
+
+    class_name = node("type_identifier", text="Deep")
+    class_node = node(
+        "class_declaration",
+        parent=enclosing,
+        fields={"name": class_name},
+    )
+    class_body = node("class_body", parent=class_node)
+    class_node._fields["body"] = class_body
+    method_name = node("property_identifier", text="run")
+    method = node(
+        "method_definition",
+        parent=class_body,
+        fields={"name": method_name},
+    )
+    static = node("static", text="static")
+    readonly = node("readonly", text="readonly")
+    field_name = node("property_identifier", text="TOKEN")
+    field = node(
+        "public_field_definition",
+        parent=class_body,
+        children=(static, readonly),
+        fields={"name": field_name},
+    )
+    events.extend(
+        (
+            SimpleNamespace(kind=ENTER, node=class_node),
+            SimpleNamespace(kind=ENTER, node=class_body),
+            SimpleNamespace(kind=ENTER, node=method),
+            SimpleNamespace(kind=EXIT, node=method),
+            SimpleNamespace(kind=ENTER, node=field),
+            SimpleNamespace(kind=EXIT, node=field),
+            SimpleNamespace(kind=EXIT, node=class_body),
+            SimpleNamespace(kind=EXIT, node=class_node),
+        )
+    )
+    for declaration, body in reversed(nested_functions):
+        events.extend(
+            (
+                SimpleNamespace(kind=EXIT, node=body),
+                SimpleNamespace(kind=EXIT, node=declaration),
+            )
+        )
+    events.append(SimpleNamespace(kind=EXIT, node=program))
+
+    result = _extract_fake_typescript_events(monkeypatch, tuple(events))
+    deep_class, deep_method, deep_field = result.symbols[-3:]
+
+    assert (deep_class.kind, deep_class.name) == (SymbolKind.CLASS, "Deep")
+    assert (deep_method.kind, deep_method.name) == (SymbolKind.METHOD, "run")
+    assert (deep_field.kind, deep_field.name, deep_field.modifiers) == (
+        SymbolKind.CONSTANT,
+        "TOKEN",
+        ("static", "readonly"),
+    )
+    assert deep_method.parent_qualified_name == deep_class.qualified_name
+    assert deep_field.parent_qualified_name == deep_class.qualified_name
+    assert parent_reads == [0]
+
+
+def test_local_and_module_lexical_classification_never_reads_node_parent(
+    monkeypatch,
+) -> None:
+    parent_reads = [0]
+
+    def lexical(start: int, parent: object, name_text: str):
+        name = _ParentCountingEcmaNode(
+            "identifier", start + 1, parent_reads, text=name_text
+        )
+        declarator = _ParentCountingEcmaNode(
+            "variable_declarator",
+            start + 2,
+            parent_reads,
+            fields={"name": name},
+        )
+        kind = _ParentCountingEcmaNode("const", start + 3, parent_reads)
+        declaration = _ParentCountingEcmaNode(
+            "lexical_declaration",
+            start,
+            parent_reads,
+            parent=parent,
+            named_children=(declarator,),
+            fields={"kind": kind},
+        )
+        return declaration
+
+    program = _ParentCountingEcmaNode("program", 0, parent_reads)
+    function_name = _ParentCountingEcmaNode(
+        "identifier", 2, parent_reads, text="outer"
+    )
+    function = _ParentCountingEcmaNode(
+        "function_declaration",
+        1,
+        parent_reads,
+        parent=program,
+        fields={"name": function_name},
+    )
+    body = _ParentCountingEcmaNode(
+        "statement_block", 3, parent_reads, parent=function
+    )
+    local = lexical(10, body, "LOCAL")
+    module = lexical(20, program, "GLOBAL")
+    events = (
+        SimpleNamespace(kind=ENTER, node=program),
+        SimpleNamespace(kind=ENTER, node=function),
+        SimpleNamespace(kind=ENTER, node=body),
+        SimpleNamespace(kind=ENTER, node=local),
+        SimpleNamespace(kind=EXIT, node=local),
+        SimpleNamespace(kind=EXIT, node=body),
+        SimpleNamespace(kind=EXIT, node=function),
+        SimpleNamespace(kind=ENTER, node=module),
+        SimpleNamespace(kind=EXIT, node=module),
+        SimpleNamespace(kind=EXIT, node=program),
+    )
+
+    result = _extract_fake_typescript_events(monkeypatch, events)
+
+    assert [(symbol.kind, symbol.name) for symbol in result.symbols] == [
+        (SymbolKind.FUNCTION, "outer"),
+        (SymbolKind.CONSTANT, "GLOBAL"),
+    ]
+    assert parent_reads == [0]
+
+
+def test_bound_commonjs_require_never_reads_node_parent(monkeypatch) -> None:
+    parent_reads = [0]
+    program = _ParentCountingEcmaNode("program", 0, parent_reads)
+    alias = _ParentCountingEcmaNode("identifier", 3, parent_reads, text="fs")
+    function = _ParentCountingEcmaNode("identifier", 5, parent_reads, text="require")
+    module = _ParentCountingEcmaNode("string", 7, parent_reads, text="node:fs")
+    arguments = _ParentCountingEcmaNode(
+        "arguments", 6, parent_reads, named_children=(module,)
+    )
+    call = _ParentCountingEcmaNode(
+        "call_expression",
+        4,
+        parent_reads,
+        fields={"function": function, "arguments": arguments},
+    )
+    declarator = _ParentCountingEcmaNode(
+        "variable_declarator",
+        2,
+        parent_reads,
+        fields={"name": alias, "value": call},
+    )
+    call._parent = declarator
+    kind = _ParentCountingEcmaNode("const", 8, parent_reads)
+    lexical = _ParentCountingEcmaNode(
+        "lexical_declaration",
+        1,
+        parent_reads,
+        parent=program,
+        named_children=(declarator,),
+        fields={"kind": kind},
+    )
+    declarator._parent = lexical
+    events = (
+        SimpleNamespace(kind=ENTER, node=program),
+        SimpleNamespace(kind=ENTER, node=lexical),
+        SimpleNamespace(kind=ENTER, node=declarator),
+        SimpleNamespace(kind=ENTER, node=call),
+        SimpleNamespace(kind=EXIT, node=call),
+        SimpleNamespace(kind=EXIT, node=declarator),
+        SimpleNamespace(kind=EXIT, node=lexical),
+        SimpleNamespace(kind=EXIT, node=program),
+    )
+
+    result = _extract_fake_typescript_events(monkeypatch, events)
+
+    assert [(item.module, item.bindings, item.is_wildcard) for item in result.imports] == [
+        ("node:fs", (ImportBinding("*", "fs"),), True),
+    ]
+    assert [(call.caller_qualified_name, call.callee_text) for call in result.calls] == [
+        (None, "require"),
+    ]
+    assert parent_reads == [0]
+
+
 def test_capture_trust_does_not_rescan_syntax_issue_locations() -> None:
     class NonIterableIssues(tuple):
         def __iter__(self):

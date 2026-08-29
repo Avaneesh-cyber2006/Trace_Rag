@@ -395,9 +395,9 @@ def _es_import(
 
 def _commonjs_bindings(
     call: Node,
+    parent: Node | None,
     capture: Callable[[Node], str],
 ) -> tuple[tuple[ImportBinding, ...], bool]:
-    parent = call.parent
     if parent is None or parent.type != "variable_declarator":
         return (), False
     if not _same_node(parent.child_by_field_name("value"), call):
@@ -437,6 +437,7 @@ def _commonjs_bindings(
 
 def _commonjs_import(
     node: Node,
+    parent: Node | None,
     source: SourceBuffer,
     capture: Callable[[Node], str],
     capture_module: Callable[[Node | None], str | None],
@@ -450,7 +451,7 @@ def _commonjs_import(
     module = capture_module(arguments.named_children[0])
     if module is None:
         return None
-    bindings, wildcard = _commonjs_bindings(node, capture)
+    bindings, wildcard = _commonjs_bindings(node, parent, capture)
     return ImportInfo(
         module,
         bindings,
@@ -460,20 +461,20 @@ def _commonjs_import(
     )
 
 
-def _is_module_declaration(node: Node) -> bool:
-    parent = node.parent
-    if parent is None:
+def _is_module_declaration(ancestors: list[Node]) -> bool:
+    index = len(ancestors) - 1
+    if index < 0:
         return False
-    if parent.type == "ambient_declaration":
-        parent = parent.parent
-        if parent is None:
+    if ancestors[index].type == "ambient_declaration":
+        index -= 1
+        if index < 0:
             return False
-    if parent.type == "program":
+    if ancestors[index].type == "program":
         return True
     return (
-        parent.type == "export_statement"
-        and parent.parent is not None
-        and parent.parent.type == "program"
+        ancestors[index].type == "export_statement"
+        and index > 0
+        and ancestors[index - 1].type == "program"
     )
 
 
@@ -517,6 +518,7 @@ class EcmaScriptExtractor:
         pushed_ownership_barriers: set[_SCOPE_KEY] = set()
         pushed_decorators: set[_SCOPE_KEY] = set()
         decorator_owners: list[str | None] = []
+        traversal_ancestors: list[Node] = []
         contextual_modifiers: tuple[str, ...] = ()
         modifier_context_restore: dict[_SCOPE_KEY, tuple[str, ...]] = {}
         qualification_barrier_depth = 0
@@ -578,7 +580,17 @@ class EcmaScriptExtractor:
                     pushed_scopes.remove(key)
                     scopes.pop()
                     ownership_scopes.pop()
+                traversal_ancestors.pop()
                 continue
+
+            parent_node = (
+                traversal_ancestors[-1] if traversal_ancestors else None
+            )
+            is_module_declaration = (
+                node.type == "lexical_declaration"
+                and _is_module_declaration(traversal_ancestors)
+            )
+            traversal_ancestors.append(node)
 
             if node.type in _MODIFIER_CONTEXT_BOUNDARIES:
                 modifier_context_restore[key] = contextual_modifiers
@@ -714,8 +726,8 @@ class EcmaScriptExtractor:
                     push_barrier(node)
                     continue
                 if (
-                    node.parent is None
-                    or _node_key(node.parent) not in extracted_class_bodies
+                    parent_node is None
+                    or _node_key(parent_node) not in extracted_class_bodies
                     or not scopes
                     or scopes[-1].kind not in {"class", "interface"}
                 ):
@@ -783,8 +795,9 @@ class EcmaScriptExtractor:
             if (
                 node_sets.typed_declarations
                 and node.type == "public_field_definition"
-                and node.parent is not None
-                and _node_key(node.parent) in extracted_class_bodies
+                and parent_node is not None
+                and parent_node.type == "class_body"
+                and _node_key(parent_node) in extracted_class_bodies
                 and scopes
                 and scopes[-1].kind == "class"
             ):
@@ -819,7 +832,7 @@ class EcmaScriptExtractor:
                 )
                 continue
 
-            if node.type == "lexical_declaration" and _is_module_declaration(node):
+            if is_module_declaration:
                 kind_node = node.child_by_field_name("kind")
                 if kind_node is None or kind_node.type != "const":
                     continue
@@ -879,6 +892,7 @@ class EcmaScriptExtractor:
                     continue
                 imported = _commonjs_import(
                     node,
+                    parent_node,
                     source,
                     capture,
                     capture_module,
