@@ -42,8 +42,14 @@ from backend.file_scanner.models import (
 )
 from backend.code_chunker.validation import ValidatedInputs, validate_inputs
 from backend.code_chunker.chunker import CodeChunker
+from backend.code_chunker.locations import (
+    build_line_starts,
+    location_from_offsets,
+    validate_parsed_locations,
+)
 from backend.code_parser import CodeParser
 from backend.code_parser.models import ParseIssueKind
+from backend.code_parser.models import CallKind, CallSite, ParseIssue, SymbolInfo
 from backend.code_parser.reader import SourceReadError
 from backend.file_scanner import FileScanner
 
@@ -133,6 +139,71 @@ def test_unavailable_repository_root_is_fatal():
 
     with pytest.raises(RepositoryChunkError):
         CodeChunker().chunk_inventory(scanner, parser)
+
+
+@pytest.mark.parametrize(
+    ("source", "start", "end", "expected"),
+    (
+        (b"abc\nxyz", 0, 3, SourceLocation(0, 3, 1, 0, 1, 3)),
+        ("नमस्ते\nX".encode(), 0, 18, SourceLocation(0, 18, 1, 0, 1, 18)),
+        (b"\xef\xbb\xbfx\n", 3, 4, SourceLocation(3, 4, 1, 3, 1, 4)),
+        (b"a\r\nb", 3, 4, SourceLocation(3, 4, 2, 0, 2, 1)),
+        (b"a\n", 2, 2, SourceLocation(2, 2, 2, 0, 2, 0)),
+    ),
+)
+def test_location_reconstruction_uses_original_utf8_byte_coordinates(
+    source, start, end, expected
+):
+    starts = build_line_starts(source)
+    assert location_from_offsets(source, starts, start, end) == expected
+
+
+def test_line_starts_treat_crlf_as_one_terminator_and_include_trailing_line():
+    assert build_line_starts(b"a\r\nb\nc\r\n") == (0, 3, 5, 8)
+
+
+@pytest.mark.parametrize(
+    "location",
+    (
+        SourceLocation(-1, 1, 1, 0, 1, 1),
+        SourceLocation(2, 1, 1, 2, 1, 1),
+        SourceLocation(0, 4, 1, 0, 1, 4),
+        SourceLocation(0, 1, 0, 0, 1, 1),
+        SourceLocation(0, 1, 1, 1, 1, 1),
+        SourceLocation(0, 0, 1, 0, 1, 0),
+    ),
+)
+def test_location_validation_rejects_invalid_symbol_ranges(location):
+    symbol = SymbolInfo("x", SymbolKind.FUNCTION, "x", None, location, (), None, (), (), ())
+    parsed = replace(_parsed(digest=sha256(b"abc").hexdigest()), symbols=(symbol,))
+    assert validate_parsed_locations(parsed, b"abc", build_line_starts(b"abc")) is False
+
+
+def test_location_validation_checks_import_call_and_issue_locations():
+    valid = SourceLocation(0, 1, 1, 0, 1, 1)
+    invalid = SourceLocation(0, 1, 1, 1, 1, 1)
+    parsed = replace(
+        _parsed(digest=sha256(b"x").hexdigest()),
+        imports=(ImportInfo("m", (), False, (), valid),),
+        calls=(CallSite(None, "x", CallKind.CALL, valid),),
+        issues=(ParseIssue(ParseIssueKind.SYNTAX_ERROR, "Syntax error.", invalid),),
+    )
+    assert validate_parsed_locations(parsed, b"x", build_line_starts(b"x")) is False
+
+
+def test_invalid_location_fails_only_affected_file(tmp_path: Path):
+    scanner, parser = _pipeline(tmp_path, b"x = 1\n")
+    bad = SymbolInfo(
+        "x", SymbolKind.CONSTANT, "x", None,
+        SourceLocation(0, 99, 1, 0, 1, 99), (), None, (), (), ()
+    )
+    parser = replace(parser, files=(replace(parser.files[0], symbols=(bad,)),))
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert result.files[0].status is ChunkFileStatus.FAILED
+    assert result.files[0].chunks == ()
+    assert result.files[0].issues[0].kind is ChunkIssueKind.LOCATION_INVALID
 
 
 def _scanned(

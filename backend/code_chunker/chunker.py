@@ -18,6 +18,7 @@ from .models import (
     ChunkerConfig,
     CodeChunkInventory,
 )
+from .locations import build_line_starts, validate_parsed_locations
 from .validation import validate_inputs
 
 
@@ -86,6 +87,10 @@ class CodeChunker:
                 continue
             if sha256(source.original_bytes).hexdigest() != parsed.source_sha256:
                 files.append(_failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED))
+                continue
+            line_starts = build_line_starts(source.original_bytes)
+            if not validate_parsed_locations(parsed, source.original_bytes, line_starts):
+                files.append(_failed_file(parsed, ChunkIssueKind.LOCATION_INVALID))
                 continue
 
             status = (
