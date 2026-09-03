@@ -510,6 +510,69 @@ def test_fragmenter_handles_bom_and_eof_without_newline_exactly():
     assert pieces[-1][1] == len(source)
 
 
+def test_chunker_constructs_exact_symbol_and_context_chunks_with_owner_metadata(tmp_path: Path):
+    data = b"# preamble\ndef greet(name: str) -> str:\n    return name\n"
+    scanner, parser = _pipeline(tmp_path, data)
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    chunks = result.files[0].chunks
+    assert chunks
+    assert any(chunk.kind is ChunkKind.SYMBOL and chunk.symbol_name == "greet" for chunk in chunks)
+    assert any(chunk.kind is ChunkKind.CONTEXT and chunk.symbol_name is None for chunk in chunks)
+    for chunk in chunks:
+        exact = data[chunk.location.start_byte:chunk.location.end_byte]
+        assert chunk.content.encode("utf-8") == exact
+        assert chunk.content_hash == sha256(exact).hexdigest()
+        assert chunk.fragment_index == 0
+        assert chunk.fragment_count == 1
+
+
+def test_oversized_candidates_become_fragments_with_common_metadata(tmp_path: Path):
+    data = b"def long_function():\n" + (b"    value = 1234567890\n" * 8)
+    scanner, parser = _pipeline(tmp_path, data)
+
+    result = CodeChunker(ChunkerConfig(32, 48)).chunk_inventory(scanner, parser)
+
+    fragments = [chunk for chunk in result.files[0].chunks if chunk.symbol_name == "long_function"]
+    assert len(fragments) > 1
+    assert all(chunk.kind is ChunkKind.FRAGMENT for chunk in fragments)
+    assert [chunk.fragment_index for chunk in fragments] == list(range(len(fragments)))
+    assert {chunk.fragment_count for chunk in fragments} == {len(fragments)}
+    assert all(len(chunk.content.encode("utf-8")) <= 48 for chunk in fragments)
+    symbol = next(symbol for symbol in parser.files[0].symbols if symbol.name == "long_function")
+    assert b"".join(chunk.content.encode("utf-8") for chunk in fragments) == data[
+        symbol.location.start_byte:symbol.location.end_byte
+    ]
+
+
+def test_bom_file_context_preserves_exact_original_prefix(tmp_path: Path):
+    data = b"\xef\xbb\xbf# note\nvalue = 1\n"
+    scanner, parser = _pipeline(tmp_path, data)
+    result = CodeChunker().chunk_inventory(scanner, parser)
+    first = result.files[0].chunks[0]
+    assert first.location.start_byte == 0
+    assert first.content.encode("utf-8") == data[:first.location.end_byte]
+
+
+def test_constructed_chunk_locations_cover_multibyte_lf_and_crlf(tmp_path: Path):
+    for data in (
+        "# नमस्ते\ndef f():\n    return 1\n".encode("utf-8"),
+        "# नमस्ते\r\ndef f():\r\n    return 1\r\n".encode("utf-8"),
+    ):
+        root = tmp_path / str(len(data))
+        scanner, parser = _pipeline(root, data)
+        chunks = CodeChunker(ChunkerConfig(12, 24)).chunk_inventory(scanner, parser).files[0].chunks
+        assert chunks
+        ordered = sorted(chunks, key=lambda chunk: chunk.location.start_byte)
+        assert all(
+            left.location.end_byte <= right.location.start_byte
+            for left, right in zip(ordered, ordered[1:])
+        )
+        for chunk in chunks:
+            assert chunk.content.encode("utf-8") == data[chunk.location.start_byte:chunk.location.end_byte]
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,
