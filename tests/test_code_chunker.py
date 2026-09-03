@@ -47,6 +47,12 @@ from backend.code_chunker.locations import (
     location_from_offsets,
     validate_parsed_locations,
 )
+from backend.code_chunker.intervals import (
+    ChunkCandidate,
+    InvalidSymbolIntervals,
+    build_symbol_intervals,
+    select_candidates,
+)
 from backend.code_parser import CodeParser
 from backend.code_parser.models import ParseIssueKind
 from backend.code_parser.models import CallKind, CallSite, ParseIssue, SymbolInfo
@@ -204,6 +210,81 @@ def test_invalid_location_fails_only_affected_file(tmp_path: Path):
     assert result.files[0].status is ChunkFileStatus.FAILED
     assert result.files[0].chunks == ()
     assert result.files[0].issues[0].kind is ChunkIssueKind.LOCATION_INVALID
+
+
+def _symbol(source: bytes, name: str, kind: SymbolKind, start: int, end: int,
+            parent: str | None = None) -> SymbolInfo:
+    return SymbolInfo(
+        name, kind, name if parent is None else f"{parent}.{name}", parent,
+        location_from_offsets(source, build_line_starts(source), start, end),
+        (), None, (), (), (),
+    )
+
+
+def test_interval_forest_is_sorted_and_records_direct_containment():
+    source = b"0123456789abcdefghij"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 20)
+    inner = _symbol(source, "inner", SymbolKind.FUNCTION, 5, 15, "Outer")
+    leaf = _symbol(source, "leaf", SymbolKind.FUNCTION, 7, 10, "Outer.inner")
+
+    intervals = build_symbol_intervals((leaf, outer, inner), len(source))
+
+    assert tuple(item.symbol for item in intervals) == (outer, inner, leaf)
+    assert intervals[0].children == (1,)
+    assert intervals[1].children == (2,)
+    assert intervals[2].children == ()
+
+
+def test_primary_selection_emits_callable_constant_and_leaf_type_wholes():
+    source = b"0123456789abcdefghij"
+    function = _symbol(source, "f", SymbolKind.FUNCTION, 0, 4)
+    constant = _symbol(source, "C", SymbolKind.CONSTANT, 4, 8)
+    leaf_type = _symbol(source, "T", SymbolKind.INTERFACE, 8, 20)
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(leaf_type, constant, function))
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    assert [(item.kind, item.owner.kind) for item in candidates] == [
+        (ChunkKind.SYMBOL, SymbolKind.FUNCTION),
+        (ChunkKind.SYMBOL, SymbolKind.CONSTANT),
+        (ChunkKind.SYMBOL, SymbolKind.INTERFACE),
+    ]
+
+
+def test_outer_callable_and_type_are_not_emitted_whole_around_selected_descendants():
+    source = b"0123456789abcdefghij"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 20)
+    method = _symbol(source, "m", SymbolKind.METHOD, 4, 16, "Outer")
+    nested = _symbol(source, "n", SymbolKind.FUNCTION, 7, 12, "Outer.m")
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(outer, method, nested))
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    assert [(item.start_byte, item.end_byte, item.owner.name) for item in candidates] == [(7, 12, "n")]
+
+
+def test_interval_builder_rejects_crossing_and_incompatible_equal_ranges():
+    source = b"0123456789"
+    crossing = (
+        _symbol(source, "a", SymbolKind.FUNCTION, 0, 6),
+        _symbol(source, "b", SymbolKind.FUNCTION, 4, 9),
+    )
+    with pytest.raises(InvalidSymbolIntervals):
+        build_symbol_intervals(crossing, len(source))
+
+    equal = (
+        _symbol(source, "a", SymbolKind.FUNCTION, 0, 6),
+        _symbol(source, "b", SymbolKind.METHOD, 0, 6),
+    )
+    with pytest.raises(InvalidSymbolIntervals):
+        build_symbol_intervals(equal, len(source))
+
+
+def test_interval_builder_collapses_exact_duplicate_symbols_deterministically():
+    source = b"0123456789"
+    symbol = _symbol(source, "a", SymbolKind.FUNCTION, 0, 6)
+    intervals = build_symbol_intervals((symbol, symbol), len(source))
+    assert tuple(item.symbol for item in intervals) == (symbol,)
 
 
 def _scanned(
