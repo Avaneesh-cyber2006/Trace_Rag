@@ -1162,6 +1162,33 @@ def test_inventory_validation_recursively_rejects_malformed_parser_values_before
             CodeChunker().chunk_inventory(scanner, parser)
 
 
+def test_inventory_validation_requires_exact_parser_partition_of_code_candidates():
+    source = _scanned("src/a.py")
+    test = _scanned("tests/test_a.py", category=FileCategory.TEST)
+    config = _scanned(
+        "pyproject.toml", extension=".toml", language=None, category=FileCategory.CONFIG
+    )
+    scanner, parser = _inventories(
+        scanned_files=(config, source, test),
+        parsed_files=(_parsed("src/a.py"),),
+        skipped=(SkippedParseFile("tests/test_a.py", ParseSkipReason.UNSUPPORTED_LANGUAGE),),
+    )
+    assert validate_inputs(scanner, parser).pairs == ((source, parser.files[0]),)
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, replace(parser, skipped=(), skipped_files=0, total_files_requested=1))
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, replace(parser, total_files_requested=3))
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(
+            scanner,
+            replace(
+                parser,
+                skipped=(SkippedParseFile("missing.py", ParseSkipReason.UNSUPPORTED_LANGUAGE),),
+            ),
+        )
+
+
 def test_chunk_enums_are_string_enums_with_stable_values():
     assert issubclass(ChunkKind, str)
     assert issubclass(ChunkKind, Enum)

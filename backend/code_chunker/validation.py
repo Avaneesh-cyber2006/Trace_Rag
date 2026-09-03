@@ -313,6 +313,24 @@ def validate_inputs(
         _invalid()
 
     scanned_by_path = {scanned.relative_path: scanned for scanned in file_inventory.files}
+    code_paths = {
+        scanned.relative_path
+        for scanned in file_inventory.files
+        if scanned.category in _CODE_CATEGORIES
+    }
+    parser_paths = {
+        item.relative_path for item in (*parse_inventory.files, *parse_inventory.skipped)
+    }
+    if (
+        parser_paths != code_paths
+        or parse_inventory.total_files_requested != len(code_paths)
+        or any(
+            (scanned := scanned_by_path.get(item.relative_path)) is None
+            or scanned.category not in _CODE_CATEGORIES
+            for item in parse_inventory.skipped
+        )
+    ):
+        _invalid()
     pairs: list[tuple[ScannedFile, ParsedFile]] = []
     for parsed in parse_inventory.files:
         scanned = scanned_by_path.get(parsed.relative_path)
