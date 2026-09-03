@@ -260,7 +260,13 @@ def test_outer_callable_and_type_are_not_emitted_whole_around_selected_descendan
 
     candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
 
-    assert [(item.start_byte, item.end_byte, item.owner.name) for item in candidates] == [(7, 12, "n")]
+    assert [(item.start_byte, item.end_byte, item.owner.name) for item in candidates if item.kind is ChunkKind.SYMBOL] == [(7, 12, "n")]
+    assert all(
+        item.kind is not ChunkKind.SYMBOL
+        for item in candidates
+        if item.owner in (outer, method)
+    )
+    _assert_non_overlapping(candidates)
 
 
 def test_interval_builder_rejects_crossing_and_incompatible_equal_ranges():
@@ -285,6 +291,68 @@ def test_interval_builder_collapses_exact_duplicate_symbols_deterministically():
     symbol = _symbol(source, "a", SymbolKind.FUNCTION, 0, 6)
     intervals = build_symbol_intervals((symbol, symbol), len(source))
     assert tuple(item.symbol for item in intervals) == (symbol,)
+
+
+def _assert_non_overlapping(candidates):
+    ordered = sorted(candidates, key=lambda item: (item.start_byte, item.end_byte))
+    assert all(left.end_byte <= right.start_byte for left, right in zip(ordered, ordered[1:]))
+
+
+def test_nested_type_residuals_never_overlap_deep_selected_method():
+    source = b"abcdefghijklmnopqrstuvwxyz1234"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 30)
+    inner = _symbol(source, "Inner", SymbolKind.CLASS, 5, 25, "Outer")
+    method = _symbol(source, "method", SymbolKind.METHOD, 10, 20, "Outer.Inner")
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(outer, inner, method))
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    method_candidates = [item for item in candidates if item.owner == method]
+    assert [(item.start_byte, item.end_byte, item.kind) for item in method_candidates] == [
+        (10, 20, ChunkKind.SYMBOL)
+    ]
+    assert all(
+        item.end_byte <= 10 or item.start_byte >= 20
+        for item in candidates if item.owner in (outer, inner)
+    )
+    _assert_non_overlapping(candidates)
+    covered = b"".join(source[item.start_byte:item.end_byte] for item in candidates)
+    assert covered == source
+
+
+def test_deeper_nested_type_partition_is_exact_and_pairwise_disjoint():
+    source = b"abcdefghijklmnopqrstuvwxyz1234567890"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 36)
+    inner = _symbol(source, "Inner", SymbolKind.CLASS, 4, 32, "Outer")
+    nested = _symbol(source, "Nested", SymbolKind.CLASS, 8, 28, "Outer.Inner")
+    method = _symbol(source, "method", SymbolKind.METHOD, 12, 24, "Outer.Inner.Nested")
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(outer, inner, nested, method))
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    _assert_non_overlapping(candidates)
+    assert sum(item.start_byte == 12 and item.end_byte == 24 for item in candidates) == 1
+    assert b"".join(source[item.start_byte:item.end_byte] for item in candidates) == source
+
+
+def test_success_fallback_covers_all_remaining_non_whitespace_exactly():
+    source = b"import x\n\n  def f():\n    pass\nTAIL"
+    start = source.index(b"def")
+    end = source.index(b"TAIL")
+    function = _symbol(source, "f", SymbolKind.FUNCTION, start, end)
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(function,))
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    _assert_non_overlapping(candidates)
+    assert any(item.owner is None and item.kind is ChunkKind.CONTEXT for item in candidates)
+    covered = [False] * len(source)
+    for item in candidates:
+        for offset in range(item.start_byte, item.end_byte):
+            assert covered[offset] is False
+            covered[offset] = True
+        assert source[item.start_byte:item.end_byte].decode("utf-8").strip() != ""
+    assert all(covered[i] for i, byte in enumerate(source) if chr(byte).isspace() is False)
 
 
 def _scanned(

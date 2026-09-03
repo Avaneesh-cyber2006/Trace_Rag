@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from backend.code_parser.models import ParsedFile, SymbolInfo, SymbolKind
+from backend.code_parser.models import ParsedFile, ParseStatus, SymbolInfo, SymbolKind
 
 from .models import ChunkKind
 
@@ -100,16 +100,55 @@ def select_candidates(
     source: bytes,
     intervals: tuple[SymbolInterval, ...],
 ) -> tuple[ChunkCandidate, ...]:
-    """Select whole structural leaves; residuals are added in a later phase."""
-    del parsed_file, source
-    candidates = [
-        ChunkCandidate(
-            ChunkKind.SYMBOL,
-            interval.symbol.location.start_byte,
-            interval.symbol.location.end_byte,
-            interval.symbol,
-        )
-        for interval in intervals
-        if interval.symbol.kind in _MEANINGFUL_KINDS and not interval.children
-    ]
+    """Build a non-overlapping structural partition and successful fallback."""
+    candidates: list[ChunkCandidate] = []
+
+    for interval in intervals:
+        symbol = interval.symbol
+        if symbol.kind not in _MEANINGFUL_KINDS:
+            continue
+        if not interval.children:
+            candidates.append(
+                ChunkCandidate(
+                    ChunkKind.SYMBOL,
+                    symbol.location.start_byte,
+                    symbol.location.end_byte,
+                    symbol,
+                )
+            )
+            continue
+
+        cursor = symbol.location.start_byte
+        for child_index in interval.children:
+            child = intervals[child_index].symbol.location
+            _append_context(candidates, source, cursor, child.start_byte, symbol)
+            cursor = child.end_byte
+        _append_context(candidates, source, cursor, symbol.location.end_byte, symbol)
+
+    candidates.sort(key=lambda item: (item.start_byte, item.end_byte))
+    if parsed_file.status is ParseStatus.SUCCESS:
+        cursor = 0
+        existing = tuple(candidates)
+        for candidate in existing:
+            if candidate.start_byte < cursor:
+                raise InvalidSymbolIntervals("Candidate ranges overlap.")
+            _append_context(candidates, source, cursor, candidate.start_byte, None)
+            cursor = candidate.end_byte
+        _append_context(candidates, source, cursor, len(source), None)
+
     return tuple(sorted(candidates, key=lambda item: (item.start_byte, item.end_byte)))
+
+
+def _append_context(
+    candidates: list[ChunkCandidate],
+    source: bytes,
+    start: int,
+    end: int,
+    owner: SymbolInfo | None,
+) -> None:
+    if start >= end:
+        return
+    text = source[start:end].decode("utf-8", errors="strict")
+    if not any(not character.isspace() for character in text):
+        return
+    candidates.append(ChunkCandidate(ChunkKind.CONTEXT, start, end, owner))
