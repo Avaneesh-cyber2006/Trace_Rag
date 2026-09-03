@@ -267,3 +267,8 @@ def _construct_chunks(
             ),
         )
     )
+
+
+def chunk_code_inventory(file_inventory, parse_inventory) -> CodeChunkInventory:
+    """Chunk matching scanner/parser inventories with an isolated default instance."""
+    return CodeChunker().chunk_inventory(file_inventory, parse_inventory)

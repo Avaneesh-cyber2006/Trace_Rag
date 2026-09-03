@@ -4,6 +4,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+import backend.code_chunker as code_chunker_public
 
 from backend.code_chunker.exceptions import (
     ChunkerConfigurationError,
@@ -639,6 +640,47 @@ def test_logging_is_aggregate_and_sanitized(tmp_path: Path, caplog):
     assert "app.py" in text
     assert secret not in text
     assert parser.files[0].source_sha256 not in text
+
+
+def test_public_api_exports_exact_approved_surface():
+    expected = {
+        "ChunkFileStatus", "ChunkIssue", "ChunkIssueKind", "ChunkKind",
+        "ChunkedFile", "ChunkerConfig", "CodeChunk", "CodeChunkInventory",
+        "CodeChunker", "CodeChunkerError", "InvalidChunkInventory",
+        "ChunkerConfigurationError", "RepositoryChunkError", "chunk_code_inventory",
+    }
+    assert set(code_chunker_public.__all__) == expected
+    assert all(hasattr(code_chunker_public, name) for name in expected)
+
+
+def test_convenience_api_delegates_in_pipeline_order(monkeypatch):
+    scanner, parser = _inventories()
+    sentinel = object()
+    calls = []
+
+    def fake(self, file_inventory, parse_inventory):
+        calls.append((self, file_inventory, parse_inventory))
+        return sentinel
+
+    monkeypatch.setattr(CodeChunker, "chunk_inventory", fake)
+    assert code_chunker_public.chunk_code_inventory(scanner, parser) is sentinel
+    assert len(calls) == 1
+    assert isinstance(calls[0][0], CodeChunker)
+    assert calls[0][1:] == (scanner, parser)
+
+
+def test_code_chunker_rejects_non_config_eagerly():
+    with pytest.raises(ChunkerConfigurationError):
+        CodeChunker(object())
+
+
+def test_public_results_do_not_retain_reader_or_tree_structures(tmp_path: Path):
+    scanner, parser = _pipeline(tmp_path, b"value = 1\n")
+    result = CodeChunker().chunk_inventory(scanner, parser)
+    forbidden_fields = {"source", "source_bytes", "original_bytes", "parse_bytes", "tree", "node", "all_chunks"}
+    for model in (CodeChunkInventory, ChunkedFile, CodeChunk):
+        assert forbidden_fields.isdisjoint(model.__dataclass_fields__)
+    assert not any(isinstance(value, bytes) for value in vars(result).values()) if hasattr(result, "__dict__") else True
 
 
 def _scanned(
