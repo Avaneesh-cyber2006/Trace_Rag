@@ -53,6 +53,8 @@ from backend.code_chunker.intervals import (
     build_symbol_intervals,
     select_candidates,
 )
+from backend.code_chunker.identity import make_chunk_id, make_content_hash
+import json
 from backend.code_parser import CodeParser
 from backend.code_parser.models import ParseIssueKind
 from backend.code_parser.models import CallKind, CallSite, ParseIssue, SymbolInfo
@@ -412,6 +414,55 @@ def test_partial_allows_issue_free_parent_residual_and_preserves_import_metadata
     candidates = select_candidates(parsed_file, source, build_symbol_intervals(parsed_file.symbols, len(source)))
     assert [(item.start_byte, item.end_byte) for item in candidates] == [(0, 5), (5, 15), (15, 20)]
     assert all(item.end_byte <= 20 for item in candidates)
+
+
+def test_chunk_id_matches_independently_serialized_canonical_material():
+    source = b"def f(): pass"
+    owner = _symbol(source, "f", SymbolKind.FUNCTION, 0, len(source))
+    material = [
+        "tracerag-code-chunk-v1", _NAMESPACE, "src/नमस्ते.py", "symbol",
+        "function", "f", "", 0, len(source), 0,
+    ]
+    expected = sha256(json.dumps(material, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert make_chunk_id(
+        _NAMESPACE, "src/नमस्ते.py", ChunkKind.SYMBOL, owner, 0, len(source), 0
+    ) == expected
+
+
+def test_same_namespace_and_provenance_ignore_different_clone_paths():
+    source = b"value = 1"
+    owner = _symbol(source, "value", SymbolKind.CONSTANT, 0, len(source))
+    first = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
+    second = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
+    assert first == second
+
+
+def test_different_repository_namespaces_change_identity_for_identical_source():
+    source = b"value = 1"
+    owner = _symbol(source, "value", SymbolKind.CONSTANT, 0, len(source))
+    first = make_chunk_id("repo:a", "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
+    second = make_chunk_id("repo:b", "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
+    assert first != second
+
+
+def test_content_hash_is_exact_bytes_and_independent_of_structural_id():
+    before = b"value = 1"
+    after = b"value = 2"
+    owner = _symbol(before, "value", SymbolKind.CONSTANT, 0, len(before))
+    before_id = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(before), 0)
+    after_id = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(after), 0)
+    assert before_id == after_id
+    assert make_content_hash(before) == sha256(before).hexdigest()
+    assert make_content_hash(before) != make_content_hash(after)
+
+
+def test_equal_content_in_different_files_has_equal_hash_but_distinct_ids():
+    source = b"return 1"
+    owner = _symbol(source, "f", SymbolKind.FUNCTION, 0, len(source))
+    assert make_content_hash(source) == make_content_hash(source)
+    assert make_chunk_id(_NAMESPACE, "a.py", ChunkKind.SYMBOL, owner, 0, len(source), 0) != make_chunk_id(
+        _NAMESPACE, "b.py", ChunkKind.SYMBOL, owner, 0, len(source), 0
+    )
 
 
 def _scanned(
