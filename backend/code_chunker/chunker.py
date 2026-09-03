@@ -138,7 +138,7 @@ class CodeChunker:
                     parsed.symbols, len(source.original_bytes)
                 )
                 candidates = select_candidates(parsed, source.original_bytes, intervals)
-            except InvalidSymbolIntervals:
+            except (InvalidSymbolIntervals, UnicodeDecodeError):
                 outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
                 files.append(outcome)
                 _log_file(outcome)

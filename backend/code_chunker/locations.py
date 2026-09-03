@@ -67,6 +67,10 @@ def _valid_location(
         return False
     if not allow_empty and location.start_byte == location.end_byte:
         return False
+    if not _utf8_boundary(source, location.start_byte) or not _utf8_boundary(
+        source, location.end_byte
+    ):
+        return False
     try:
         expected = location_from_offsets(
             source, line_starts, location.start_byte, location.end_byte
@@ -74,6 +78,13 @@ def _valid_location(
     except ValueError:
         return False
     return expected == location
+
+
+def _utf8_boundary(source: bytes, offset: int) -> bool:
+    """Return whether offset is between complete UTF-8 code points in O(1)."""
+    return 0 <= offset <= len(source) and (
+        offset == len(source) or source[offset] & 0xC0 != 0x80
+    )
 
 
 def validate_parsed_locations(

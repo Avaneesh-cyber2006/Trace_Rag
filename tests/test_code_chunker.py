@@ -222,6 +222,31 @@ def test_invalid_location_fails_only_affected_file(tmp_path: Path):
     assert result.files[0].issues[0].kind is ChunkIssueKind.LOCATION_INVALID
 
 
+@pytest.mark.parametrize(
+    ("source", "location"),
+    (
+        ("नमस्ते".encode("utf-8"), SourceLocation(1, 3, 1, 1, 1, 3)),
+        (b"\xef\xbb\xbfx", SourceLocation(1, 3, 1, 1, 1, 3)),
+    ),
+)
+def test_location_validation_rejects_offsets_inside_utf8_code_points(source, location):
+    symbol = SymbolInfo(
+        "x", SymbolKind.FUNCTION, "x", None, location, (), None, (), (), ()
+    )
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=(symbol,))
+    assert validate_parsed_locations(parsed, source, build_line_starts(source)) is False
+
+
+def test_candidate_unicode_failure_is_sanitized_as_location_invalid(tmp_path: Path, monkeypatch):
+    scanner, parser = _pipeline(tmp_path, b"x = 1\n")
+    monkeypatch.setattr(
+        "backend.code_chunker.chunker.select_candidates",
+        lambda *args: (_ for _ in ()).throw(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")),
+    )
+    result = CodeChunker().chunk_inventory(scanner, parser)
+    assert result.files[0].issues[0].kind is ChunkIssueKind.LOCATION_INVALID
+
+
 def _symbol(source: bytes, name: str, kind: SymbolKind, start: int, end: int,
             parent: str | None = None) -> SymbolInfo:
     return SymbolInfo(
