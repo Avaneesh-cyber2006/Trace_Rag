@@ -1,5 +1,7 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from enum import Enum
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -39,9 +41,98 @@ from backend.file_scanner.models import (
     SkippedDirectory,
 )
 from backend.code_chunker.validation import ValidatedInputs, validate_inputs
+from backend.code_chunker.chunker import CodeChunker
+from backend.code_parser import CodeParser
+from backend.code_parser.models import ParseIssueKind
+from backend.code_parser.reader import SourceReadError
+from backend.file_scanner import FileScanner
 
 
 _NAMESPACE = "tracerag-repository-v1:github:example/repo"
+
+
+def _pipeline(tmp_path: Path, data: bytes, *, relative_path: str = "app.py"):
+    source_path = tmp_path / relative_path
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(data)
+    scanned = FileScanner().scan(tmp_path, repository_namespace=_NAMESPACE)
+    parsed = CodeParser().parse_inventory(scanned)
+    return scanned, parsed
+
+
+def test_same_size_source_mutation_fails_with_source_changed(tmp_path: Path):
+    scanner, parser = _pipeline(tmp_path, b"answer = 1\n")
+    (tmp_path / "app.py").write_bytes(b"answer = 2\n")
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert result.files[0].status is ChunkFileStatus.FAILED
+    assert result.files[0].chunks == ()
+    assert result.files[0].issues == (
+        ChunkIssue(ChunkIssueKind.SOURCE_CHANGED, "Source changed after parsing.", None),
+    )
+
+
+def test_verified_bom_original_bytes_match_parser_digest(tmp_path: Path):
+    data = b"\xef\xbb\xbfanswer = 1\r\n"
+    scanner, parser = _pipeline(tmp_path, data)
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert parser.files[0].source_sha256 == sha256(data).hexdigest()
+    assert result.files[0].status is ChunkFileStatus.SUCCESS
+    assert result.files[0].source_sha256 == sha256(data).hexdigest()
+
+
+def test_failed_parse_is_not_read_and_emits_parse_unavailable(tmp_path: Path, monkeypatch):
+    scanner, parser = _pipeline(tmp_path, b"answer = 1\n")
+    failed = replace(parser.files[0], status=ParseStatus.FAILED, source_sha256=None)
+    parser = replace(parser, success_files=0, failed_files=1, files=(failed,))
+
+    def forbidden_read(*args, **kwargs):
+        raise AssertionError("FAILED parse must not be read")
+
+    monkeypatch.setattr("backend.code_chunker.chunker.SafeSourceReader.read", forbidden_read)
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert result.files[0].status is ChunkFileStatus.FAILED
+    assert result.files[0].chunks == ()
+    assert result.files[0].issues[0].kind is ChunkIssueKind.PARSE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("parse_kind", "chunk_kind"),
+    (
+        (ParseIssueKind.READ_ERROR, ChunkIssueKind.READ_ERROR),
+        (ParseIssueKind.FILE_CHANGED, ChunkIssueKind.SOURCE_CHANGED),
+        (ParseIssueKind.PATH_INVALID, ChunkIssueKind.PATH_INVALID),
+        (ParseIssueKind.LINK_UNSAFE, ChunkIssueKind.LINK_UNSAFE),
+        (ParseIssueKind.DECODING_ERROR, ChunkIssueKind.DECODING_ERROR),
+    ),
+)
+def test_safe_reader_failures_map_to_fixed_chunk_issues(
+    tmp_path: Path, monkeypatch, parse_kind: ParseIssueKind, chunk_kind: ChunkIssueKind
+):
+    scanner, parser = _pipeline(tmp_path, b"answer = 1\n")
+
+    def fail_read(*args, **kwargs):
+        raise SourceReadError(parse_kind, "repository-controlled details")
+
+    monkeypatch.setattr("backend.code_chunker.chunker.SafeSourceReader.read", fail_read)
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    file = result.files[0]
+    assert file.status is ChunkFileStatus.FAILED
+    assert file.chunks == ()
+    assert file.issues[0].kind is chunk_kind
+    assert "repository-controlled" not in file.issues[0].message
+
+
+def test_unavailable_repository_root_is_fatal():
+    scanner, parser = _inventories(root="Z:/definitely/missing/tracerag")
+
+    with pytest.raises(RepositoryChunkError):
+        CodeChunker().chunk_inventory(scanner, parser)
 
 
 def _scanned(
