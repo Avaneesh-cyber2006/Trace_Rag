@@ -573,6 +573,74 @@ def test_constructed_chunk_locations_cover_multibyte_lf_and_crlf(tmp_path: Path)
             assert chunk.content.encode("utf-8") == data[chunk.location.start_byte:chunk.location.end_byte]
 
 
+def test_repeat_runs_are_byte_for_byte_deterministic(tmp_path: Path):
+    scanner, parser = _pipeline(tmp_path, b"# header\nA = 1\ndef f():\n    return A\n")
+    chunker = CodeChunker(ChunkerConfig(16, 24))
+    assert chunker.chunk_inventory(scanner, parser) == chunker.chunk_inventory(scanner, parser)
+
+
+def test_equal_content_in_two_files_is_not_globally_deduplicated(tmp_path: Path):
+    (tmp_path / "a.py").write_bytes(b"def f():\n    return 1\n")
+    (tmp_path / "b.py").write_bytes(b"def f():\n    return 1\n")
+    scanner = FileScanner().scan(tmp_path, repository_namespace=_NAMESPACE)
+    parser = CodeParser().parse_inventory(scanner)
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    symbols = [chunk for file in result.files for chunk in file.chunks if chunk.symbol_name == "f"]
+    assert len(symbols) == 2
+    assert symbols[0].content_hash == symbols[1].content_hash
+    assert symbols[0].chunk_id != symbols[1].chunk_id
+
+
+def test_inventory_counters_partition_final_file_outcomes(tmp_path: Path):
+    (tmp_path / "a.py").write_bytes(b"A = 1\n")
+    (tmp_path / "b.py").write_bytes(b"B = 2\n")
+    scanner = FileScanner().scan(tmp_path, repository_namespace=_NAMESPACE)
+    parser = CodeParser().parse_inventory(scanner)
+    failed = replace(parser.files[1], status=ParseStatus.FAILED, source_sha256=None)
+    parser = replace(parser, success_files=1, failed_files=1, files=(parser.files[0], failed))
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert result.total_files_requested == 2
+    assert result.success_files + result.partial_files + result.failed_files == 2
+    assert result.total_chunks == sum(len(file.chunks) for file in result.files)
+
+
+def test_chunk_and_file_order_is_deterministic(tmp_path: Path):
+    (tmp_path / "b.py").write_bytes(b"B = 2\n")
+    (tmp_path / "A.py").write_bytes(b"A = 1\n")
+    scanner = FileScanner().scan(tmp_path, repository_namespace=_NAMESPACE)
+    parser = CodeParser().parse_inventory(scanner)
+    result = CodeChunker().chunk_inventory(scanner, parser)
+    assert [file.relative_path for file in result.files] == ["A.py", "b.py"]
+    for file in result.files:
+        keys = [
+            (
+                chunk.location.start_byte, chunk.location.end_byte, chunk.kind.value,
+                "" if chunk.symbol_kind is None else chunk.symbol_kind.value,
+                "" if chunk.qualified_name is None else chunk.qualified_name,
+                chunk.fragment_index, chunk.chunk_id,
+            )
+            for chunk in file.chunks
+        ]
+        assert keys == sorted(keys)
+
+
+def test_logging_is_aggregate_and_sanitized(tmp_path: Path, caplog):
+    secret = "SECRET_SOURCE_VALUE"
+    scanner, parser = _pipeline(tmp_path, f"value = '{secret}'\n".encode())
+    with caplog.at_level("DEBUG", logger="backend.code_chunker.chunker"):
+        CodeChunker().chunk_inventory(scanner, parser)
+    text = caplog.text
+    assert "Code chunk inventory start" in text
+    assert "Code chunk inventory complete" in text
+    assert "app.py" in text
+    assert secret not in text
+    assert parser.files[0].source_sha256 not in text
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,

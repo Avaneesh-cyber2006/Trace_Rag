@@ -9,7 +9,7 @@ from backend.code_parser.exceptions import RepositoryParseError
 from backend.code_parser.models import ParseIssueKind, ParseStatus
 from backend.code_parser.reader import SafeSourceReader, SourceReadError
 
-from .exceptions import RepositoryChunkError
+from .exceptions import InvalidChunkInventory, RepositoryChunkError
 from .fragmenter import FragmentationFailure, fragment_candidate
 from .identity import make_chunk_id, make_content_hash
 from .intervals import InvalidSymbolIntervals, build_symbol_intervals, select_candidates
@@ -62,6 +62,25 @@ def _failed_file(parsed, kind: ChunkIssueKind) -> ChunkedFile:
     )
 
 
+def _log_path(relative_path: str) -> str:
+    sanitized = "".join(character if character.isprintable() else "?" for character in relative_path)
+    return sanitized or "<invalid>"
+
+
+def _log_file(file: ChunkedFile) -> None:
+    path = _log_path(file.relative_path)
+    fragment_count = sum(chunk.kind is ChunkKind.FRAGMENT for chunk in file.chunks)
+    logger.debug(
+        "Code chunk file complete: %s status=%s chunks=%d fragments=%d",
+        path,
+        file.status.value,
+        len(file.chunks),
+        fragment_count,
+    )
+    for issue in file.issues:
+        logger.warning("Code chunk recoverable issue: %s (%s)", path, issue.kind.value)
+
+
 class CodeChunker:
     """Convert matching scanner/parser snapshots into immutable chunks."""
 
@@ -73,29 +92,43 @@ class CodeChunker:
             raise ChunkerConfigurationError("Invalid chunker configuration.")
 
     def chunk_inventory(self, file_inventory, parse_inventory) -> CodeChunkInventory:
-        validated = validate_inputs(file_inventory, parse_inventory)
+        try:
+            validated = validate_inputs(file_inventory, parse_inventory)
+        except InvalidChunkInventory:
+            logger.error("Code chunk inventory failed: invalid inventory")
+            raise
+        logger.info("Code chunk inventory start: %d files requested", len(validated.pairs))
         try:
             reader = SafeSourceReader(validated.repository_path)
         except RepositoryParseError as error:
+            logger.error("Code chunk inventory failed: repository root unavailable")
             raise RepositoryChunkError(_REPOSITORY_ERROR) from error
 
         files: list[ChunkedFile] = []
         for scanned, parsed in validated.pairs:
             if parsed.status is ParseStatus.FAILED:
-                files.append(_failed_file(parsed, ChunkIssueKind.PARSE_UNAVAILABLE))
+                outcome = _failed_file(parsed, ChunkIssueKind.PARSE_UNAVAILABLE)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
             try:
                 source = reader.read(scanned)
             except SourceReadError as error:
                 kind = _READ_KIND_MAP.get(error.kind, ChunkIssueKind.READ_ERROR)
-                files.append(_failed_file(parsed, kind))
+                outcome = _failed_file(parsed, kind)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
             if sha256(source.original_bytes).hexdigest() != parsed.source_sha256:
-                files.append(_failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED))
+                outcome = _failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
             line_starts = build_line_starts(source.original_bytes)
             if not validate_parsed_locations(parsed, source.original_bytes, line_starts):
-                files.append(_failed_file(parsed, ChunkIssueKind.LOCATION_INVALID))
+                outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
 
             try:
@@ -104,7 +137,9 @@ class CodeChunker:
                 )
                 candidates = select_candidates(parsed, source.original_bytes, intervals)
             except InvalidSymbolIntervals:
-                files.append(_failed_file(parsed, ChunkIssueKind.LOCATION_INVALID))
+                outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
 
             try:
@@ -117,7 +152,9 @@ class CodeChunker:
                     self.config,
                 )
             except (FragmentationFailure, UnicodeDecodeError, ValueError):
-                files.append(_failed_file(parsed, ChunkIssueKind.FRAGMENTATION_ERROR))
+                outcome = _failed_file(parsed, ChunkIssueKind.FRAGMENTATION_ERROR)
+                files.append(outcome)
+                _log_file(outcome)
                 continue
 
             status = (
@@ -125,8 +162,7 @@ class CodeChunker:
                 if parsed.status is ParseStatus.SUCCESS
                 else ChunkFileStatus.PARTIAL
             )
-            files.append(
-                ChunkedFile(
+            outcome = ChunkedFile(
                     parsed.relative_path,
                     parsed.language,
                     parsed.status,
@@ -136,10 +172,11 @@ class CodeChunker:
                     chunks,
                     (),
                 )
-            )
+            files.append(outcome)
+            _log_file(outcome)
 
         result_files = tuple(files)
-        return CodeChunkInventory(
+        result = CodeChunkInventory(
             validated.repository_path,
             validated.repository_namespace,
             len(result_files),
@@ -149,6 +186,14 @@ class CodeChunker:
             sum(len(file.chunks) for file in result_files),
             result_files,
         )
+        logger.info(
+            "Code chunk inventory complete: %d success, %d partial, %d failed, %d chunks",
+            result.success_files,
+            result.partial_files,
+            result.failed_files,
+            result.total_chunks,
+        )
+        return result
 
 
 def _construct_chunks(
@@ -208,4 +253,17 @@ def _construct_chunks(
                     fragment_count=fragment_count,
                 )
             )
-    return tuple(chunks)
+    return tuple(
+        sorted(
+            chunks,
+            key=lambda chunk: (
+                chunk.location.start_byte,
+                chunk.location.end_byte,
+                chunk.kind.value,
+                "" if chunk.symbol_kind is None else chunk.symbol_kind.value,
+                "" if chunk.qualified_name is None else chunk.qualified_name,
+                chunk.fragment_index,
+                chunk.chunk_id,
+            ),
+        )
+    )
