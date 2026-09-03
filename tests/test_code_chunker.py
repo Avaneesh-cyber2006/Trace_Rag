@@ -683,6 +683,51 @@ def test_public_results_do_not_retain_reader_or_tree_structures(tmp_path: Path):
     assert not any(isinstance(value, bytes) for value in vars(result).values()) if hasattr(result, "__dict__") else True
 
 
+@pytest.mark.parametrize(
+    ("filename", "data", "expected_language", "expected_symbol_kind"),
+    (
+        ("app.py", b"import os\nclass A:\n    def m(self):\n        return 1\n", ParsedLanguage.PYTHON, SymbolKind.METHOD),
+        ("App.java", b"package p; class A { int m() { return 1; } }\n", ParsedLanguage.JAVA, SymbolKind.METHOD),
+        ("app.js", b"import x from 'x'; class A { m() { return 1; } }\n", ParsedLanguage.JAVASCRIPT, SymbolKind.METHOD),
+        ("view.jsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.JAVASCRIPT, SymbolKind.FUNCTION),
+        ("types.ts", b"interface A { m(x: number): string; }\n", ParsedLanguage.TYPESCRIPT, SymbolKind.METHOD),
+        ("view.tsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.TSX, SymbolKind.FUNCTION),
+    ),
+)
+def test_pipeline_language_fixtures_preserve_exact_nonoverlapping_coverage(
+    tmp_path: Path, filename, data, expected_language, expected_symbol_kind
+):
+    scanner, parser = _pipeline(tmp_path, data, relative_path=filename)
+    assert parser.files[0].status is ParseStatus.SUCCESS
+    assert parser.files[0].language is expected_language
+
+    first = CodeChunker(ChunkerConfig(24, 48)).chunk_inventory(scanner, parser)
+    second = CodeChunker(ChunkerConfig(24, 48)).chunk_inventory(scanner, parser)
+
+    assert first == second
+    file = first.files[0]
+    assert any(chunk.symbol_kind is expected_symbol_kind for chunk in file.chunks)
+    ordered = sorted(file.chunks, key=lambda chunk: chunk.location.start_byte)
+    assert all(
+        left.location.end_byte <= right.location.start_byte
+        for left, right in zip(ordered, ordered[1:])
+    )
+    covered = [False] * len(data)
+    for chunk in ordered:
+        exact = data[chunk.location.start_byte:chunk.location.end_byte]
+        assert chunk.content.encode("utf-8") == exact
+        for offset in range(chunk.location.start_byte, chunk.location.end_byte):
+            assert covered[offset] is False
+            covered[offset] = True
+    decoded = data.decode("utf-8")
+    byte_offset = 0
+    for character in decoded:
+        encoded = character.encode("utf-8")
+        if not character.isspace():
+            assert all(covered[byte_offset:byte_offset + len(encoded)])
+        byte_offset += len(encoded)
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,
