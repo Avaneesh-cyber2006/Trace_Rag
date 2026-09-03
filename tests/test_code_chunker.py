@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from enum import Enum
 
 import pytest
@@ -20,13 +20,301 @@ from backend.code_chunker.models import (
     CodeChunkInventory,
 )
 from backend.code_parser.models import (
+    CodeParseInventory,
     ImportInfo,
     ParameterInfo,
+    ParsedFile,
     ParseStatus,
     ParsedLanguage,
+    SkippedParseFile,
+    ParseSkipReason,
     SourceLocation,
     SymbolKind,
 )
+from backend.file_scanner.models import (
+    FileCategory,
+    FileInventory,
+    IgnoredFile,
+    ScannedFile,
+    SkippedDirectory,
+)
+from backend.code_chunker.validation import ValidatedInputs, validate_inputs
+
+
+_NAMESPACE = "tracerag-repository-v1:github:example/repo"
+
+
+def _scanned(
+    relative_path: str = "src/app.py",
+    *,
+    extension: str = ".py",
+    language: str | None = "python",
+    category: FileCategory = FileCategory.SOURCE,
+) -> ScannedFile:
+    return ScannedFile(
+        relative_path=relative_path,
+        filename=relative_path.rsplit("/", maxsplit=1)[-1],
+        extension=extension,
+        language=language,
+        category=category,
+        size_bytes=1,
+    )
+
+
+def _parsed(
+    relative_path: str = "src/app.py",
+    *,
+    language: ParsedLanguage = ParsedLanguage.PYTHON,
+    status: ParseStatus = ParseStatus.SUCCESS,
+    digest: str | None = "a" * 64,
+) -> ParsedFile:
+    return ParsedFile(relative_path, language, status, (), (), (), (), digest)
+
+
+def _inventories(
+    *,
+    scanned_files: tuple[ScannedFile, ...] = (_scanned(),),
+    parsed_files: tuple[ParsedFile, ...] = (_parsed(),),
+    ignored: tuple[IgnoredFile, ...] = (),
+    skipped_directories: tuple[SkippedDirectory, ...] = (),
+    skipped: tuple[SkippedParseFile, ...] = (),
+    root: str = "/repo",
+    scanner_namespace: object = _NAMESPACE,
+    parser_namespace: object = _NAMESPACE,
+) -> tuple[FileInventory, CodeParseInventory]:
+    scanner = FileInventory(
+        root,
+        len(scanned_files) + len(ignored),
+        len(scanned_files),
+        len(ignored),
+        scanned_files,
+        ignored,
+        skipped_directories,
+        scanner_namespace,
+    )
+    parser = CodeParseInventory(
+        root,
+        len(parsed_files) + len(skipped),
+        sum(item.status is ParseStatus.SUCCESS for item in parsed_files),
+        sum(item.status is ParseStatus.PARTIAL for item in parsed_files),
+        sum(item.status is ParseStatus.FAILED for item in parsed_files),
+        len(skipped),
+        parsed_files,
+        skipped,
+        parser_namespace,
+    )
+    return scanner, parser
+
+
+def test_inventory_validation_returns_frozen_ordered_o1_join_pairs():
+    scanner, parser = _inventories(
+        scanned_files=(
+            _scanned("src/A.py"),
+            _scanned("src/b.ts", extension=".ts", language="typescript"),
+        ),
+        parsed_files=(
+            _parsed("src/A.py"),
+            _parsed("src/b.ts", language=ParsedLanguage.TYPESCRIPT),
+        ),
+    )
+
+    result = validate_inputs(scanner, parser)
+
+    assert result == ValidatedInputs(
+        "/repo",
+        _NAMESPACE,
+        ((scanner.files[0], parser.files[0]), (scanner.files[1], parser.files[1])),
+    )
+    assert getattr(ValidatedInputs, "__slots__") == (
+        "repository_path",
+        "repository_namespace",
+        "pairs",
+    )
+    assert getattr(ValidatedInputs, "__dataclass_params__").frozen is True
+
+
+@pytest.mark.parametrize("value", (None, object(), "not-an-inventory"))
+def test_inventory_validation_rejects_wrong_inventory_types(value):
+    scanner, parser = _inventories()
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(value, parser)
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, value)
+
+
+@pytest.mark.parametrize(
+    "inventory_name, field_name, value",
+    (
+        ("scanner", "files", []),
+        ("scanner", "ignored", []),
+        ("scanner", "skipped_directories", []),
+        ("parser", "files", []),
+        ("parser", "skipped", []),
+        ("scanner", "files", (object(),)),
+        ("scanner", "ignored", (object(),)),
+        ("scanner", "skipped_directories", (object(),)),
+        ("parser", "files", (object(),)),
+        ("parser", "skipped", (object(),)),
+    ),
+)
+def test_inventory_validation_rejects_non_tuple_or_wrong_member_collections(
+    inventory_name, field_name, value
+):
+    scanner, parser = _inventories()
+    if inventory_name == "scanner":
+        scanner = replace(scanner, **{field_name: value})
+    else:
+        parser = replace(parser, **{field_name: value})
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+@pytest.mark.parametrize(
+    "scanner_changes, parser_changes",
+    (
+        ({"included_files": 0}, {}),
+        ({"ignored_files": 1}, {}),
+        ({"total_files_seen": 0}, {}),
+        ({}, {"total_files_requested": 0}),
+        ({}, {"success_files": 0}),
+        ({}, {"partial_files": 1}),
+        ({}, {"failed_files": 1}),
+        ({}, {"skipped_files": 1}),
+    ),
+)
+def test_inventory_validation_rejects_inconsistent_counters(
+    scanner_changes, parser_changes
+):
+    scanner, parser = _inventories()
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(
+            replace(scanner, **scanner_changes), replace(parser, **parser_changes)
+        )
+
+
+def test_inventory_validation_rejects_a_parsed_file_with_an_invalid_status():
+    scanner, parser = _inventories(parsed_files=(replace(_parsed(), status=object()),))
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+def test_inventory_validation_rejects_duplicate_paths_and_unsorted_parser_files():
+    scanner, parser = _inventories(
+        scanned_files=(_scanned("src/a.py"), _scanned("src/a.py")),
+        parsed_files=(_parsed("src/a.py"), _parsed("src/a.py")),
+    )
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+    scanner, parser = _inventories(
+        scanned_files=(_scanned("src/a.py"), _scanned("src/b.py")),
+        parsed_files=(_parsed("src/b.py"), _parsed("src/a.py")),
+    )
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+@pytest.mark.parametrize(
+    "scanner_namespace, parser_namespace",
+    (
+        (None, _NAMESPACE),
+        ("", _NAMESPACE),
+        (object(), _NAMESPACE),
+        (_NAMESPACE, None),
+        (_NAMESPACE, ""),
+        (_NAMESPACE, object()),
+        (_NAMESPACE, "tracerag-repository-v1:github:other/repo"),
+    ),
+)
+def test_namespace_validation_rejects_missing_empty_wrong_or_different_namespace(
+    scanner_namespace, parser_namespace
+):
+    scanner, parser = _inventories(
+        scanner_namespace=scanner_namespace, parser_namespace=parser_namespace
+    )
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+def test_inventory_validation_rejects_root_mismatch_missing_join_and_non_code_category():
+    scanner, parser = _inventories()
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, replace(parser, repository_path="/other"))
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, replace(parser, files=(_parsed("src/missing.py"),)))
+
+    scanner, parser = _inventories(
+        scanned_files=(_scanned(category=FileCategory.CONFIG),)
+    )
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+@pytest.mark.parametrize(
+    "scanned, parsed",
+    (
+        (_scanned(extension=".py", language="java"), _parsed()),
+        (_scanned(extension=".jsx", language="javascript"), _parsed()),
+        (_scanned(extension=".md", language=None), _parsed()),
+    ),
+)
+def test_join_validation_rejects_incompatible_language_selector(scanned, parsed):
+    scanner, parser = _inventories(scanned_files=(scanned,), parsed_files=(parsed,))
+
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+@pytest.mark.parametrize(
+    "status, digest, expected",
+    (
+        (ParseStatus.SUCCESS, None, True),
+        (ParseStatus.PARTIAL, "A" * 64, True),
+        (ParseStatus.SUCCESS, "f" * 63, True),
+        (ParseStatus.SUCCESS, "g" * 64, True),
+        (ParseStatus.FAILED, None, False),
+    ),
+)
+def test_join_validation_enforces_processable_digest_but_allows_failed_none(
+    status, digest, expected
+):
+    scanner, parser = _inventories(parsed_files=(_parsed(status=status, digest=digest),))
+
+    if expected:
+        with pytest.raises(InvalidChunkInventory):
+            validate_inputs(scanner, parser)
+    else:
+        assert validate_inputs(scanner, parser).pairs == ((scanner.files[0], parser.files[0]),)
+
+
+@pytest.mark.parametrize(
+    "extension, scanner_language, parsed_language",
+    (
+        (".py", "python", ParsedLanguage.PYTHON),
+        (".java", "java", ParsedLanguage.JAVA),
+        (".js", "javascript", ParsedLanguage.JAVASCRIPT),
+        (".jsx", "javascript", ParsedLanguage.JAVASCRIPT),
+        (".ts", "typescript", ParsedLanguage.TYPESCRIPT),
+        (".tsx", "typescript", ParsedLanguage.TSX),
+    ),
+)
+def test_join_validation_accepts_closed_language_selector(
+    extension, scanner_language, parsed_language
+):
+    scanner, parser = _inventories(
+        scanned_files=(
+            _scanned(extension=extension, language=scanner_language),
+        ),
+        parsed_files=(_parsed(language=parsed_language),),
+    )
+
+    assert validate_inputs(scanner, parser).pairs == ((scanner.files[0], parser.files[0]),)
 
 
 def test_chunk_enums_are_string_enums_with_stable_values():
