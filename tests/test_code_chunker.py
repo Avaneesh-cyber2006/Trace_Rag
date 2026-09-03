@@ -1088,6 +1088,38 @@ def test_join_validation_accepts_closed_language_selector(
     assert validate_inputs(scanner, parser).pairs == ((scanner.files[0], parser.files[0]),)
 
 
+@pytest.mark.parametrize("field", ("symbols", "imports", "calls", "issues"))
+def test_inventory_validation_rejects_nested_non_tuple_parser_collections(field):
+    scanner, parser = _inventories()
+    malformed = replace(parser.files[0], **{field: []})
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, replace(parser, files=(malformed,)))
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"relative_path": ""}, {"filename": 1}, {"extension": None},
+        {"language": 1}, {"category": "source"}, {"size_bytes": True},
+        {"size_bytes": -1},
+    ),
+)
+def test_inventory_validation_rejects_malformed_scanned_file_fields(change):
+    scanned = replace(_scanned(), **change)
+    scanner, parser = _inventories(scanned_files=(scanned,))
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
+def test_inventory_validation_rejects_unsorted_scanner_files():
+    scanner, parser = _inventories(
+        scanned_files=(_scanned("b.py"), _scanned("a.py")),
+        parsed_files=(_parsed("a.py"), _parsed("b.py")),
+    )
+    with pytest.raises(InvalidChunkInventory):
+        validate_inputs(scanner, parser)
+
+
 def test_chunk_enums_are_string_enums_with_stable_values():
     assert issubclass(ChunkKind, str)
     assert issubclass(ChunkKind, Enum)

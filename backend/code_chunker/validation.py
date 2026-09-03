@@ -6,18 +6,25 @@ from dataclasses import dataclass
 import re
 
 from backend.code_parser.models import (
+    CallSite,
     CodeParseInventory,
+    ImportInfo,
     ParsedFile,
     ParsedLanguage,
+    ParseIssue,
+    ParseSkipReason,
     ParseStatus,
     SkippedParseFile,
+    SymbolInfo,
 )
 from backend.file_scanner.models import (
     FileCategory,
     FileInventory,
     IgnoredFile,
+    IgnoreReason,
     ScannedFile,
     SkippedDirectory,
+    SkippedDirectoryReason,
 )
 
 from .exceptions import InvalidChunkInventory
@@ -70,6 +77,7 @@ def _valid_scanner_inventory(inventory: FileInventory) -> bool:
     )
     return (
         type(inventory.repository_path) is str
+        and bool(inventory.repository_path)
         and all(type(counter) is int and counter >= 0 for counter in counters)
         and _has_exact_members(inventory.files, ScannedFile)
         and _has_exact_members(inventory.ignored, IgnoredFile)
@@ -78,6 +86,23 @@ def _valid_scanner_inventory(inventory: FileInventory) -> bool:
         and inventory.ignored_files == len(inventory.ignored)
         and inventory.total_files_seen
         == inventory.included_files + inventory.ignored_files
+        and all(_valid_scanned_file(item) for item in inventory.files)
+        and all(
+            type(item.relative_path) is str
+            and bool(item.relative_path)
+            and type(item.reason) is IgnoreReason
+            for item in inventory.ignored
+        )
+        and all(
+            type(item.relative_path) is str
+            and bool(item.relative_path)
+            and type(item.reason) is SkippedDirectoryReason
+            for item in inventory.skipped_directories
+        )
+        and tuple(sorted(inventory.files, key=_path_key)) == inventory.files
+        and tuple(sorted(inventory.ignored, key=_path_key)) == inventory.ignored
+        and tuple(sorted(inventory.skipped_directories, key=_path_key))
+        == inventory.skipped_directories
         and _has_unique_paths(
             inventory.files, inventory.ignored, inventory.skipped_directories
         )
@@ -94,12 +119,16 @@ def _valid_parser_inventory(inventory: CodeParseInventory) -> bool:
     )
     return (
         type(inventory.repository_path) is str
+        and bool(inventory.repository_path)
         and all(type(counter) is int and counter >= 0 for counter in counters)
         and _has_exact_members(inventory.files, ParsedFile)
         and _has_exact_members(inventory.skipped, SkippedParseFile)
+        and all(_valid_parsed_file(item) for item in inventory.files)
         and all(
-            type(item.language) is ParsedLanguage and type(item.status) is ParseStatus
-            for item in inventory.files
+            type(item.relative_path) is str
+            and bool(item.relative_path)
+            and type(item.reason) is ParseSkipReason
+            for item in inventory.skipped
         )
         and inventory.total_files_requested
         == len(inventory.files) + len(inventory.skipped)
@@ -118,6 +147,44 @@ def _valid_parser_inventory(inventory: CodeParseInventory) -> bool:
             )
         )
         == inventory.files
+        and tuple(sorted(inventory.skipped, key=_path_key)) == inventory.skipped
+    )
+
+
+def _path_key(item: object) -> tuple[str, str]:
+    path = getattr(item, "relative_path", "")
+    return path.casefold(), path
+
+
+def _valid_scanned_file(file: ScannedFile) -> bool:
+    return (
+        type(file.relative_path) is str
+        and bool(file.relative_path)
+        and type(file.filename) is str
+        and bool(file.filename)
+        and type(file.extension) is str
+        and isinstance(file.language, (str, type(None)))
+        and type(file.category) is FileCategory
+        and type(file.size_bytes) is int
+        and file.size_bytes >= 0
+    )
+
+
+def _valid_parsed_file(file: ParsedFile) -> bool:
+    digest_valid = file.source_sha256 is None or (
+        type(file.source_sha256) is str
+        and bool(_DIGEST_PATTERN.fullmatch(file.source_sha256))
+    )
+    return (
+        type(file.relative_path) is str
+        and bool(file.relative_path)
+        and type(file.language) is ParsedLanguage
+        and type(file.status) is ParseStatus
+        and _has_exact_members(file.symbols, SymbolInfo)
+        and _has_exact_members(file.imports, ImportInfo)
+        and _has_exact_members(file.calls, CallSite)
+        and _has_exact_members(file.issues, ParseIssue)
+        and digest_valid
     )
 
 
