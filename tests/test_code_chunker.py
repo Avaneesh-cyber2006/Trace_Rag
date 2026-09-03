@@ -500,12 +500,16 @@ def test_chunk_id_matches_independently_serialized_canonical_material():
     ) == expected
 
 
-def test_same_namespace_and_provenance_ignore_different_clone_paths():
-    source = b"value = 1"
-    owner = _symbol(source, "value", SymbolKind.CONSTANT, 0, len(source))
-    first = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
-    second = make_chunk_id(_NAMESPACE, "app.py", ChunkKind.SYMBOL, owner, 0, len(source), 0)
-    assert first == second
+def test_same_namespace_and_provenance_ignore_different_clone_paths(tmp_path: Path):
+    source = b"value = 1\n"
+    first_inputs = _pipeline(tmp_path / "clone-a", source)
+    second_inputs = _pipeline(tmp_path / "elsewhere" / "clone-b", source)
+    first = CodeChunker().chunk_inventory(*first_inputs)
+    second = CodeChunker().chunk_inventory(*second_inputs)
+    assert first.repository_path != second.repository_path
+    assert tuple(chunk.chunk_id for chunk in first.files[0].chunks) == tuple(
+        chunk.chunk_id for chunk in second.files[0].chunks
+    )
 
 
 def test_different_repository_namespaces_change_identity_for_identical_source():
@@ -743,6 +747,14 @@ def test_code_chunker_rejects_non_config_eagerly():
         CodeChunker(object())
 
 
+def test_invalid_configuration_emits_fixed_error_log(caplog):
+    with caplog.at_level("ERROR"):
+        with pytest.raises(ChunkerConfigurationError):
+            ChunkerConfig(0, 1)
+    assert "invalid configuration" in caplog.text.lower()
+    assert "0" not in caplog.text
+
+
 def test_public_results_do_not_retain_reader_or_tree_structures(tmp_path: Path):
     scanner, parser = _pipeline(tmp_path, b"value = 1\n")
     result = CodeChunker().chunk_inventory(scanner, parser)
@@ -753,18 +765,18 @@ def test_public_results_do_not_retain_reader_or_tree_structures(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    ("filename", "data", "expected_language", "expected_symbol_kind"),
+    ("filename", "data", "expected_language", "expected_symbol_kinds"),
     (
-        ("app.py", b"import os\nclass A:\n    def m(self):\n        return 1\n", ParsedLanguage.PYTHON, SymbolKind.METHOD),
-        ("App.java", b"package p; class A { int m() { return 1; } }\n", ParsedLanguage.JAVA, SymbolKind.METHOD),
-        ("app.js", b"import x from 'x'; class A { m() { return 1; } }\n", ParsedLanguage.JAVASCRIPT, SymbolKind.METHOD),
-        ("view.jsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.JAVASCRIPT, SymbolKind.FUNCTION),
-        ("types.ts", b"interface A { m(x: number): string; }\n", ParsedLanguage.TYPESCRIPT, SymbolKind.METHOD),
-        ("view.tsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.TSX, SymbolKind.FUNCTION),
+        ("app.py", b"VALUE = 1\nclass Outer:\n class Inner:\n  def m(self): return VALUE\n", ParsedLanguage.PYTHON, (SymbolKind.CONSTANT, SymbolKind.METHOD)),
+        ("App.java", b"enum E { X } class A { A() {} int m(int x) { return x; } int m() { return 1; } }\n", ParsedLanguage.JAVA, (SymbolKind.ENUM, SymbolKind.CONSTRUCTOR, SymbolKind.METHOD)),
+        ("app.js", b"const X = 1; class A { constructor() {} m() { return X; } }\n", ParsedLanguage.JAVASCRIPT, (SymbolKind.CONSTANT, SymbolKind.CONSTRUCTOR, SymbolKind.METHOD)),
+        ("view.jsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.JAVASCRIPT, (SymbolKind.FUNCTION,)),
+        ("types.ts", b"enum E { X } interface A { m(x: number): string; }\n", ParsedLanguage.TYPESCRIPT, (SymbolKind.METHOD,)),
+        ("view.tsx", b"const App = () => <div>Hello</div>;\n", ParsedLanguage.TSX, (SymbolKind.FUNCTION,)),
     ),
 )
 def test_pipeline_language_fixtures_preserve_exact_nonoverlapping_coverage(
-    tmp_path: Path, filename, data, expected_language, expected_symbol_kind
+    tmp_path: Path, filename, data, expected_language, expected_symbol_kinds
 ):
     scanner, parser = _pipeline(tmp_path, data, relative_path=filename)
     assert parser.files[0].status is ParseStatus.SUCCESS
@@ -775,7 +787,8 @@ def test_pipeline_language_fixtures_preserve_exact_nonoverlapping_coverage(
 
     assert first == second
     file = first.files[0]
-    assert any(chunk.symbol_kind is expected_symbol_kind for chunk in file.chunks)
+    present_kinds = {chunk.symbol_kind for chunk in file.chunks}
+    assert set(expected_symbol_kinds) <= present_kinds
     ordered = sorted(file.chunks, key=lambda chunk: chunk.location.start_byte)
     assert all(
         left.location.end_byte <= right.location.start_byte

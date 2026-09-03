@@ -106,79 +106,11 @@ class CodeChunker:
 
         files: list[ChunkedFile] = []
         for scanned, parsed in validated.pairs:
-            if parsed.status is ParseStatus.FAILED:
-                outcome = _failed_file(parsed, ChunkIssueKind.PARSE_UNAVAILABLE)
-                files.append(outcome)
-                _log_file(outcome)
-                continue
-            try:
-                source = reader.read(scanned)
-            except SourceReadError as error:
-                kind = _READ_KIND_MAP.get(error.kind, ChunkIssueKind.READ_ERROR)
-                outcome = _failed_file(parsed, kind)
-                files.append(outcome)
-                _log_file(outcome)
-                continue
-            if sha256(source.original_bytes).hexdigest() != parsed.source_sha256:
-                outcome = _failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED)
-                files.append(outcome)
-                _log_file(outcome)
-                del source
-                continue
-            line_starts = build_line_starts(source.original_bytes)
-            if not validate_parsed_locations(parsed, source.original_bytes, line_starts):
-                outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
-                files.append(outcome)
-                _log_file(outcome)
-                del source
-                continue
-
-            try:
-                intervals = build_symbol_intervals(
-                    parsed.symbols, len(source.original_bytes)
-                )
-                candidates = select_candidates(parsed, source.original_bytes, intervals)
-            except (InvalidSymbolIntervals, UnicodeDecodeError):
-                outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
-                files.append(outcome)
-                _log_file(outcome)
-                del source
-                continue
-
-            try:
-                chunks = _construct_chunks(
-                    validated.repository_namespace,
-                    parsed.relative_path,
-                    candidates,
-                    source.original_bytes,
-                    line_starts,
-                    self.config,
-                )
-            except (FragmentationFailure, UnicodeDecodeError, ValueError):
-                outcome = _failed_file(parsed, ChunkIssueKind.FRAGMENTATION_ERROR)
-                files.append(outcome)
-                _log_file(outcome)
-                del source
-                continue
-
-            status = (
-                ChunkFileStatus.SUCCESS
-                if parsed.status is ParseStatus.SUCCESS
-                else ChunkFileStatus.PARTIAL
+            outcome = _process_file(
+                reader, scanned, parsed, validated.repository_namespace, self.config
             )
-            outcome = ChunkedFile(
-                    parsed.relative_path,
-                    parsed.language,
-                    parsed.status,
-                    status,
-                    parsed.source_sha256,
-                    parsed.imports,
-                    chunks,
-                    (),
-                )
             files.append(outcome)
             _log_file(outcome)
-            del source
 
         result_files = tuple(files)
         result = CodeChunkInventory(
@@ -199,6 +131,54 @@ class CodeChunker:
             result.total_chunks,
         )
         return result
+
+
+def _process_file(reader, scanned, parsed, repository_namespace, config) -> ChunkedFile:
+    """Process one file so its source-derived temporaries have file-local lifetime."""
+    if parsed.status is ParseStatus.FAILED:
+        return _failed_file(parsed, ChunkIssueKind.PARSE_UNAVAILABLE)
+    try:
+        source = reader.read(scanned)
+    except SourceReadError as error:
+        return _failed_file(
+            parsed, _READ_KIND_MAP.get(error.kind, ChunkIssueKind.READ_ERROR)
+        )
+    if sha256(source.original_bytes).hexdigest() != parsed.source_sha256:
+        return _failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED)
+    line_starts = build_line_starts(source.original_bytes)
+    if not validate_parsed_locations(parsed, source.original_bytes, line_starts):
+        return _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
+    try:
+        intervals = build_symbol_intervals(parsed.symbols, len(source.original_bytes))
+        candidates = select_candidates(parsed, source.original_bytes, intervals)
+    except (InvalidSymbolIntervals, UnicodeDecodeError):
+        return _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
+    try:
+        chunks = _construct_chunks(
+            repository_namespace,
+            parsed.relative_path,
+            candidates,
+            source.original_bytes,
+            line_starts,
+            config,
+        )
+    except (FragmentationFailure, UnicodeDecodeError, ValueError):
+        return _failed_file(parsed, ChunkIssueKind.FRAGMENTATION_ERROR)
+    status = (
+        ChunkFileStatus.SUCCESS
+        if parsed.status is ParseStatus.SUCCESS
+        else ChunkFileStatus.PARTIAL
+    )
+    return ChunkedFile(
+        parsed.relative_path,
+        parsed.language,
+        parsed.status,
+        status,
+        parsed.source_sha256,
+        parsed.imports,
+        chunks,
+        (),
+    )
 
 
 def _construct_chunks(

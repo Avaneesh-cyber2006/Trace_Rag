@@ -1,4 +1,5 @@
 import ast
+import sys
 from importlib.metadata import version
 from pathlib import Path
 
@@ -45,24 +46,30 @@ def test_pinned_grammar_initializes_and_parses_minimal_fixture(
 
 def test_code_chunker_uses_only_standard_library_and_approved_backend_boundaries() -> None:
     package = Path(__file__).parents[1] / "backend" / "code_chunker"
-    forbidden_roots = {
-        "tree_sitter", "requests", "urllib", "socket", "subprocess",
-        "git", "numpy", "pandas", "openai",
+    approved_backend_modules = {
+        "backend.code_parser.exceptions",
+        "backend.code_parser.models",
+        "backend.code_parser.reader",
+        "backend.file_scanner.models",
     }
     for path in sorted(package.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        imports = [
-            alias.name.split(".", 1)[0]
+        absolute_modules = [
+            alias.name
             for node in ast.walk(tree)
             if isinstance(node, ast.Import)
             for alias in node.names
         ]
-        imports += [
-            (node.module or "").split(".", 1)[0]
+        absolute_modules += [
+            node.module or ""
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and node.level == 0
         ]
-        assert forbidden_roots.isdisjoint(imports), (path, imports)
+        assert all(
+            module.split(".", 1)[0] in sys.stdlib_module_names
+            or module in approved_backend_modules
+            for module in absolute_modules
+        ), (path, absolute_modules)
         assert not any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import logging
 
 from backend.code_parser.models import (
     ImportInfo,
@@ -13,6 +14,9 @@ from backend.code_parser.models import (
 )
 
 from .exceptions import ChunkerConfigurationError
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChunkKind(str, Enum):
@@ -51,6 +55,7 @@ class ChunkerConfig:
             or self.max_chunk_bytes <= 0
             or self.target_chunk_bytes > self.max_chunk_bytes
         ):
+            logger.error("Code chunker invalid configuration")
             raise ChunkerConfigurationError(
                 "target_chunk_bytes and max_chunk_bytes must be positive integers "
                 "with target_chunk_bytes <= max_chunk_bytes"
