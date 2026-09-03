@@ -6,16 +6,22 @@ from dataclasses import dataclass
 import re
 
 from backend.code_parser.models import (
+    CallKind,
     CallSite,
     CodeParseInventory,
+    ImportBinding,
     ImportInfo,
+    ParameterInfo,
     ParsedFile,
     ParsedLanguage,
     ParseIssue,
+    ParseIssueKind,
     ParseSkipReason,
     ParseStatus,
     SkippedParseFile,
+    SourceLocation,
     SymbolInfo,
+    SymbolKind,
 )
 from backend.file_scanner.models import (
     FileCategory,
@@ -184,7 +190,90 @@ def _valid_parsed_file(file: ParsedFile) -> bool:
         and _has_exact_members(file.imports, ImportInfo)
         and _has_exact_members(file.calls, CallSite)
         and _has_exact_members(file.issues, ParseIssue)
+        and all(_valid_symbol(item) for item in file.symbols)
+        and all(_valid_import(item) for item in file.imports)
+        and all(_valid_call(item) for item in file.calls)
+        and all(_valid_issue(item) for item in file.issues)
         and digest_valid
+    )
+
+
+def _optional_string(value: object) -> bool:
+    return value is None or type(value) is str
+
+
+def _string_tuple(value: object) -> bool:
+    return type(value) is tuple and all(type(item) is str for item in value)
+
+
+def _valid_location_shape(value: object) -> bool:
+    return type(value) is SourceLocation and all(
+        type(item) is int
+        for item in (
+            value.start_byte, value.end_byte, value.start_line,
+            value.start_column, value.end_line, value.end_column,
+        )
+    )
+
+
+def _valid_parameter(value: object) -> bool:
+    return (
+        type(value) is ParameterInfo
+        and type(value.name) is str
+        and _optional_string(value.type_name)
+        and _optional_string(value.default_value_text)
+    )
+
+
+def _valid_binding(value: object) -> bool:
+    return (
+        type(value) is ImportBinding
+        and type(value.imported_name) is str
+        and _optional_string(value.alias)
+    )
+
+
+def _valid_import(value: object) -> bool:
+    return (
+        type(value.module) is str
+        and _has_exact_members(value.bindings, ImportBinding)
+        and all(_valid_binding(item) for item in value.bindings)
+        and type(value.is_wildcard) is bool
+        and _string_tuple(value.modifiers)
+        and _valid_location_shape(value.location)
+    )
+
+
+def _valid_symbol(value: object) -> bool:
+    return (
+        type(value.name) is str
+        and type(value.kind) is SymbolKind
+        and type(value.qualified_name) is str
+        and _optional_string(value.parent_qualified_name)
+        and _valid_location_shape(value.location)
+        and _has_exact_members(value.parameters, ParameterInfo)
+        and all(_valid_parameter(item) for item in value.parameters)
+        and _optional_string(value.return_type)
+        and _string_tuple(value.modifiers)
+        and _string_tuple(value.base_types)
+        and _string_tuple(value.implemented_types)
+    )
+
+
+def _valid_call(value: object) -> bool:
+    return (
+        _optional_string(value.caller_qualified_name)
+        and type(value.callee_text) is str
+        and type(value.kind) is CallKind
+        and _valid_location_shape(value.location)
+    )
+
+
+def _valid_issue(value: object) -> bool:
+    return (
+        type(value.kind) is ParseIssueKind
+        and type(value.message) is str
+        and (value.location is None or _valid_location_shape(value.location))
     )
 
 
@@ -235,3 +324,7 @@ def validate_inputs(
         file_inventory.repository_namespace,
         tuple(pairs),
     )
+    ImportBinding,
+    ParameterInfo,
+    ParseIssueKind,
+    SourceLocation,

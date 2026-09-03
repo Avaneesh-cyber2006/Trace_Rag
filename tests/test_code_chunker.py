@@ -23,15 +23,21 @@ from backend.code_chunker.models import (
     CodeChunkInventory,
 )
 from backend.code_parser.models import (
+    CallKind,
+    CallSite,
     CodeParseInventory,
+    ImportBinding,
     ImportInfo,
     ParameterInfo,
+    ParseIssue,
+    ParseIssueKind,
     ParsedFile,
     ParseStatus,
     ParsedLanguage,
     SkippedParseFile,
     ParseSkipReason,
     SourceLocation,
+    SymbolInfo,
     SymbolKind,
 )
 from backend.file_scanner.models import (
@@ -1118,6 +1124,42 @@ def test_inventory_validation_rejects_unsorted_scanner_files():
     )
     with pytest.raises(InvalidChunkInventory):
         validate_inputs(scanner, parser)
+
+
+def test_inventory_validation_recursively_rejects_malformed_parser_values_before_io(
+    monkeypatch,
+):
+    location = SourceLocation(0, 1, 1, 0, 1, 1)
+    parameter = ParameterInfo("value", None, None)
+    binding = ImportBinding("item", None)
+    imported = ImportInfo("pkg", (binding,), False, ("type",), location)
+    symbol = SymbolInfo(
+        "f", SymbolKind.FUNCTION, "f", None, location, (parameter,), None, (), (), ()
+    )
+    call = CallSite("f", "g", CallKind.CALL, location)
+    issue = ParseIssue(ParseIssueKind.SYNTAX_ERROR, "bad", location)
+    base = replace(
+        _parsed(), symbols=(symbol,), imports=(imported,), calls=(call,), issues=(issue,)
+    )
+    malformed = (
+        replace(base, symbols=(replace(symbol, kind="function"),)),
+        replace(base, symbols=(replace(symbol, parameters=(replace(parameter, name=1),)),)),
+        replace(base, symbols=(replace(symbol, modifiers=(1,)),)),
+        replace(base, imports=(replace(imported, bindings=(replace(binding, alias=1),)),)),
+        replace(base, imports=(replace(imported, is_wildcard=1),)),
+        replace(base, calls=(replace(call, kind="call"),)),
+        replace(base, issues=(replace(issue, kind="syntax_error"),)),
+        replace(base, issues=(replace(issue, location=object()),)),
+    )
+
+    monkeypatch.setattr(
+        "backend.code_chunker.chunker.SafeSourceReader",
+        lambda root: pytest.fail("reader constructed before nested validation"),
+    )
+    for parsed_file in malformed:
+        scanner, parser = _inventories(parsed_files=(parsed_file,))
+        with pytest.raises(InvalidChunkInventory):
+            CodeChunker().chunk_inventory(scanner, parser)
 
 
 def test_chunk_enums_are_string_enums_with_stable_values():
