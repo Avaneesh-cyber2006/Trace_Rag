@@ -54,6 +54,7 @@ from backend.code_chunker.intervals import (
     select_candidates,
 )
 from backend.code_chunker.identity import make_chunk_id, make_content_hash
+from backend.code_chunker.fragmenter import fragment_candidate
 import json
 from backend.code_parser import CodeParser
 from backend.code_parser.models import ParseIssueKind
@@ -463,6 +464,50 @@ def test_equal_content_in_different_files_has_equal_hash_but_distinct_ids():
     assert make_chunk_id(_NAMESPACE, "a.py", ChunkKind.SYMBOL, owner, 0, len(source), 0) != make_chunk_id(
         _NAMESPACE, "b.py", ChunkKind.SYMBOL, owner, 0, len(source), 0
     )
+
+
+@pytest.mark.parametrize("size", (4_096, 8_192))
+def test_fragmenter_keeps_candidate_at_or_below_max(size):
+    source = b"a" * size
+    candidate = ChunkCandidate(ChunkKind.CONTEXT, 0, size, None)
+    assert fragment_candidate(candidate, source, ChunkerConfig()) == ((0, size),)
+
+
+def test_fragmenter_prefers_last_complete_line_before_target():
+    source = b"a" * 3000 + b"\n" + b"b" * 3000 + b"\n" + b"c" * 3000
+    candidate = ChunkCandidate(ChunkKind.CONTEXT, 0, len(source), None)
+    pieces = fragment_candidate(candidate, source, ChunkerConfig())
+    assert pieces[0] == (0, 3001)
+    assert b"".join(source[a:b] for a, b in pieces) == source
+
+
+def test_fragmenter_keeps_crlf_together_and_never_exceeds_max():
+    source = b"a" * 7 + b"\r\n" + b"b" * 7 + b"\r\n" + b"c" * 7
+    candidate = ChunkCandidate(ChunkKind.CONTEXT, 0, len(source), None)
+    pieces = fragment_candidate(candidate, source, ChunkerConfig(8, 10))
+    assert pieces[0] == (0, 9)
+    assert all(len(source[a:b]) <= 10 for a, b in pieces)
+    assert all(not (b < len(source) and source[b - 1:b + 1] == b"\r\n") for _, b in pieces)
+    assert b"".join(source[a:b] for a, b in pieces) == source
+
+
+def test_large_single_line_unicode_splits_only_at_utf8_boundaries():
+    source = ("नमस्ते" * 1000).encode("utf-8")
+    candidate = ChunkCandidate(ChunkKind.SYMBOL, 0, len(source), None)
+    pieces = fragment_candidate(candidate, source, ChunkerConfig(16, 31))
+    assert len(pieces) > 1
+    assert all(0 < end - start <= 31 for start, end in pieces)
+    assert all(source[start:end].decode("utf-8") for start, end in pieces)
+    assert b"".join(source[a:b] for a, b in pieces) == source
+
+
+def test_fragmenter_handles_bom_and_eof_without_newline_exactly():
+    source = b"\xef\xbb\xbf" + b"a" * 20
+    candidate = ChunkCandidate(ChunkKind.CONTEXT, 0, len(source), None)
+    pieces = fragment_candidate(candidate, source, ChunkerConfig(8, 10))
+    assert pieces[0][0] == 0
+    assert b"".join(source[a:b] for a, b in pieces) == source
+    assert pieces[-1][1] == len(source)
 
 
 def _scanned(
