@@ -728,6 +728,32 @@ def test_pipeline_language_fixtures_preserve_exact_nonoverlapping_coverage(
         byte_offset += len(encoded)
 
 
+def test_security_boundary_uses_shared_reader_without_direct_io_parser_or_network(
+    tmp_path: Path, monkeypatch
+):
+    scanner, parser = _pipeline(tmp_path, b"value = 1\n")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("forbidden Module 4 side effect")
+
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    monkeypatch.setattr(Path, "iterdir", forbidden)
+    monkeypatch.setattr(Path, "glob", forbidden)
+    monkeypatch.setattr(Path, "rglob", forbidden)
+    monkeypatch.setattr("subprocess.run", forbidden)
+    monkeypatch.setattr("subprocess.Popen", forbidden)
+    monkeypatch.setattr("socket.create_connection", forbidden)
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    monkeypatch.setattr("backend.code_parser.registry.Parser", forbidden)
+
+    result = CodeChunker().chunk_inventory(scanner, parser)
+
+    assert result.success_files == 1
+    assert result.files[0].chunks
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,

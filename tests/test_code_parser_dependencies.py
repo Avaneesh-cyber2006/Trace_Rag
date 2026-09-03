@@ -1,4 +1,6 @@
+import ast
 from importlib.metadata import version
+from pathlib import Path
 
 import pytest
 from tree_sitter import Language, Parser
@@ -39,3 +41,31 @@ def test_pinned_grammar_initializes_and_parses_minimal_fixture(
     tree = parser.parse(source)
     assert tree.root_node.type == root_type
     assert not tree.root_node.has_error
+
+
+def test_code_chunker_uses_only_standard_library_and_approved_backend_boundaries() -> None:
+    package = Path(__file__).parents[1] / "backend" / "code_chunker"
+    forbidden_roots = {
+        "tree_sitter", "requests", "urllib", "socket", "subprocess",
+        "git", "numpy", "pandas", "openai",
+    }
+    for path in sorted(package.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imports = [
+            alias.name.split(".", 1)[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        imports += [
+            (node.module or "").split(".", 1)[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level == 0
+        ]
+        assert forbidden_roots.isdisjoint(imports), (path, imports)
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"eval", "exec", "compile", "__import__"}
+            for node in ast.walk(tree)
+        ), path
