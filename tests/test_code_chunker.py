@@ -272,17 +272,26 @@ def test_partial_issue_lookup_does_not_scan_every_issue_for_every_parent(monkeyp
     import backend.code_chunker.intervals as interval_module
 
     calls = 0
+    indexed_queries = 0
     original = interval_module._ranges_intersect
+    original_query = interval_module._UnsafeRangeIndex.intersects
 
     def counted(*args):
         nonlocal calls
         calls += 1
         return original(*args)
 
+    def counted_query(self, *args):
+        nonlocal indexed_queries
+        indexed_queries += 1
+        return original_query(self, *args)
+
     monkeypatch.setattr(interval_module, "_ranges_intersect", counted)
+    monkeypatch.setattr(interval_module._UnsafeRangeIndex, "intersects", counted_query)
     candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
     assert candidates
     assert calls <= 400
+    assert indexed_queries == 200
 
 
 def _symbol(source: bytes, name: str, kind: SymbolKind, start: int, end: int,
@@ -753,6 +762,14 @@ def test_invalid_configuration_emits_fixed_error_log(caplog):
             ChunkerConfig(0, 1)
     assert "invalid configuration" in caplog.text.lower()
     assert "0" not in caplog.text
+
+
+def test_non_config_argument_emits_fixed_error_log(caplog):
+    with caplog.at_level("ERROR", logger="backend.code_chunker.chunker"):
+        with pytest.raises(ChunkerConfigurationError):
+            CodeChunker(object())
+    assert "invalid configuration" in caplog.text.lower()
+    assert "object" not in caplog.text.lower()
 
 
 def test_public_results_do_not_retain_reader_or_tree_structures(tmp_path: Path):

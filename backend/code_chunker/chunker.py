@@ -89,6 +89,7 @@ class CodeChunker:
         if not isinstance(self.config, ChunkerConfig):
             from .exceptions import ChunkerConfigurationError
 
+            logger.error("Code chunking failed: invalid configuration")
             raise ChunkerConfigurationError("Invalid chunker configuration.")
 
     def chunk_inventory(self, file_inventory, parse_inventory) -> CodeChunkInventory:

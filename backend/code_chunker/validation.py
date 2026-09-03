@@ -342,7 +342,3 @@ def validate_inputs(
         file_inventory.repository_namespace,
         tuple(pairs),
     )
-    ImportBinding,
-    ParameterInfo,
-    ParseIssueKind,
-    SourceLocation,
