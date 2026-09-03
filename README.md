@@ -186,3 +186,36 @@ Repository contents remain untrusted static data. Module 3 does not execute repo
 Processing is deliberately one file at a time. The result retains immutable structural metadata only: no complete source bytes or text and no Tree-sitter tree or node is retained after that file completes.
 
 Version 1 performs no cross-file resolution of imports, calls, symbols, base types, or implementations. It builds no dependency, inheritance, or call graph and defines no repository-global symbol IDs. Module 4 and later concerns are explicit non-goals: no chunking, no RAG, no embeddings, vector database, retrieval, graph construction, API, authentication, or frontend is implemented here.
+
+## Module 4 — Code Chunker
+
+The Code Chunker consumes the matching Module 2 `FileInventory` and Module 3 `CodeParseInventory`. Both inventories must have the same normalized repository path and the same nonempty opaque repository namespace. Successful and partial parsed files must also carry Module 3's exact original-byte `source_sha256` fingerprint.
+
+```python
+from backend.code_chunker import CodeChunker
+from backend.code_parser import CodeParser
+from backend.file_scanner import FileScanner
+
+inventory = FileScanner().scan(
+    repository.local_path,
+    repository_namespace=namespace,
+)
+parsed = CodeParser().parse_inventory(inventory)
+chunks = CodeChunker().chunk_inventory(inventory, parsed)
+```
+
+The equivalent convenience API is `chunk_code_inventory(inventory, parsed)`. The default target is 4,096 bytes and the hard maximum is 8,192 bytes. These are source-byte limits, not tokenizer limits.
+
+Module 4 re-reads each processable file only through the supported `backend.code_parser.reader.SafeSourceReader` boundary. It hashes `SourceBuffer.original_bytes` and refuses stale snapshots before trusting structural locations. Each retained chunk is one exact contiguous original-byte slice:
+
+```python
+chunk.content.encode("utf-8") == original_bytes[
+    chunk.location.start_byte:chunk.location.end_byte
+]
+```
+
+Callable and constant symbols are primary chunks. Leaf types may be whole chunks; parents with selected descendants contribute only non-overlapping residual context. Successful files retain remaining non-whitespace source as file context. Partial files never receive arbitrary whole-file fallback, and failed parsed files are not re-read and produce no chunks.
+
+`chunk_id` hashes versioned repository-namespaced structural provenance, so equivalent clones have stable identities while different repositories remain distinct. `content_hash` independently hashes the exact chunk bytes. Equal content hashes do not remove or merge provenance records. Fragment indices, locations, file order, chunk order, issues, and inventory counters are deterministic.
+
+Repository source remains untrusted static data. Module 4 never executes or imports repository code, constructs a second parser, reads around the hardened reader, runs Git/shell/package/build/test commands, accesses the network, evaluates syntax, or loads repository configuration or plugins. It does not implement tokenization, embeddings, indexing, retrieval, RAG, graph resolution, API/frontend behavior, or any Module 5+ concern.
