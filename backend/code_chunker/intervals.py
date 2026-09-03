@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_left
 
 from backend.code_parser.models import (
     ParsedFile,
@@ -31,6 +32,16 @@ class ChunkCandidate:
     start_byte: int
     end_byte: int
     owner: SymbolInfo | None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnsafeRangeIndex:
+    starts: tuple[int, ...]
+    prefix_max_ends: tuple[int, ...]
+
+    def intersects(self, start: int, end: int) -> bool:
+        count = bisect_left(self.starts, end)
+        return count > 0 and self.prefix_max_ends[count - 1] > start
 
 
 _MEANINGFUL_KINDS = frozenset(
@@ -114,6 +125,7 @@ def select_candidates(
         if issue.kind in (ParseIssueKind.SYNTAX_ERROR, ParseIssueKind.MISSING_NODE)
         and issue.location is not None
     )
+    unsafe_index = _build_unsafe_index(unsafe_locations)
 
     for interval in intervals:
         symbol = interval.symbol
@@ -130,14 +142,8 @@ def select_candidates(
             )
             continue
 
-        if parsed_file.status is ParseStatus.PARTIAL and any(
-            _ranges_intersect(
-                symbol.location.start_byte,
-                symbol.location.end_byte,
-                issue.start_byte,
-                issue.end_byte,
-            )
-            for issue in unsafe_locations
+        if parsed_file.status is ParseStatus.PARTIAL and unsafe_index.intersects(
+            symbol.location.start_byte, symbol.location.end_byte
         ):
             continue
 
@@ -166,6 +172,21 @@ def _ranges_intersect(start: int, end: int, other_start: int, other_end: int) ->
     if other_start == other_end:
         return start <= other_start < end
     return start < other_end and other_start < end
+
+
+def _build_unsafe_index(locations) -> _UnsafeRangeIndex:
+    ranges = sorted(
+        (location.start_byte, max(location.end_byte, location.start_byte + 1))
+        for location in locations
+    )
+    starts: list[int] = []
+    prefix_max_ends: list[int] = []
+    maximum = -1
+    for start, end in ranges:
+        starts.append(start)
+        maximum = max(maximum, end)
+        prefix_max_ends.append(maximum)
+    return _UnsafeRangeIndex(tuple(starts), tuple(prefix_max_ends))
 
 
 def _append_context(

@@ -247,6 +247,44 @@ def test_candidate_unicode_failure_is_sanitized_as_location_invalid(tmp_path: Pa
     assert result.files[0].issues[0].kind is ChunkIssueKind.LOCATION_INVALID
 
 
+def test_partial_issue_lookup_does_not_scan_every_issue_for_every_parent(monkeypatch):
+    source = b"x" * 5_000
+    starts = build_line_starts(source)
+    symbols = []
+    for index in range(200):
+        start = index * 10
+        parent = f"C{index}"
+        symbols.extend(
+            (
+                _symbol(source, parent, SymbolKind.CLASS, start, start + 9),
+                _symbol(source, "m", SymbolKind.METHOD, start + 2, start + 4, parent),
+            )
+        )
+    location = location_from_offsets(source, starts, 4_500, 4_501)
+    issues = tuple(
+        ParseIssue(ParseIssueKind.SYNTAX_ERROR, "bad", location) for _ in range(200)
+    )
+    parsed = replace(
+        _parsed(status=ParseStatus.PARTIAL, digest=sha256(source).hexdigest()),
+        symbols=tuple(symbols),
+        issues=issues,
+    )
+    import backend.code_chunker.intervals as interval_module
+
+    calls = 0
+    original = interval_module._ranges_intersect
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(interval_module, "_ranges_intersect", counted)
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+    assert candidates
+    assert calls <= 400
+
+
 def _symbol(source: bytes, name: str, kind: SymbolKind, start: int, end: int,
             parent: str | None = None) -> SymbolInfo:
     return SymbolInfo(
