@@ -355,6 +355,65 @@ def test_success_fallback_covers_all_remaining_non_whitespace_exactly():
     assert all(covered[i] for i, byte in enumerate(source) if chr(byte).isspace() is False)
 
 
+def test_partial_disables_file_fallback_but_keeps_trusted_symbol():
+    source = b"BROKEN prefix defgood suffix"
+    symbol = _symbol(source, "good", SymbolKind.FUNCTION, 14, 21)
+    issue = ParseIssue(
+        ParseIssueKind.SYNTAX_ERROR,
+        "Syntax error.",
+        location_from_offsets(source, build_line_starts(source), 0, 6),
+    )
+    parsed = replace(
+        _parsed(status=ParseStatus.PARTIAL, digest=sha256(source).hexdigest()),
+        symbols=(symbol,), issues=(issue,),
+    )
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    assert candidates == (ChunkCandidate(ChunkKind.SYMBOL, 14, 21, symbol),)
+
+
+def test_partial_excludes_issue_intersecting_parent_residual_but_keeps_descendant():
+    source = b"0123456789abcdefghij"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 20)
+    method = _symbol(source, "m", SymbolKind.METHOD, 5, 15, "Outer")
+    issue = ParseIssue(
+        ParseIssueKind.MISSING_NODE,
+        "Missing syntax.",
+        location_from_offsets(source, build_line_starts(source), 1, 2),
+    )
+    parsed = replace(
+        _parsed(status=ParseStatus.PARTIAL, digest=sha256(source).hexdigest()),
+        symbols=(outer, method), issues=(issue,),
+    )
+
+    candidates = select_candidates(parsed, source, build_symbol_intervals(parsed.symbols, len(source)))
+
+    assert candidates == (ChunkCandidate(ChunkKind.SYMBOL, 5, 15, method),)
+
+
+def test_partial_allows_issue_free_parent_residual_and_preserves_import_metadata(tmp_path: Path):
+    source = b"0123456789abcdefghijXXXXX"
+    outer = _symbol(source, "Outer", SymbolKind.CLASS, 0, 20)
+    method = _symbol(source, "m", SymbolKind.METHOD, 5, 15, "Outer")
+    issue = ParseIssue(
+        ParseIssueKind.SYNTAX_ERROR,
+        "Syntax error.",
+        location_from_offsets(source, build_line_starts(source), 21, 22),
+    )
+    imported = ImportInfo(
+        "pkg", (), False, (),
+        location_from_offsets(source, build_line_starts(source), 21, 25),
+    )
+    parsed_file = replace(
+        _parsed(status=ParseStatus.PARTIAL, digest=sha256(source).hexdigest()),
+        symbols=(outer, method), issues=(issue,), imports=(imported,),
+    )
+    candidates = select_candidates(parsed_file, source, build_symbol_intervals(parsed_file.symbols, len(source)))
+    assert [(item.start_byte, item.end_byte) for item in candidates] == [(0, 5), (5, 15), (15, 20)]
+    assert all(item.end_byte <= 20 for item in candidates)
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from backend.code_parser.models import ParsedFile, ParseStatus, SymbolInfo, SymbolKind
+from backend.code_parser.models import (
+    ParsedFile,
+    ParseIssueKind,
+    ParseStatus,
+    SymbolInfo,
+    SymbolKind,
+)
 
 from .models import ChunkKind
 
@@ -102,6 +108,12 @@ def select_candidates(
 ) -> tuple[ChunkCandidate, ...]:
     """Build a non-overlapping structural partition and successful fallback."""
     candidates: list[ChunkCandidate] = []
+    unsafe_locations = tuple(
+        issue.location
+        for issue in parsed_file.issues
+        if issue.kind in (ParseIssueKind.SYNTAX_ERROR, ParseIssueKind.MISSING_NODE)
+        and issue.location is not None
+    )
 
     for interval in intervals:
         symbol = interval.symbol
@@ -116,6 +128,17 @@ def select_candidates(
                     symbol,
                 )
             )
+            continue
+
+        if parsed_file.status is ParseStatus.PARTIAL and any(
+            _ranges_intersect(
+                symbol.location.start_byte,
+                symbol.location.end_byte,
+                issue.start_byte,
+                issue.end_byte,
+            )
+            for issue in unsafe_locations
+        ):
             continue
 
         cursor = symbol.location.start_byte
@@ -137,6 +160,12 @@ def select_candidates(
         _append_context(candidates, source, cursor, len(source), None)
 
     return tuple(sorted(candidates, key=lambda item: (item.start_byte, item.end_byte)))
+
+
+def _ranges_intersect(start: int, end: int, other_start: int, other_end: int) -> bool:
+    if other_start == other_end:
+        return start <= other_start < end
+    return start < other_end and other_start < end
 
 
 def _append_context(
