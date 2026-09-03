@@ -41,7 +41,14 @@ def _is_optional_nonempty_string(value: object) -> bool:
 
 
 def _is_posix_relative_path(value: object) -> bool:
-    if not isinstance(value, str) or not value or "\\" in value or value.startswith("/"):
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or (len(value) >= 2 and value[0].isalpha() and value[1] == ":")
+    ):
         return False
     parts = value.split("/")
     return all(part and part not in {".", ".."} for part in parts)
@@ -51,12 +58,12 @@ def validate_and_flatten_inventory(
     inventory: CodeChunkInventory,
 ) -> tuple[str, tuple[ChunkInput, ...]]:
     """Validate Module 5's consumed contracts and attach file context to chunks."""
-    if not isinstance(inventory, CodeChunkInventory):
+    if type(inventory) is not CodeChunkInventory:
         _invalid()
 
     if not isinstance(inventory.repository_namespace, str) or not inventory.repository_namespace:
         _invalid()
-    if not isinstance(inventory.files, tuple):
+    if type(inventory.files) is not tuple:
         _invalid()
     counters = (
         inventory.total_files_requested,
@@ -76,19 +83,20 @@ def validate_and_flatten_inventory(
     partial_files = 0
     failed_files = 0
     total_chunks = 0
-    previous_path: str | None = None
+    previous_path_key: tuple[str, str] | None = None
 
     for file in inventory.files:
-        if not isinstance(file, ChunkedFile):
+        if type(file) is not ChunkedFile:
             _invalid()
         if not _is_posix_relative_path(file.relative_path):
             _invalid()
-        if previous_path is not None and file.relative_path <= previous_path:
+        path_key = (file.relative_path.casefold(), file.relative_path)
+        if previous_path_key is not None and path_key <= previous_path_key:
             _invalid()
-        previous_path = file.relative_path
-        if not isinstance(file.language, ParsedLanguage):
+        previous_path_key = path_key
+        if type(file.language) is not ParsedLanguage:
             _invalid()
-        if not isinstance(file.status, ChunkFileStatus) or not isinstance(file.chunks, tuple):
+        if type(file.status) is not ChunkFileStatus or type(file.chunks) is not tuple:
             _invalid()
 
         if file.status is ChunkFileStatus.SUCCESS:
@@ -97,23 +105,25 @@ def validate_and_flatten_inventory(
             partial_files += 1
         elif file.status is ChunkFileStatus.FAILED:
             failed_files += 1
+            if file.chunks:
+                _invalid()
         else:
             _invalid()
 
         previous_chunk_key: tuple[int, int, str, str, str, int, str] | None = None
         for chunk in file.chunks:
-            if not isinstance(chunk, CodeChunk):
+            if type(chunk) is not CodeChunk:
                 _invalid()
             if (
                 not _is_lowercase_sha256(chunk.chunk_id)
                 or not _is_lowercase_sha256(chunk.content_hash)
-                or not isinstance(chunk.kind, ChunkKind)
-                or not isinstance(chunk.location, SourceLocation)
+                or type(chunk.kind) is not ChunkKind
+                or type(chunk.location) is not SourceLocation
                 or not isinstance(chunk.content, str)
                 or not chunk.content
                 or not (
                     chunk.symbol_kind is None
-                    or isinstance(chunk.symbol_kind, SymbolKind)
+                    or type(chunk.symbol_kind) is SymbolKind
                 )
                 or not _is_optional_nonempty_string(chunk.qualified_name)
                 or not _is_optional_nonempty_string(chunk.parent_qualified_name)

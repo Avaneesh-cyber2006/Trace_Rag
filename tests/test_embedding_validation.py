@@ -27,6 +27,26 @@ from backend.embedding_vector_store.validation import (
 _NAMESPACE = "tracerag-repository-v1:github:example/repo"
 
 
+class _InventorySubclass(CodeChunkInventory):
+    pass
+
+
+class _ChunkedFileSubclass(ChunkedFile):
+    pass
+
+
+class _CodeChunkSubclass(CodeChunk):
+    pass
+
+
+class _SourceLocationSubclass(SourceLocation):
+    pass
+
+
+class _TupleSubclass(tuple):
+    pass
+
+
 def _chunk(
     *,
     chunk_id: str = "a" * 64,
@@ -76,6 +96,28 @@ def _file(
         (),
         chunks,
         (),
+    )
+
+
+def _chunk_subclass() -> CodeChunk:
+    chunk = _chunk()
+    return _CodeChunkSubclass(
+        chunk.chunk_id,
+        chunk.kind,
+        chunk.location,
+        chunk.content,
+        chunk.content_hash,
+        chunk.symbol_kind,
+        chunk.symbol_name,
+        chunk.qualified_name,
+        chunk.parent_qualified_name,
+        chunk.parameters,
+        chunk.return_type,
+        chunk.modifiers,
+        chunk.base_types,
+        chunk.implemented_types,
+        chunk.fragment_index,
+        chunk.fragment_count,
     )
 
 
@@ -182,7 +224,10 @@ def test_inventory_rejects_malformed_chunk_identity_names_or_content(
         validate_and_flatten_inventory(inventory)
 
 
-@pytest.mark.parametrize("relative_path", ("", "/absolute.py", "src\\app.py", "../app.py", "src/../app.py"))
+@pytest.mark.parametrize(
+    "relative_path",
+    ("", "/absolute.py", "src\\app.py", "../app.py", "src/../app.py", "bad\x00.py", "C:escape.py"),
+)
 def test_inventory_rejects_non_posix_relative_paths(relative_path: str) -> None:
     with pytest.raises(InvalidCodeChunkInventory):
         validate_and_flatten_inventory(_inventory((_file(relative_path),)))
@@ -219,6 +264,44 @@ def test_inventory_rejects_files_and_chunks_out_of_module_four_order() -> None:
         validate_and_flatten_inventory(unsorted_files)
     with pytest.raises(InvalidCodeChunkInventory):
         validate_and_flatten_inventory(unsorted_chunks)
+
+
+def test_inventory_accepts_module_four_casefold_file_order() -> None:
+    inventory = _inventory((_file("a.py"), _file("B.py")))
+
+    assert validate_and_flatten_inventory(inventory) == (_NAMESPACE, ())
+
+
+def test_inventory_rejects_chunks_attached_to_failed_file() -> None:
+    inventory = _inventory(
+        (_file(status=ChunkFileStatus.FAILED, chunks=(_chunk(),)),)
+    )
+
+    with pytest.raises(InvalidCodeChunkInventory):
+        validate_and_flatten_inventory(inventory)
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    (
+        _InventorySubclass(".", _NAMESPACE, 0, 0, 0, 0, 0, ()),
+        replace(_inventory(), files=_TupleSubclass(())),
+        _inventory((_ChunkedFileSubclass("a.py", ParsedLanguage.PYTHON, ParseStatus.SUCCESS, ChunkFileStatus.SUCCESS, "c" * 64, (), (), ()),)),
+        _inventory((_file(chunks=(_chunk_subclass(),)),)),
+    ),
+)
+def test_inventory_rejects_subclasses_of_module_four_models_and_tuples(
+    inventory: CodeChunkInventory,
+) -> None:
+    with pytest.raises(InvalidCodeChunkInventory):
+        validate_and_flatten_inventory(inventory)
+
+
+def test_inventory_rejects_source_location_subclass() -> None:
+    chunk = replace(_chunk(), location=_SourceLocationSubclass(0, 6, 1, 0, 1, 6))
+
+    with pytest.raises(InvalidCodeChunkInventory):
+        validate_and_flatten_inventory(_inventory((_file(chunks=(chunk,)),)))
 
 
 def test_inventory_flattens_empty_inventory_to_immutable_values() -> None:
