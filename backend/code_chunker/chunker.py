@@ -123,12 +123,14 @@ class CodeChunker:
                 outcome = _failed_file(parsed, ChunkIssueKind.SOURCE_CHANGED)
                 files.append(outcome)
                 _log_file(outcome)
+                del source
                 continue
             line_starts = build_line_starts(source.original_bytes)
             if not validate_parsed_locations(parsed, source.original_bytes, line_starts):
                 outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
                 files.append(outcome)
                 _log_file(outcome)
+                del source
                 continue
 
             try:
@@ -140,6 +142,7 @@ class CodeChunker:
                 outcome = _failed_file(parsed, ChunkIssueKind.LOCATION_INVALID)
                 files.append(outcome)
                 _log_file(outcome)
+                del source
                 continue
 
             try:
@@ -155,6 +158,7 @@ class CodeChunker:
                 outcome = _failed_file(parsed, ChunkIssueKind.FRAGMENTATION_ERROR)
                 files.append(outcome)
                 _log_file(outcome)
+                del source
                 continue
 
             status = (
@@ -174,6 +178,7 @@ class CodeChunker:
                 )
             files.append(outcome)
             _log_file(outcome)
+            del source
 
         result_files = tuple(files)
         result = CodeChunkInventory(

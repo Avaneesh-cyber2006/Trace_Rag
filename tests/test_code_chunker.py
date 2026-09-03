@@ -754,6 +754,67 @@ def test_security_boundary_uses_shared_reader_without_direct_io_parser_or_networ
     assert result.files[0].chunks
 
 
+def test_deep_interval_scaling_is_iterative_beyond_recursion_limit():
+    depth = 1_200
+    source = b"x" * (depth * 2 + 1)
+    starts = build_line_starts(source)
+    symbols = []
+    for index in range(depth):
+        name = f"S{index}"
+        parent = None if index == 0 else f"S{index - 1}"
+        symbols.append(
+            SymbolInfo(
+                name, SymbolKind.CLASS if index < depth - 1 else SymbolKind.METHOD,
+                name, parent,
+                location_from_offsets(source, starts, index, len(source) - index),
+                (), None, (), (), (),
+            )
+        )
+    parsed = replace(_parsed(digest=sha256(source).hexdigest()), symbols=tuple(symbols))
+    intervals = build_symbol_intervals(parsed.symbols, len(source))
+    candidates = select_candidates(parsed, source, intervals)
+    assert len(intervals) == depth
+    assert len(candidates) <= depth * 2 + 1
+    _assert_non_overlapping(candidates)
+
+
+def test_one_file_at_a_time_releases_previous_full_source_buffer(tmp_path: Path, monkeypatch):
+    (tmp_path / "a.py").write_bytes(b"A = 1\n")
+    (tmp_path / "b.py").write_bytes(b"B = 2\n")
+    scanner = FileScanner().scan(tmp_path, repository_namespace=_NAMESPACE)
+    parser = CodeParser().parse_inventory(scanner)
+    bytes_by_path = {
+        file.relative_path: (tmp_path / file.relative_path).read_bytes()
+        for file in scanner.files
+    }
+
+    class TrackedBuffer:
+        active = 0
+
+        def __init__(self, data):
+            type(self).active += 1
+            self.original_bytes = data
+
+        def __del__(self):
+            type(self).active -= 1
+
+    class TrackingReader:
+        calls = 0
+
+        def __init__(self, root):
+            self.root = root
+
+        def read(self, scanned):
+            assert TrackedBuffer.active == 0
+            type(self).calls += 1
+            return TrackedBuffer(bytes_by_path[scanned.relative_path])
+
+    monkeypatch.setattr("backend.code_chunker.chunker.SafeSourceReader", TrackingReader)
+    result = CodeChunker().chunk_inventory(scanner, parser)
+    assert TrackingReader.calls == 2
+    assert result.success_files == 2
+
+
 def _scanned(
     relative_path: str = "src/app.py",
     *,
