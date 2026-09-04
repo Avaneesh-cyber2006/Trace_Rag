@@ -4,7 +4,7 @@
 
 **PASS — REVISED VECTOR REPRESENTATION**
 
-Verified on 2026-09-03 and revised on 2026-09-04 after Task 10 executable review. The dependency capability remains a pass under the clarified vector-representation contract below. Production work after Task 10 is contingent on implementation review proving that Task 10 removes the unapproved vector mirror, performs checked binary32 projection, and treats Chroma's embedding field as the sole persisted vector authority. This artifact does not itself authorize the current Task 10 implementation or implement production code.
+Verified on 2026-09-03 and revised on 2026-09-04 after Task 10 executable review. The dependency capability remains a pass under the clarified vector-representation contract below. Task 10 implementation and independent re-review subsequently proved that the unapproved vector mirror is absent, binary32 projection is checked before mutation, and Chroma's embedding field is the sole persisted vector authority. Tasks after Task 10 may proceed under this revised gate.
 
 ## Environment and Dependency Pins
 
@@ -189,7 +189,7 @@ Task 10 representation probe:
 & 'C:\Users\avane\AppData\Local\Temp\tracerag-module5-gate-20260903-01\Scripts\python.exe' .superpowers/sdd/2026-09-03-embedding-vector-store/task-10-f32-probe.py
 ```
 
-The probe used ChromaDB 1.5.9, inserted already projected synthetic values, and delegated reopen/read/query to a new Python process. The five cases and observed values are recorded in “Revised authoritative vector representation” above. The original capability suite's `1e-6` distance tolerance covers the maximum observed self-distance boundary error. The revised `PASS` remains contingent on converting this evidence into Task 10 production and regression behavior, followed by implementation review, before Task 11 begins.
+The probe used ChromaDB 1.5.9, inserted already projected synthetic values, and delegated reopen/read/query to a new Python process. The five cases and observed values are recorded in “Revised authoritative vector representation” above. The original capability suite's `1e-6` distance tolerance covers the maximum observed self-distance boundary error. Task 10 converted this evidence into tracked production and regression behavior; its independent scoped re-review reported no Critical or Important findings.
 
 ## Official Sources Consulted
 
