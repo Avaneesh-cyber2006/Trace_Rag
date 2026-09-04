@@ -303,7 +303,7 @@ A content hash change re-embeds that chunk. A document-version or embedding-iden
 
 ## 13. Embedding Validation
 
-Provider responses are untrusted external data. Before any store call, validation requires:
+Provider responses are untrusted external data. Before any store call, provider-boundary validation requires:
 
 - batch result count exactly equals requested document count;
 - each result is present and is an `EmbeddingVector` or validated adapter value;
@@ -313,6 +313,8 @@ Provider responses are untrusted external data. Before any store call, validatio
 - every value is finite, excluding NaN and positive/negative infinity.
 
 The same validation applies to query vectors. Validation occurs for the complete batch before any record from that batch is accepted into candidate construction. Malformed data raises `EmbeddingInvalidResponseError`, aborts the candidate, and leaves the active index authoritative.
+
+For a Chroma write, the adapter then performs a checked component-wise IEEE-754 binary32 projection of the already validated provider vector. A finite provider value whose binary32 projection is non-finite is rejected before mutation. The adapter does not clip or normalize vector values. ChromaDB 1.5.9 may return a component a few binary32 ULPs from even the submitted projection, so equality with the original Python-float tuple, or with a locally projected tuple, is not a persistence invariant. This derived numeric representation is distinct from exact source/content preservation.
 
 ## 14. VectorStore Contract
 
@@ -352,6 +354,7 @@ The contract specifies complete logical generation semantics, not physical copyi
 - physical collection names and private generation identifiers;
 - original namespace retention and exact validation in control and record metadata;
 - external-vector insertion with no Chroma embedding function;
+- checked binary32 projection before external-vector insertion;
 - storage metadata encoding/decoding;
 - candidate construction, validation, atomic publication, and retirement;
 - mapping the configured Chroma metric's distance to the public score; and
@@ -388,9 +391,11 @@ Every published generation records and validates repository namespace, embedding
 - full non-secret embedding identity; and
 - storage schema version.
 
-The Chroma document is exact `CodeChunk.content`; the embedding is the externally generated validated vector. The synthetic embedding text is not persisted as source evidence. Optional values use an adapter-defined reversible representation because Chroma metadata capabilities must be verified; decoding must reproduce `None` without ambiguity.
+The Chroma document is exact `CodeChunk.content`; this source/evidence field remains byte-exact. The Chroma embedding field is the sole persisted vector authority: it receives the checked binary32 projection of the validated provider vector, and manifest reads return the finite dimension-valid values that Chroma persisted. Exact Python-float equality with provider output is not promised. The synthetic embedding text is not persisted as source evidence. Optional values use an adapter-defined reversible representation because Chroma metadata capabilities must be verified; decoding must reproduce `None` without ambiguity.
 
-There is no SQLite/JSON or other second per-chunk manifest. The vector records are the manifest. Small durable storage-control data used solely to locate the explicitly active generation is allowed.
+There is no SQLite/JSON or other second per-chunk manifest and no vector mirror in Chroma metadata, a sidecar file, or control data. The Chroma vector records are the manifest. Small durable storage-control data used solely to locate the explicitly active generation is allowed.
+
+This binary32 representation is a pre-release clarification of `tracerag-chroma-schema-v1`, not a migration or new embedding space. `gemini-embedding-001-retrieval-3072-v1` continues to identify provider/model/task/dimension semantics; the store-owned numeric representation is versioned only by `tracerag-chroma-schema-v1`.
 
 Incompatible schema is not silently guessed or migrated. Corrupt or incompatible storage raises a typed error before reuse or search.
 
@@ -529,7 +534,7 @@ sort by public deterministic ordering -> immutable results
 
 The public score is finite, lies in `[0.0, 1.0]`, and increases with similarity. It is not a probability. Raw Chroma distance and metric-specific details do not escape the adapter.
 
-`ChromaVectorStore` configures one explicit metric and owns the verified transformation from that metric's returned distance to the public score. The exact metric and formula are a prerequisite-gate output documented against and tested with the exact Chroma pin. Values are validated, not silently clipped, unless the verified mathematical contract explicitly requires a documented floating-point boundary tolerance. No universal `min_score` exists in V1.
+`ChromaVectorStore` configures one explicit metric and owns the verified transformation from that metric's returned distance to the public score. The exact metric and formula are a prerequisite-gate output documented against and tested with the exact Chroma pin. Search operates on Chroma's persisted vector representation, not an original-vector mirror. For ChromaDB 1.5.9 cosine distance, the formula remains `score = 1 - (distance / 2)`. Finite distance error within the gate-proven absolute `1e-6` tolerance of `0` or `2` is treated as that boundary before applying the formula; values farther outside `[0, 2]` are corruption. This boundary rule is not permission to clip arbitrary distances. No universal `min_score` exists in V1.
 
 For every successful search:
 
@@ -560,7 +565,7 @@ The following fail closed before reuse or results are accepted:
 - duplicate or malformed chunk IDs/content hashes;
 - missing or malformed required metadata;
 - invalid source-document values;
-- vector absence, malformed values, or incompatible dimensions;
+- vector absence, malformed/non-finite values, incompatible dimensions, or a non-finite binary32 projection on write;
 - incompatible embedding identity; and
 - invalid, duplicate, out-of-scope, excessive, or non-finite search results.
 
@@ -574,7 +579,7 @@ Gemini credentials are injected from outside Module 5 through application config
 
 Missing credentials/configuration fail before indexing or query embedding. Repository path and content are untrusted data, never configuration. The persistence root is also external trusted configuration and must not resolve inside the analyzed repository unless a caller explicitly supplies that location after an application-level policy decision; Module 5 provides no such default.
 
-Normal logs may include provider name, non-secret model identity, operation, document count, retry attempt, and sanitized outcome. They omit API keys, authorization headers, source chunks, embedding documents, full vectors, raw provider bodies, raw Chroma responses, and repository-controlled exception text. Typed exception messages are fixed/sanitized and do not automatically chain a secret-bearing raw response into public display.
+Normal logs may include provider name, non-secret model identity, operation, document count, retry attempt, and sanitized outcome. They omit API keys, authorization headers, source chunks, embedding documents, full vectors, raw provider bodies, raw Chroma responses, and repository-controlled exception text. Typed exception messages are fixed/sanitized and do not automatically chain a secret-bearing raw response into public display. Vector values occur only in Chroma's designated embedding field; they are not duplicated into record metadata, the active-pointer file, logs, exceptions, or another manifest.
 
 ## 26. Error Taxonomy
 
@@ -651,11 +656,12 @@ Unit and contract tests cover:
 - no-op synchronization with a fail-if-called provider and zero mutating store calls;
 - first and repeated empty indexes and nonempty-to-empty synchronization;
 - retry eligibility, delay sequence, exhaustion, and permanent no-retry failures;
-- missing/empty/wrong-dimension/non-numeric/bool/NaN/infinite vectors and cardinality mismatch;
+- missing/empty/wrong-dimension/non-numeric/bool/NaN/infinite vectors, finite values that overflow binary32 projection, and cardinality mismatch;
 - credential absence and non-leakage through identity, metadata, logs, exceptions, and repr;
 - repository isolation, exact namespace deletion, and collision/mismatch rejection;
 - never-indexed versus active-empty search, request bounds, identity mismatch, and query validation;
-- score validation, exact content, uniqueness, count bounds, and deterministic tie ordering;
+- checked binary32 write projection and fresh-process manifest reads for exactly representable, ordinary non-unit, small-magnitude, negative, and representative normalized-like vectors, without requiring exact equality to provider Python floats or storing a vector mirror;
+- score validation over Chroma's persisted representation, including the proven `1e-6` distance-boundary tolerance, exact content, uniqueness, count bounds, and deterministic tie ordering;
 - candidate abort on embedding/write/validation failure and preservation of the old active index;
 - publication failure and indeterminate-outcome resolution;
 - cleanup failure after successful publication;
@@ -664,7 +670,7 @@ Unit and contract tests cover:
 - same-namespace synchronization guard and concurrent search snapshot stability; and
 - scaling call counts and bounded intermediates.
 
-Chroma integration tests use isolated temporary persistence directories and never a real user index. They prove external embeddings with no Chroma embedding function, persistence/restart, active/candidate lifecycle, repository isolation, valid empty publication, exact evidence round-trip, metric/score normalization, failure preservation, and cleanup independence.
+Chroma integration tests use isolated temporary persistence directories and never a real user index. They prove external embeddings with no Chroma embedding function, checked binary32 projection, persistence/restart, active/candidate lifecycle, repository isolation, valid empty publication, exact source/evidence round-trip, store-authoritative vector readback, metric/score normalization with boundary tolerance, failure preservation, and cleanup independence.
 
 An optional real Gemini test is explicitly opt-in, uses externally supplied credentials, performs the minimum request, and is excluded from the ordinary suite. It never logs content, vectors, responses, or secrets.
 
@@ -701,7 +707,7 @@ The eventual Module 5 implementation is acceptable only when all of the followin
 
 1. Public core contracts contain no Gemini, Chroma, collection, or generation concepts.
 2. Embedding document V1 is byte-deterministic and preserves the exact source suffix.
-3. Every document/query vector and batch cardinality is validated before use.
+3. Every document/query vector and batch cardinality is validated before use; Chroma writes additionally use checked finite binary32 projection without clipping or normalization.
 4. Compatible unchanged chunks are reused; new and updated chunks alone are embedded.
 5. A true no-op performs no provider call, write, candidate creation, or publication.
 6. Identity or document-version incompatibility causes complete repository re-embedding.
@@ -709,12 +715,12 @@ The eventual Module 5 implementation is acceptable only when all of the followin
 8. Any failure before the proven publication commit point leaves the prior index authoritative and searchable.
 9. Cleanup failure after publication does not invalidate the new active index.
 10. Search binds one active snapshot, enforces embedding compatibility, and is mutation-free.
-11. Results contain exact source evidence, valid normalized scores, unique in-scope chunks, and deterministic order.
+11. Results contain exact source evidence, valid normalized scores derived from search over Chroma's persisted vector representation, unique in-scope chunks, and deterministic order.
 12. Storage corruption and incompatibility fail closed without repair or guessing.
-13. Credentials and source/vector payloads do not leak through persistence, identities, logs, repr, or exceptions.
+13. Credentials do not leak; exact source and derived vectors persist only in their designated Chroma document and embedding fields, with no metadata/file vector mirror or exposure through identities, logs, repr, or exceptions.
 14. Repository namespaces are isolated logically and validated in complete stored metadata.
 15. Resource bounds are proven structurally and no oversized document is truncated.
-16. The exact Gemini/Chroma dependency set passes the prerequisite capability gate.
+16. The exact Gemini/Chroma dependency set passes the prerequisite capability gate, including the revised binary32 vector-representation cases and floating-distance tolerance.
 17. Modules 1–4 and the complete test suite remain green with no production-behavior changes.
 
 ## 35. Explicit Deferred Work for Modules 6–10
@@ -735,6 +741,7 @@ Resolved architecture decisions are:
 - exact-equality embedding-space compatibility;
 - `tracerag-embedding-document-v1` with six fixed metadata fields and exact source suffix;
 - vector records as the only per-chunk synchronization manifest;
+- Chroma's embedding field as the sole vector authority, with checked binary32 write projection and store-authoritative readback;
 - one logical index per exact repository namespace;
 - complete logical candidates and one explicit atomic publication point;
 - private generation details and explicit active-pointer authority;
@@ -742,4 +749,4 @@ Resolved architecture decisions are:
 - bounded typed retries and no partial-success state; and
 - public score normalization inside the storage adapter.
 
-The intentionally unresolved implementation prerequisites are factual capability choices, not design ambiguity: exact Gemini SDK/model/configuration/dimension/pins and limits; exact Chroma pin; supported metadata representation; persistence/publication mechanism; configured metric and verified score formula; and exact supported single-writer deployment mechanics. The later prerequisite gate must resolve these from official documentation and executable prototypes before the implementation plan authorizes production work.
+The dependency gate resolves the exact Gemini SDK/model/configuration/dimension/pins and limits; exact Chroma pin; binary32 vector representation; supported metadata representation; persistence/publication mechanism; configured metric and verified score formula/tolerance; and supported single-writer deployment mechanics. The revised vector-representation gate remains contingent on Task 10 implementation review proving the documented projection, single vector authority, and fresh-process behavior before later production tasks resume.

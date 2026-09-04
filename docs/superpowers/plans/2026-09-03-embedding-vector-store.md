@@ -14,6 +14,7 @@
 
 - Execution begins by invoking `superpowers:using-git-worktrees` and creating an isolated `codex/module-5-embedding-vector-store` feature branch/worktree; never implement directly on primary `main`.
 - Task 1 is a hard dependency and capability gate. Tasks 2–30 may execute only after its committed result is `PASS`; `BLOCKED` stops Module 5 implementation.
+- The revised Task 10 vector-representation gate is `PASS — REVISED VECTOR REPRESENTATION`, contingent on implementation review. Task 11 and later must not begin until Task 10 removes the vector mirror and proves the checked projection, store-authoritative readback, and fresh-process cases below.
 - Do not select a Gemini SDK, model, dimension, task mode, limit, exception mapping, Chroma version, metadata encoding, metric, score formula, or publication mechanism from memory. Consume the facts committed by Task 1.
 - Only `backend/embedding_vector_store/providers/gemini.py` may import the Gemini SDK. Only `backend/embedding_vector_store/stores/chroma.py` may import ChromaDB or manipulate physical collection names, private generation identifiers, raw distances, and Chroma metadata APIs.
 - Core public interfaces remain provider-independent. No public model contains a generation ID, collection name, API key, retry state, raw distance, or raw provider response.
@@ -21,6 +22,7 @@
 - Module 4 `CodeChunkInventory` is immutable source authority. Never reread, rescan, normalize, truncate, execute, or import analyzed repository content.
 - The persistence root is mandatory external configuration and has no repository-local default.
 - Provider responses and stored records are untrusted. Validate before storage, reuse, or return.
+- After provider validation, Chroma writes use checked component-wise IEEE-754 binary32 projection and fail closed if a finite provider value projects non-finite. Do not clip or normalize vectors. Chroma's embedding field is the sole persisted vector authority; do not mirror vectors in metadata, files, or control data, and do not require exact Python-float equality on readback.
 - There is no `PARTIAL_SUCCESS`. Any pre-publication failure preserves the previous active index and raises a typed exception.
 - Search is read-only, uses one active snapshot, and returns exact stored `CodeChunk.content`.
 - Ordinary tests perform no real Gemini network request. The optional live test is explicitly selected and externally credentialed.
@@ -392,7 +394,7 @@ python -m pytest tests/test_embedding_providers.py tests/test_embedding_validati
 
 - [ ] **Step 3: Implement provider-independent boundary**
 
-Use `Protocol` and tuple signatures from the canonical interface. Validate with exact length and `math.isfinite`; reject `bool` explicitly. Raise only `EmbeddingInvalidResponseError` with fixed messages and return the original ordered tuple when valid.
+Use `Protocol` and tuple signatures from the canonical interface. Validate with exact length and `math.isfinite`; reject `bool` explicitly. Raise only `EmbeddingInvalidResponseError` with fixed messages and return the original ordered tuple when valid. This is provider-boundary validation; Task 10 separately owns checked store-representation projection.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -500,7 +502,7 @@ git commit -m "feat: integrate gemini embeddings"
 
 - [ ] **Step 1: Write RED interface tests**
 
-Assert every canonical method name/signature exists. Model `RepositoryIndexState` as `indexed: bool` plus `snapshot: RepositoryIndexSnapshot | None`; require exactly one consistent state. Internal snapshot/candidate handles may wrap opaque adapter tokens but expose only namespace, identity, document version, schema version, and expected count to core. `StoredRecord` carries all vector-record evidence plus embedding and versions. `StoreSearchResult` adds repository namespace and normalized score. Assert none are re-exported at package top level.
+Assert every canonical method name/signature exists. Model `RepositoryIndexState` as `indexed: bool` plus `snapshot: RepositoryIndexSnapshot | None`; require exactly one consistent state. Internal snapshot/candidate handles may wrap opaque adapter tokens but expose only namespace, identity, document version, schema version, and expected count to core. `StoredRecord` carries all vector-record evidence plus the finite dimension-valid embedding values read from the store and versions; it does not promise equality to the provider's original Python-float tuple. `StoreSearchResult` adds repository namespace and normalized score. Assert none are re-exported at package top level.
 
 - [ ] **Step 2: Verify RED**
 
@@ -542,7 +544,7 @@ git commit -m "feat: define vector store lifecycle"
 
 - [ ] **Step 1: Write RED schema/isolation tests**
 
-Assert persistence root is mandatory, resolved, external, and never inferred from inventory. Use two nearly identical namespaces and a forced derived-ID collision to prove full namespace validation. Round-trip every required record/control field, optional `None` values using Task 1 encoding, Unicode paths/names, exact content, identity, document/schema version, expected count, and validated dimensions. Reject unknown schema, malformed metadata, namespace mismatch, and unsupported values.
+Assert persistence root is mandatory, resolved, external, and never inferred from inventory. Use two nearly identical namespaces and a forced derived-ID collision to prove full namespace validation. Round-trip every required record/control field, optional `None` values using Task 1 encoding, Unicode paths/names, exact content, identity, document/schema version, expected count, and validated dimensions. Assert record/control metadata contains no serialized vector or vector-mirror field. Reject unknown schema, malformed metadata, namespace mismatch, and unsupported values.
 
 - [ ] **Step 2: Verify RED**
 
@@ -581,7 +583,7 @@ git commit -m "feat: encode chroma repository metadata"
 
 - [ ] **Step 1: Write RED temporary-directory integration tests**
 
-Create a candidate, add two explicit known vectors/documents, close/recreate the store, and assert exact embeddings, exact source content, and complete metadata return. Install a fail-if-called Chroma embedding function sentinel and prove it is never invoked. Assert wrong dimensions, duplicate chunk IDs, count mismatch, and malformed records fail closed.
+Create a candidate containing exactly float32-representable, ordinary non-unit, negative, small-magnitude, and representative normalized-like vectors plus distinctive Unicode/CRLF source documents. Validate every provider vector first, then close the first client and read the candidate from a fresh process/store instance. Assert source content and synchronization metadata return exactly. Assert returned embeddings are finite, dimension-valid, component-wise float32 values read from Chroma and are stable across reopen; require exact original equality only for cases proven exactly representable. Explicitly prove that ordinary Python floats need not equal the returned values and that some Chroma-returned components may differ by a few float32 ULPs from the submitted projection. Install a fail-if-called Chroma embedding function sentinel and prove it is never invoked. Assert wrong dimensions, duplicate chunk IDs, count mismatch, malformed records, NaN/infinity, and a finite Python float whose float32 projection is non-finite all fail closed before mutation. Assert no metadata or sidecar/control file mirrors vector values.
 
 - [ ] **Step 2: Verify RED**
 
@@ -591,12 +593,12 @@ python -m pytest tests/test_chroma_vector_store.py -q -k "external_vector or reo
 
 - [ ] **Step 3: Implement basic persistent record operations**
 
-Use only the Task 1 verified external-embedding APIs and explicitly disable/omit Chroma embedding generation. Store `VectorRecord.content` as Chroma document, validated vector as embedding, and encoded synchronization metadata. Read all manifest records with deterministic pagination/bounds appropriate to the verified API and validate completeness.
+Use only the Task 1 verified external-embedding APIs and explicitly disable/omit Chroma embedding generation. After the provider-independent vector has passed finite/dimension validation, perform checked component-wise IEEE-754 binary32 projection before `collection.add`; reject projection overflow, and do not clip or normalize. Store `VectorRecord.content` as the exact Chroma document, the projected vector only in Chroma's embedding field, and encoded synchronization metadata without any vector copy. Read all manifest records with deterministic pagination/bounds appropriate to the verified API, return Chroma's persisted finite dimension-valid values, and validate completeness. Exact Python-float equality is not a manifest invariant.
 
 - [ ] **Step 4: Run GREEN and capability regression**
 
 ```powershell
-python -m pytest tests/test_chroma_vector_store.py tests/capability/test_module5_dependency_capabilities.py -q -k "external_vector or reopen or restart or manifest or capability"
+python -m pytest tests/test_chroma_vector_store.py tests/capability/test_module5_dependency_capabilities.py -q -k "external_vector or reopen or restart or manifest or float32 or representation or capability"
 ```
 
 - [ ] **Step 5: Commit**
@@ -1011,7 +1013,7 @@ git commit -m "feat: query active semantic index snapshots"
 
 - [ ] **Step 1: Write mathematical RED tests**
 
-Use Task 1 synthetic vectors to assert exact/approximately justified formula results at identical, orthogonal, opposite, and representative intermediate distances; validate floating-point boundary policy from the gate; assert higher score means closer; and reject non-finite/out-of-domain raw distances. Prove the query addresses only the snapshot’s repository collection and requests at most `top_k`.
+Use Task 1 synthetic vectors and Task 10 persisted-representation cases to assert exact/approximately justified formula results at identical, orthogonal, opposite, and representative intermediate distances. Prove search operates on Chroma's persisted embedding, not an original-vector mirror. Accept only finite cosine-distance boundary error within the gate-proven absolute `1e-6` tolerance, treat an in-tolerance value as the corresponding `0` or `2` endpoint, retain `score = 1 - distance / 2`, and reject values farther outside the domain. Assert higher score means closer. Prove the query addresses only the snapshot’s repository collection and requests at most `top_k`.
 
 - [ ] **Step 2: Verify RED**
 
@@ -1021,7 +1023,7 @@ python -m pytest tests/test_chroma_vector_store.py -q -k "search or score or dis
 
 - [ ] **Step 3: Implement the recorded formula**
 
-Configure the verified metric at collection creation and convert raw distance with the exact formula recorded in the gate artifact. Decode complete record metadata and exact stored document. Do not expose raw distances, vectors, collection names, or private locators.
+Configure the verified metric at collection creation and convert raw distance with the exact formula and endpoint-tolerance rule recorded in the gate artifact. Decode complete record metadata and exact stored document. Do not expose raw distances, vectors, collection names, or private locators.
 
 - [ ] **Step 4: Run GREEN and capability regression**
 
@@ -1170,7 +1172,7 @@ git commit -m "feat: guard repository index synchronization"
 
 - [ ] **Step 1: Write RED security tests with recognizable sentinels**
 
-Use fake secret `TRACERAG_TEST_SECRET_DO_NOT_LEAK`, unique source, vector, auth header, and raw response text. Assert none appears in identities, metadata, public results beyond the required exact `content`, repr of provider/config/errors, logs, or sanitized exceptions. Patch repository `.env`/config reads, repository imports/execution, subprocess, shell, network outside the injected Gemini client, and Chroma embedding functions to raise if called. Assert persistence metadata contains no secret and ordinary tests cannot instantiate a real network client accidentally.
+Use fake secret `TRACERAG_TEST_SECRET_DO_NOT_LEAK`, unique source, vector, auth header, and raw response text. Assert none appears in identities, metadata, public results beyond the required exact `content`, repr of provider/config/errors, logs, or sanitized exceptions. Prove vector values exist only in Chroma's embedding field—not record metadata, active-pointer/control JSON, or another sidecar/manifest—and that manifest readback comes from that field. Patch repository `.env`/config reads, repository imports/execution, subprocess, shell, network outside the injected Gemini client, and Chroma embedding functions to raise if called. Assert persistence metadata contains no secret and ordinary tests cannot instantiate a real network client accidentally.
 
 - [ ] **Step 2: Verify RED or record already-GREEN evidence**
 
@@ -1252,7 +1254,7 @@ git commit -m "test: verify embedding index scaling"
 
 - [ ] **Step 1: Write cross-module RED integration tests**
 
-Build temporary Python, Java, JavaScript, TypeScript, TSX, context, and fragmented inputs through Modules 2–4. Synchronize with a deterministic provider, reopen Chroma, search, and assert exact chunk IDs, hashes, paths, structural metadata, and byte-exact content round-trip. Repeat unchanged sync for zero calls; mutate source through the real pipeline for update/delete/add; synchronize empty; and prove two repositories remain isolated.
+Build temporary Python, Java, JavaScript, TypeScript, TSX, context, and fragmented inputs through Modules 2–4. Synchronize with a deterministic provider, reopen Chroma, search, and assert exact chunk IDs, hashes, paths, structural metadata, and byte-exact content round-trip. Separately assert returned stored vectors follow Task 10's Chroma-authoritative binary32 representation rather than provider Python-float equality. Repeat unchanged sync for zero calls; mutate source through the real pipeline for update/delete/add; synchronize empty; and prove two repositories remain isolated.
 
 - [ ] **Step 2: Verify integration behavior**
 
@@ -1413,9 +1415,10 @@ git diff --name-only 0215f4095dba40cce8284775e0193cd44f8f9594..HEAD
 git diff 0215f4095dba40cce8284775e0193cd44f8f9594..HEAD -- backend/repository_loader backend/file_scanner backend/code_parser backend/code_chunker
 rg -n "PARTIAL_SUCCESS|generation_id|collection_name|chromadb|google\.genai|gemini|read_text|read_bytes|subprocess|eval\(|exec\(" backend/embedding_vector_store
 rg -n "embedding_function" backend/embedding_vector_store tests
+rg -n "embedding_values|vector_mirror|embedding_mirror" backend/embedding_vector_store tests
 ```
 
-Expected: no Modules 1–4 production diff; changed files stay within approved Module 5, tests, exact dependency pins, README, and verification docs. Review every static match: provider imports occur only in `providers/gemini.py`, Chroma imports/physical details only in `stores/chroma.py`, no source reread/execution exists, Chroma automatic embedding is absent/disabled, and no partial-success path exists.
+Expected: no Modules 1–4 production diff; changed files stay within approved Module 5, tests, exact dependency pins, README, and verification docs. Review every static match: provider imports occur only in `providers/gemini.py`, Chroma imports/physical details only in `stores/chroma.py`, no source reread/execution exists, Chroma automatic embedding is absent/disabled, no vector mirror exists, and no partial-success path exists.
 
 - [ ] **Step 4: Verify evidence-specific invariants**
 
@@ -1456,12 +1459,12 @@ Expected: clean feature branch with focused commits and no push. Stop for integr
 - Provider boundary and document/query distinction: Tasks 5 and 7.
 - Exact V1 embedding document and no normalization/truncation: Tasks 3, 14, and 26.
 - Embedding identity/compatibility and forced re-index: Tasks 2, 7, and 17.
-- Vector/cardinality/finite validation: Tasks 5, 14, and 20.
+- Provider vector/cardinality/finite validation and checked Chroma binary32 projection: Tasks 5, 10, 14, and 20.
 - VectorStore opaque lifecycle contracts: Task 8.
-- Chroma-only schema, namespace isolation, persistence, and external vectors: Tasks 9–10.
+- Chroma-only schema, namespace isolation, persistence, external vectors, and sole-authority binary32 representation: Tasks 9–10.
 - Complete candidates, atomic publication, failure preservation, cleanup independence, and crash recovery: Tasks 11–12 and 15.
 - Linear incremental synchronization, batching, no-op, and empty indexes: Tasks 13–18.
-- Search validation, one snapshot, query identity, score semantics, exact results, and deterministic order: Tasks 19–22.
+- Search validation, one snapshot, query identity, persisted-representation score semantics/tolerance, exact source results, and deterministic order: Tasks 19–22.
 - Exact repository deletion: Task 23.
 - One writer per namespace and concurrent readers: Task 24.
 - Credential/logging/source-execution boundary: Task 25.
@@ -1473,6 +1476,6 @@ Expected: clean feature branch with focused commits and no push. Stop for integr
 
 ## Hard Stop Conditions
 
-Stop Module 5 implementation after Task 1 with a committed `BLOCKED` report if any of these remains unproven for exact pins: supported Gemini document/query embeddings; stable dimensions/limits/error mapping; external Chroma embeddings without automatic embedding; persistent reopen; exact metric/distance/score semantics; reversible required metadata; durable unambiguous active-pointer publication; preservation of the old active index before commit; or the required single-writer/concurrent-reader deployment.
+Stop Module 5 implementation after Task 1 with a committed `BLOCKED` report if any of these remains unproven for exact pins: supported Gemini document/query embeddings; stable dimensions/limits/error mapping; external Chroma embeddings without automatic embedding; checked finite binary32 projection and Chroma-authoritative readback across a fresh process; exact metric/distance/score semantics including bounded endpoint tolerance; reversible required metadata; durable unambiguous active-pointer publication; preservation of the old active index before commit; or the required single-writer/concurrent-reader deployment.
 
-Do not substitute a weaker publication invariant, a guessed dependency fact, a second per-chunk manifest, a repository-local persistence default, silent truncation, result filtering, newest-generation inference, or partial success. Any required architectural change returns to design review before production work resumes.
+Do not substitute a weaker publication invariant, a guessed dependency fact, a second per-chunk manifest or vector mirror, a repository-local persistence default, silent truncation, result filtering, newest-generation inference, or partial success. `gemini-embedding-001-retrieval-3072-v1` continues to own provider/model/task/dimension compatibility, while `tracerag-chroma-schema-v1` solely owns the clarified store representation. Any further required architectural change returns to design review before production work resumes.

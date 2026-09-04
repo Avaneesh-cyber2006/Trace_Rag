@@ -2,9 +2,9 @@
 
 ## Result
 
-**PASS**
+**PASS — REVISED VECTOR REPRESENTATION**
 
-Verified on 2026-09-03. This gate authorizes Task 2 of the approved Module 5 implementation plan to begin only after separate user review. It does not implement Module 5 production code.
+Verified on 2026-09-03 and revised on 2026-09-04 after Task 10 executable review. The dependency capability remains a pass under the clarified vector-representation contract below. Production work after Task 10 is contingent on implementation review proving that Task 10 removes the unapproved vector mirror, performs checked binary32 projection, and treats Chroma's embedding field as the sole persisted vector authority. This artifact does not itself authorize the current Task 10 implementation or implement production code.
 
 ## Environment and Dependency Pins
 
@@ -72,6 +72,22 @@ Retry decisions use types plus numeric codes, never message substrings. Module 5
 
 The caller must supply persistence outside the analyzed repository. Module 5 never uses Chroma's default `./chroma` path.
 
+### Revised authoritative vector representation
+
+ChromaDB 1.5.9 persists and returns finite component values in a binary32-valued representation. Exact Python-float round-trip is not a supported invariant. Module 5 therefore validates the provider vector first, performs a checked component-wise IEEE-754 binary32 projection before a Chroma write, and rejects a finite Python float if its projection is non-finite. It does not clip or normalize vectors.
+
+The Chroma embedding field is the sole persisted vector authority. Manifest reads return Chroma's finite, dimension-valid persisted values; no JSON metadata field, pointer/control file, or second per-chunk manifest may mirror the original vector. Search consequently operates on the persisted Chroma representation.
+
+A fresh-process executable probe wrote already projected vectors and reopened the collection in a child Python process. Its cases showed:
+
+- exactly representable `(0.5, -0.25, 0.125)` reopened exactly;
+- ordinary non-unit `(0.1, -0.2, 0.3)` did not equal the original, and returned components such as `0.10000000894069672` differed from the submitted binary32 projection `0.10000000149011612` by a small number of binary32 ULPs;
+- negative non-unit `(-0.7, -1.1, 0.9)` likewise included a returned component a few binary32 ULPs from the submitted projection;
+- small-magnitude `(1e-30, -3e-20, 2e-10)` and representative normalized-like `(0.5773502691896258, -0.5773502691896258, 0.5773502691896258)` reopened consistently as their binary32-valued representations; and
+- self-query cosine distances over those persisted values ranged from `-2.384185791015625e-07` through `1.1920928955078125e-07`, demonstrating a small floating boundary error around mathematical zero.
+
+This evidence distinguishes exact source/evidence persistence from derived-vector numeric representation: Chroma documents must still reproduce exact `CodeChunk.content` and metadata must still reproduce exact provenance. The selected provider compatibility identity remains `gemini-embedding-001-retrieval-3072-v1`, because it captures provider/model/task/dimension semantics. Store representation is owned solely by `tracerag-chroma-schema-v1`. As Module 5 is pre-release, this is a clarification of schema V1 rather than a data migration or compatibility-version change.
+
 ### Collection identifiers
 
 The pinned runtime enforces 3–512 characters; characters are `[a-zA-Z0-9._-]`; the first and last are alphanumeric; consecutive periods and IP-address names are rejected. Module 5 uses the stricter safe subset:
@@ -108,7 +124,7 @@ The executable prototype returned approximately `0.0`, `1.0`, and `2.0` for iden
 score = 1 - (distance / 2)
 ```
 
-Thus distance `0 → 1.0`, `1 → 0.5`, and `2 → 0.0`; higher is more similar. Non-finite or materially out-of-range distances are corruption. Implementation tests may tolerate only small floating-point boundary error proven by the pinned engine and must not silently clamp arbitrary invalid values.
+Thus distance `0 → 1.0`, `1 → 0.5`, and `2 → 0.0`; higher is more similar. The existing executable capability test proves an absolute `1e-6` tolerance, and the revised fresh-process cases observed endpoint error no larger than `2.384185791015625e-07`. A finite distance within `1e-6` of `0` or `2` is treated as that endpoint before applying the unchanged formula. Non-finite values or distances farther outside `[0,2]` are corruption; arbitrary invalid values are never silently clipped.
 
 ## Durable Active-generation Publication
 
@@ -167,6 +183,14 @@ python -m pytest tests/capability/test_module5_dependency_capabilities.py -q -rs
 
 Final gate result: `22 passed`; one Chroma deprecation warning notes its legacy embedding-function configuration loader while the current documented `embedding_function=None` behavior remains functional. `pip check` reports no broken requirements.
 
+Task 10 representation probe:
+
+```powershell
+& 'C:\Users\avane\AppData\Local\Temp\tracerag-module5-gate-20260903-01\Scripts\python.exe' .superpowers/sdd/2026-09-03-embedding-vector-store/task-10-f32-probe.py
+```
+
+The probe used ChromaDB 1.5.9, inserted already projected synthetic values, and delegated reopen/read/query to a new Python process. The five cases and observed values are recorded in “Revised authoritative vector representation” above. The original capability suite's `1e-6` distance tolerance covers the maximum observed self-distance boundary error. The revised `PASS` remains contingent on converting this evidence into Task 10 production and regression behavior, followed by implementation review, before Task 11 begins.
+
 ## Official Sources Consulted
 
 Accessed 2026-09-03:
@@ -182,4 +206,4 @@ Accessed 2026-09-03:
 - Chroma persistent-client guide: https://docs.trychroma.com/docs/run-chroma/clients
 - Chroma official repository and concurrency issue evidence: https://github.com/chroma-core/chroma
 
-No real Gemini request was made. No credential, repository source chunk, provider vector, or raw secret-bearing response is present in this artifact.
+No real Gemini request was made. No credential, repository source chunk, real provider vector, or raw secret-bearing response is present in this artifact; all displayed vector values are fixed synthetic capability inputs.
