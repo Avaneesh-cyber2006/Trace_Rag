@@ -11,6 +11,7 @@ from typing import Iterable
 
 import chromadb
 from chromadb.config import Settings
+from chromadb.errors import ChromaError
 
 from ..exceptions import (
     EmbeddingVectorStoreConfigurationError,
@@ -18,7 +19,7 @@ from ..exceptions import (
     VectorStoreCorruptionError,
     VectorStoreWriteError,
 )
-from ..models import EmbeddingModelIdentity, EmbeddingVector
+from ..models import EmbeddingModelIdentity, EmbeddingVector, VectorRecord
 from .base import CandidateIndex, RepositoryIndexSnapshot, StoredRecord
 
 
@@ -60,6 +61,7 @@ _CONTROL_KEYS = frozenset(
 _CORRUPTION_MESSAGE = "Vector store data is incompatible or corrupt."
 _CONFIGURATION_MESSAGE = "Vector store configuration is invalid."
 _WRITE_MESSAGE = "Vector store record is invalid."
+_MANIFEST_PAGE_SIZE = 100
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -295,6 +297,171 @@ class ChromaVectorStore:
             )
         except ValueError as error:
             raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+    def _candidate_collection_name(self, candidate: CandidateIndex) -> str:
+        if not isinstance(candidate, CandidateIndex) or not isinstance(
+            candidate._token, str
+        ):
+            raise VectorStoreWriteError(_WRITE_MESSAGE)
+        try:
+            self._encode_control_metadata(candidate)
+            return self._collection_identifier(
+                candidate.repository_namespace, candidate._token
+            )
+        except (VectorStoreConfigurationError, VectorStoreWriteError) as error:
+            raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+    def _create_candidate_collection(self, candidate: CandidateIndex) -> None:
+        """Create one isolated, externally embedded physical candidate."""
+        collection_name = self._candidate_collection_name(candidate)
+        metadata = self._encode_control_metadata(candidate)
+        try:
+            self._client.create_collection(
+                name=collection_name,
+                metadata=metadata,
+                embedding_function=None,
+                configuration={"hnsw": {"space": "cosine"}},
+            )
+        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
+            raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+    def _candidate_collection(self, candidate: CandidateIndex):
+        """Open a candidate only after its complete control metadata validates."""
+        collection_name = self._candidate_collection_name(candidate)
+        try:
+            collection = self._client.get_collection(
+                name=collection_name, embedding_function=None
+            )
+        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        decoded = self._decode_snapshot_metadata(
+            candidate.repository_namespace, collection.metadata, candidate._token
+        )
+        if (
+            decoded.identity != candidate.identity
+            or decoded.document_version != candidate.document_version
+            or decoded.schema_version != candidate.schema_version
+            or decoded.expected_chunk_count != candidate.expected_chunk_count
+        ):
+            _raise_corruption()
+        return collection
+
+    def _write_embedded_candidate(
+        self, candidate: CandidateIndex, records: tuple[VectorRecord, ...]
+    ) -> None:
+        """Persist one complete candidate batch using caller-supplied embeddings."""
+        if (
+            not isinstance(candidate, CandidateIndex)
+            or type(records) is not tuple
+            or len(records) != candidate.expected_chunk_count
+            or any(not isinstance(record, VectorRecord) for record in records)
+        ):
+            raise VectorStoreWriteError(_WRITE_MESSAGE)
+        if len({record.chunk_id for record in records}) != len(records):
+            raise VectorStoreWriteError(_WRITE_MESSAGE)
+
+        encoded_records: list[dict[str, object]] = []
+        for record in records:
+            try:
+                stored = StoredRecord(
+                    repository_namespace=candidate.repository_namespace,
+                    chunk_id=record.chunk_id,
+                    content_hash=record.content_hash,
+                    relative_path=record.relative_path,
+                    language=record.language,
+                    chunk_kind=record.chunk_kind,
+                    symbol_kind=record.symbol_kind,
+                    qualified_name=record.qualified_name,
+                    parent_qualified_name=record.parent_qualified_name,
+                    content=record.content,
+                    embedding=record.embedding,
+                    embedding_identity=candidate.identity,
+                    document_version=candidate.document_version,
+                    schema_version=candidate.schema_version,
+                )
+                encoded_records.append(self._encode_record(stored))
+            except (ValueError, VectorStoreCorruptionError) as error:
+                raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+        collection = self._candidate_collection(candidate)
+        try:
+            if collection.count() != 0:
+                raise ValueError("candidate already contains records")
+            collection.add(
+                ids=[record["identifier"] for record in encoded_records],
+                embeddings=[list(record["embedding"]) for record in encoded_records],
+                documents=[record["document"] for record in encoded_records],
+                metadatas=[record["metadata"] for record in encoded_records],
+            )
+            if collection.count() != candidate.expected_chunk_count:
+                raise ValueError("candidate record count is incomplete")
+        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
+            raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+    def _read_candidate_manifest(
+        self, candidate: CandidateIndex
+    ) -> tuple[StoredRecord, ...]:
+        """Return every persisted candidate record after exact evidence validation."""
+        collection = self._candidate_collection(candidate)
+        try:
+            count = collection.count()
+        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        if type(count) is not int or count != candidate.expected_chunk_count:
+            _raise_corruption()
+
+        records: list[StoredRecord] = []
+        identifiers: set[str] = set()
+        for offset in range(0, count, _MANIFEST_PAGE_SIZE):
+            limit = min(_MANIFEST_PAGE_SIZE, count - offset)
+            try:
+                page = collection.get(
+                    limit=limit,
+                    offset=offset,
+                    include=["documents", "embeddings", "metadatas"],
+                )
+                page_ids = page["ids"]
+                documents = page["documents"]
+                embeddings = page["embeddings"]
+                metadatas = page["metadatas"]
+            except (ChromaError, KeyError, RuntimeError, TypeError, ValueError) as error:
+                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+            if isinstance(embeddings, (str, bytes)) or not isinstance(
+                embeddings, Iterable
+            ):
+                _raise_corruption()
+            try:
+                embedding_rows = tuple(embeddings)
+            except (TypeError, ValueError) as error:
+                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+            if (
+                not isinstance(page_ids, list)
+                or not isinstance(documents, list)
+                or not isinstance(metadatas, list)
+                or len(page_ids) != limit
+                or len(documents) != limit
+                or len(embedding_rows) != limit
+                or len(metadatas) != limit
+            ):
+                _raise_corruption()
+            for identifier, document, embedding, metadata in zip(
+                page_ids, documents, embedding_rows, metadatas, strict=True
+            ):
+                if not isinstance(identifier, str) or identifier in identifiers:
+                    _raise_corruption()
+                identifiers.add(identifier)
+                records.append(
+                    self._decode_record(
+                        candidate.repository_namespace,
+                        identifier=identifier,
+                        embedding=embedding,
+                        document=document,
+                        metadata=metadata,
+                    )
+                )
+        if len(records) != count or len(identifiers) != count:
+            _raise_corruption()
+        return tuple(sorted(records, key=lambda record: record.chunk_id))
 
 
 __all__ = ("ChromaVectorStore",)

@@ -10,9 +10,18 @@ import pytest
 from backend.embedding_vector_store.exceptions import (
     VectorStoreConfigurationError,
     VectorStoreCorruptionError,
+    VectorStoreWriteError,
 )
-from backend.embedding_vector_store.models import EmbeddingModelIdentity, EmbeddingVector
-from backend.embedding_vector_store.stores.base import RepositoryIndexSnapshot, StoredRecord
+from backend.embedding_vector_store.models import (
+    EmbeddingModelIdentity,
+    EmbeddingVector,
+    VectorRecord,
+)
+from backend.embedding_vector_store.stores.base import (
+    CandidateIndex,
+    RepositoryIndexSnapshot,
+    StoredRecord,
+)
 from backend.embedding_vector_store.stores.chroma import (
     STORAGE_SCHEMA_VERSION,
     ChromaVectorStore,
@@ -58,6 +67,52 @@ def _snapshot(**changes: object) -> RepositoryIndexSnapshot:
         object(),
     )
     return replace(snapshot, **changes)
+
+
+def _candidate(**changes: object) -> CandidateIndex:
+    candidate = CandidateIndex(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        STORAGE_SCHEMA_VERSION,
+        2,
+        "candidate10",
+    )
+    return replace(candidate, **changes)
+
+
+def _vector_record(
+    chunk_id: str, content_hash: str, content: str, values: tuple[float, ...]
+) -> VectorRecord:
+    return VectorRecord(
+        chunk_id,
+        content_hash,
+        "src/資料/δelta.py",
+        "python",
+        "symbol",
+        "function",
+        "資料.計算",
+        "資料",
+        content,
+        EmbeddingVector(values),
+    )
+
+
+def _candidate_records() -> tuple[VectorRecord, VectorRecord]:
+    return (
+        _vector_record(
+            "c" * 64,
+            "d" * 64,
+            "def 計算():\r\n    return 'λ  ' \n",
+            (1.0, 0.0, 0.0),
+        ),
+        _vector_record(
+            "e" * 64,
+            "f" * 64,
+            "class 資料:\n    値 = 'two'\n",
+            (0.0, 1.0, 0.0),
+        ),
+    )
 
 
 def test_persistence_root_is_mandatory_resolved_and_not_inventory_inferred(
@@ -242,3 +297,108 @@ def test_record_metadata_rejects_invalid_embedding_dimensions_and_values(
 
     with pytest.raises(VectorStoreCorruptionError):
         store._decode_record(NAMESPACE, **encoded)
+
+
+def test_external_vector_candidate_reopens_with_exact_evidence_and_no_auto_embedding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailIfCalledEmbeddingFunction:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, input: object) -> object:
+            self.calls += 1
+            raise AssertionError("Chroma automatic embedding must not run")
+
+    store = _store(tmp_path)
+    sentinel = FailIfCalledEmbeddingFunction()
+    create_collection = store._client.create_collection
+
+    def create_with_external_embeddings(*args: object, **kwargs: object) -> object:
+        assert kwargs["embedding_function"] is None
+        collection = create_collection(*args, **kwargs)
+        collection._embedding_function = sentinel
+        return collection
+
+    monkeypatch.setattr(store._client, "create_collection", create_with_external_embeddings)
+    candidate = _candidate()
+    records = _candidate_records()
+
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, records)
+
+    reopened = _store(tmp_path)
+    manifest = reopened._read_candidate_manifest(candidate)
+
+    assert sentinel.calls == 0
+    assert manifest == (
+        StoredRecord(
+            NAMESPACE,
+            records[0].chunk_id,
+            records[0].content_hash,
+            records[0].relative_path,
+            records[0].language,
+            records[0].chunk_kind,
+            records[0].symbol_kind,
+            records[0].qualified_name,
+            records[0].parent_qualified_name,
+            records[0].content,
+            records[0].embedding,
+            IDENTITY,
+            "tracerag-embedding-document-v1",
+            STORAGE_SCHEMA_VERSION,
+        ),
+        StoredRecord(
+            NAMESPACE,
+            records[1].chunk_id,
+            records[1].content_hash,
+            records[1].relative_path,
+            records[1].language,
+            records[1].chunk_kind,
+            records[1].symbol_kind,
+            records[1].qualified_name,
+            records[1].parent_qualified_name,
+            records[1].content,
+            records[1].embedding,
+            IDENTITY,
+            "tracerag-embedding-document-v1",
+            STORAGE_SCHEMA_VERSION,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,records",
+    (
+        (
+            _candidate(),
+            (
+                _vector_record("1" * 64, "2" * 64, "wrong dimensions", (1.0, 0.0)),
+                _candidate_records()[1],
+            ),
+        ),
+        (
+            _candidate(),
+            (_candidate_records()[0], _candidate_records()[0]),
+        ),
+        (
+            replace(_candidate(), expected_chunk_count=1),
+            _candidate_records(),
+        ),
+        (
+            _candidate(),
+            (object(), _candidate_records()[1]),
+        ),
+    ),
+    ids=("wrong_dimensions", "duplicate_ids", "count_mismatch", "malformed_records"),
+)
+def test_external_vector_candidate_write_fails_closed_before_partial_persistence(
+    tmp_path: Path, candidate: CandidateIndex, records: tuple[object, ...]
+) -> None:
+    store = _store(tmp_path)
+    store._create_candidate_collection(candidate)
+
+    with pytest.raises(VectorStoreWriteError):
+        store._write_embedded_candidate(candidate, records)  # type: ignore[arg-type]
+
+    assert store._candidate_collection(candidate).count() == 0
