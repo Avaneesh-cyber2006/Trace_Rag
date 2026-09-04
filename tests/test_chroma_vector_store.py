@@ -2,8 +2,12 @@
 
 from dataclasses import replace
 import inspect
+import json
+import math
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -489,3 +493,104 @@ def test_finite_values_that_overflow_binary32_fail_before_candidate_mutation(
         store._write_embedded_candidate(candidate, (overflowing, _candidate_records()[1]))
 
     assert store._candidate_collection(candidate).count() == 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        (0.5, -0.25, 0.125),
+        (0.1, -0.2, 0.3),
+        (-0.7, -1.1, 0.9),
+        (1e-30, -3e-20, 2e-10),
+        (0.5773502691896258, -0.5773502691896258, 0.5773502691896258),
+    ),
+    ids=("exact_f32", "ordinary", "negative", "small", "normalized_like"),
+)
+def test_projected_external_vectors_survive_fresh_child_process_reopen(
+    tmp_path: Path, values: tuple[float, float, float]
+) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    records = (
+        _vector_record("1" * 64, "2" * 64, "first", values),
+        _candidate_records()[1],
+    )
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, records)
+    collection_name = store._candidate_collection_name(candidate)
+    parent_values = tuple(
+        float(value)
+        for value in store._candidate_collection(candidate).get(
+            ids=[records[0].chunk_id], include=["embeddings"]
+        )["embeddings"][0]
+    )
+    script = (
+        "import chromadb,json,math,sys; from chromadb.config import Settings; "
+        "c=chromadb.PersistentClient(path=sys.argv[1],settings=Settings(anonymized_telemetry=False)); "
+        "r=c.get_collection(sys.argv[2],embedding_function=None).get(include=['embeddings']); "
+        "v=[float(x) for x in r['embeddings'][0]]; assert len(v)==3 and all(math.isfinite(x) for x in v); print(json.dumps(v))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(store._persistence_root), collection_name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    reopened_values = tuple(json.loads(result.stdout))
+
+    assert len(reopened_values) == len(values)
+    assert all(math.isfinite(value) for value in reopened_values)
+    assert reopened_values == parent_values
+    if values == (0.5, -0.25, 0.125):
+        assert reopened_values == values
+
+
+@pytest.mark.parametrize("invalid", (float("nan"), float("inf"), float("-inf")))
+def test_nonfinite_provider_vectors_fail_before_candidate_mutation(
+    tmp_path: Path, invalid: float
+) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    store._create_candidate_collection(candidate)
+    invalid_record = _vector_record("1" * 64, "2" * 64, "invalid", (invalid, 0.0, 0.0))
+
+    with pytest.raises(VectorStoreWriteError):
+        store._write_embedded_candidate(candidate, (invalid_record, _candidate_records()[1]))
+
+    assert store._candidate_collection(candidate).count() == 0
+
+
+def test_external_vector_records_have_no_vector_metadata_mirror_or_sidecar(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, _candidate_records())
+    physical = store._candidate_collection(candidate).get(include=["metadatas"])
+    required = {
+        "schema_version", "repository_namespace", "chunk_id", "content_hash",
+        "relative_path", "language", "chunk_kind", "embedding_provider",
+        "embedding_model", "embedding_dimensions", "embedding_compatibility_version",
+        "document_version", "symbol_kind", "qualified_name", "parent_qualified_name",
+    }
+
+    for metadata in physical["metadatas"]:
+        assert set(metadata) == required
+        assert all(not isinstance(value, list | dict) for value in metadata.values())
+        assert "embedding_values" not in metadata
+    assert not [path for path in store._persistence_root.rglob("*") if path.is_file() and path.suffix in {".json", ".npy", ".npz"}]
+
+
+def test_direct_chroma_query_uses_persisted_external_embedding_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    records = _candidate_records()
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, records)
+    collection = store._candidate_collection(candidate)
+    persisted = collection.get(ids=[records[0].chunk_id], include=["embeddings"])["embeddings"][0]
+    result = collection.query(query_embeddings=[list(persisted)], n_results=2, include=["distances"])
+
+    assert result["ids"][0][0] == records[0].chunk_id
+    assert abs(result["distances"][0][0]) <= 1e-6
