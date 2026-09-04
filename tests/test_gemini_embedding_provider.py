@@ -7,7 +7,8 @@ import math
 from types import SimpleNamespace
 from typing import Any
 
-from google.genai import errors
+from google import genai
+from google.genai import errors, types
 import httpx
 import pytest
 
@@ -60,6 +61,16 @@ class _FakeClient:
 def _response(*vectors: list[object]) -> object:
     return SimpleNamespace(
         embeddings=[SimpleNamespace(values=values) for values in vectors]
+    )
+
+
+def _real_sdk_client_with_response(response: httpx.Response) -> genai.Client:
+    transport = httpx.MockTransport(lambda request: response)
+    http_client = httpx.Client(transport=transport)
+    return genai.Client(
+        api_key="offline-key",
+        vertexai=False,
+        http_options=types.HttpOptions(httpx_client=http_client),
     )
 
 
@@ -119,7 +130,8 @@ def test_constructor_rejects_an_unusable_injected_client() -> None:
 def test_constructor_sanitizes_verified_sdk_configuration_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def reject_configuration(*, api_key: str) -> object:
+    def reject_configuration(*, api_key: str, vertexai: bool) -> object:
+        assert vertexai is False
         raise ValueError(f"raw-body:{api_key}")
 
     monkeypatch.setattr(
@@ -143,11 +155,13 @@ def test_constructor_sanitizes_verified_sdk_configuration_failures(
 def test_constructor_uses_verified_sdk_client_path_for_external_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    constructed: list[str] = []
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_ENTERPRISE", "true")
+    constructed: list[dict[str, object]] = []
     fake = _FakeClient()
 
-    def construct(*, api_key: str) -> _FakeClient:
-        constructed.append(api_key)
+    def construct(**kwargs: object) -> _FakeClient:
+        constructed.append(kwargs)
         return fake
 
     monkeypatch.setattr(
@@ -162,8 +176,12 @@ def test_constructor_uses_verified_sdk_client_path_for_external_api_key(
         max_batch_size=1,
     )
 
-    assert constructed == ["external-key"]
+    assert constructed == [{"api_key": "external-key", "vertexai": False}]
     assert isinstance(provider, EmbeddingProvider)
+    assert provider.identity.provider == "gemini"
+    assert provider.identity.model == _MODEL
+    assert provider.identity.dimensions == _DIMENSIONS
+    assert provider.identity.compatibility_version == _COMPATIBILITY
 
 
 @pytest.mark.parametrize(
@@ -331,6 +349,59 @@ def test_classification_never_uses_exception_message_substrings() -> None:
 
     with pytest.raises(EmbeddingInvalidRequestError):
         provider.embed_query("query")
+
+
+def test_sdk_request_config_validation_remains_an_invalid_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient()
+    provider = _provider(client)
+    real_constructor = types.EmbedContentConfig
+
+    def reject_request_config(**kwargs: object) -> object:
+        return real_constructor(output_dimensionality="raw-body")  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "backend.embedding_vector_store.providers.gemini.types.EmbedContentConfig",
+        reject_request_config,
+    )
+
+    with pytest.raises(EmbeddingInvalidRequestError) as captured:
+        provider.embed_query("query")
+
+    assert client.models.calls == []
+    assert "raw-body" not in str(captured.value)
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            200,
+            content=b"raw-body-not-json",
+            headers={"content-type": "application/json"},
+        ),
+        httpx.Response(
+            200,
+            json={"embeddings": [{"values": ["raw-body-not-a-number"]}]},
+        ),
+    ],
+)
+def test_real_sdk_response_decode_and_validation_failures_are_invalid_responses(
+    response: httpx.Response,
+) -> None:
+    client = _real_sdk_client_with_response(response)
+    provider = _provider(client)
+
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError) as captured:
+            provider.embed_query("query")
+    finally:
+        client.close()
+
+    assert "raw-body" not in str(captured.value)
+    assert captured.value.__context__ is None
 
 
 @pytest.mark.parametrize(

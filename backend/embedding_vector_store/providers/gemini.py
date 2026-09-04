@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from json import JSONDecodeError
 import math
 
 from google import genai
 from google.genai import errors, types
 import httpx
+from pydantic import ValidationError
 
 from ..exceptions import (
     EmbeddingAuthenticationError,
@@ -72,7 +74,7 @@ class GeminiEmbeddingProvider:
         if client is None:
             constructed_client: object | None = None
             try:
-                constructed_client = genai.Client(api_key=api_key)
+                constructed_client = genai.Client(api_key=api_key, vertexai=False)
             except ValueError:
                 pass
             if constructed_client is None:
@@ -149,18 +151,31 @@ class GeminiEmbeddingProvider:
         task_type: str,
         document_request: bool,
     ) -> tuple[EmbeddingVector, ...]:
+        request_config: object | None = None
+        configuration_failure: EmbeddingInvalidRequestError | None = None
+        try:
+            request_config = types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=self._identity.dimensions,
+            )
+        except ValueError:
+            configuration_failure = EmbeddingInvalidRequestError(
+                _INVALID_REQUEST_MESSAGE
+            )
+        if configuration_failure is not None:
+            raise configuration_failure
+
         response: object | None = None
         mapped_failure: EmbeddingVectorStoreError | None = None
         try:
             response = self._client.models.embed_content(  # type: ignore[attr-defined]
                 model=self._identity.model,
                 contents=contents,
-                config=types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=self._identity.dimensions,
-                ),
+                config=request_config,
             )
         except errors.UnknownApiResponseError:
+            mapped_failure = EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
+        except (JSONDecodeError, ValidationError):
             mapped_failure = EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
         except (httpx.TimeoutException, httpx.ConnectError):
             mapped_failure = EmbeddingTransientError(_TRANSIENT_MESSAGE)
