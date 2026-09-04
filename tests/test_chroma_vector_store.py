@@ -452,7 +452,9 @@ def test_huge_integer_candidate_embedding_fails_closed_as_write_error(
         store._write_embedded_candidate(candidate, (huge, _candidate_records()[1]))
 
 
-def test_non_unit_external_vectors_reopen_with_exact_original_values(tmp_path: Path) -> None:
+def test_non_unit_external_vectors_reopen_as_chroma_authoritative_values(
+    tmp_path: Path,
+) -> None:
     store = _store(tmp_path)
     candidate = _candidate()
     records = (
@@ -462,8 +464,28 @@ def test_non_unit_external_vectors_reopen_with_exact_original_values(tmp_path: P
     store._create_candidate_collection(candidate)
     store._write_embedded_candidate(candidate, records)
 
-    manifest = _store(tmp_path)._read_candidate_manifest(candidate)
-
-    assert tuple(record.embedding for record in manifest) == tuple(
-        record.embedding for record in records
+    reopened = _store(tmp_path)
+    manifest = reopened._read_candidate_manifest(candidate)
+    physical = reopened._candidate_collection(candidate).get(
+        include=["embeddings", "metadatas"]
     )
+
+    assert "embedding_values" not in physical["metadatas"][0]
+    assert tuple(record.embedding.values for record in manifest) == tuple(
+        tuple(float(value) for value in row) for row in physical["embeddings"]
+    )
+    assert manifest[0].embedding != records[0].embedding
+
+
+def test_finite_values_that_overflow_binary32_fail_before_candidate_mutation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    store._create_candidate_collection(candidate)
+    overflowing = _vector_record("1" * 64, "2" * 64, "overflow", (3.5e38, 0.0, 0.0))
+
+    with pytest.raises(VectorStoreWriteError):
+        store._write_embedded_candidate(candidate, (overflowing, _candidate_records()[1]))
+
+    assert store._candidate_collection(candidate).count() == 0

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from hashlib import sha256
-import json
 import math
 from numbers import Real
 from pathlib import Path
 import re
+import struct
 from typing import Iterable
 
 import chromadb
@@ -41,7 +41,6 @@ _RECORD_REQUIRED_KEYS = frozenset(
         "embedding_model",
         "embedding_dimensions",
         "embedding_compatibility_version",
-        "embedding_values",
         "document_version",
     }
 )
@@ -141,13 +140,19 @@ def _validated_embedding_values(
     return tuple(normalized_values)
 
 
-def _encoded_embedding_values(embedding: EmbeddingVector) -> str:
+def _project_embedding_values(
+    embedding: EmbeddingVector, identity: EmbeddingModelIdentity
+) -> EmbeddingVector:
     try:
-        return json.dumps(
-            embedding.values, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        values = _validated_embedding_values(embedding.values, identity)
+        projected = tuple(
+            struct.unpack("!f", struct.pack("!f", value))[0] for value in values
         )
-    except (OverflowError, TypeError, ValueError) as error:
+    except (OverflowError, struct.error, VectorStoreCorruptionError) as error:
         raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+    if not all(math.isfinite(value) for value in projected):
+        raise VectorStoreWriteError(_WRITE_MESSAGE)
+    return EmbeddingVector(projected)
 
 
 class ChromaVectorStore:
@@ -203,7 +208,6 @@ class ChromaVectorStore:
             "language": record.language,
             "chunk_kind": record.chunk_kind,
             "document_version": record.document_version,
-            "embedding_values": _encoded_embedding_values(record.embedding),
             **_metadata_for_identity(record.embedding_identity),
         }
         for key in _RECORD_OPTIONAL_KEYS:
@@ -255,14 +259,7 @@ class ChromaVectorStore:
             if key in metadata and not _is_nonempty_string(metadata[key]):
                 _raise_corruption()
         identity = _identity_from_metadata(metadata)
-        if not isinstance(metadata.get("embedding_values"), str):
-            _raise_corruption()
-        try:
-            original_embedding = json.loads(metadata["embedding_values"])
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
-        _validated_embedding_values(embedding, identity)
-        normalized_values = _validated_embedding_values(original_embedding, identity)
+        normalized_values = _validated_embedding_values(embedding, identity)
         try:
             return StoredRecord(
                 repository_namespace=repository_namespace,
@@ -403,7 +400,9 @@ class ChromaVectorStore:
                     qualified_name=record.qualified_name,
                     parent_qualified_name=record.parent_qualified_name,
                     content=record.content,
-                    embedding=record.embedding,
+                    embedding=_project_embedding_values(
+                        record.embedding, candidate.identity
+                    ),
                     embedding_identity=candidate.identity,
                     document_version=candidate.document_version,
                     schema_version=candidate.schema_version,
