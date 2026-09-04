@@ -18,13 +18,29 @@ from backend.code_parser.models import (
     SymbolKind,
 )
 from backend.embedding_vector_store.exceptions import InvalidCodeChunkInventory
+from backend.embedding_vector_store.models import (
+    EmbeddingDocument,
+    EmbeddingModelIdentity,
+    EmbeddingVector,
+)
 from backend.embedding_vector_store.validation import (
     ChunkInput,
     validate_and_flatten_inventory,
+    validate_embedding_batch,
+    validate_embedding_vector,
 )
 
 
 _NAMESPACE = "tracerag-repository-v1:github:example/repo"
+_EMBEDDING_IDENTITY = EmbeddingModelIdentity("fake", "model", 3, "v1")
+_EMBEDDING_DOCUMENT = EmbeddingDocument("a" * 64, "document")
+
+
+def _untrusted_vector(values: object) -> EmbeddingVector:
+    """Construct a provider-shaped value without relying on local model checks."""
+    vector = object.__new__(EmbeddingVector)
+    object.__setattr__(vector, "values", values)
+    return vector
 
 
 class _InventorySubclass(CodeChunkInventory):
@@ -329,3 +345,66 @@ def test_inventory_flattens_mixed_languages_in_file_and_chunk_order() -> None:
     )
     assert getattr(ChunkInput, "__slots__") == ("chunk", "relative_path", "language")
     assert getattr(ChunkInput, "__dataclass_params__").frozen is True
+
+
+def test_vector_validation_returns_the_original_valid_vector() -> None:
+    vector = EmbeddingVector((0.1, 0.2, 0.3))
+
+    assert validate_embedding_vector(vector, _EMBEDDING_IDENTITY) is vector
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        None,
+        (),
+        (0.1, 0.2),
+        "not-a-vector",
+        (True, 0.2, 0.3),
+        (float("nan"), 0.2, 0.3),
+        (float("inf"), 0.2, 0.3),
+        (float("-inf"), 0.2, 0.3),
+    ),
+)
+def test_vector_validation_rejects_missing_or_invalid_values(values: object) -> None:
+    vector = _untrusted_vector(values)
+
+    from backend.embedding_vector_store.exceptions import EmbeddingInvalidResponseError
+
+    with pytest.raises(EmbeddingInvalidResponseError):
+        validate_embedding_vector(vector, _EMBEDDING_IDENTITY)
+
+
+def test_vector_validation_rejects_a_non_vector_response() -> None:
+    from backend.embedding_vector_store.exceptions import EmbeddingInvalidResponseError
+
+    with pytest.raises(EmbeddingInvalidResponseError):
+        validate_embedding_vector(None, _EMBEDDING_IDENTITY)  # type: ignore[arg-type]
+
+
+def test_batch_validation_returns_the_original_ordered_tuple_after_full_validation() -> None:
+    documents = (_EMBEDDING_DOCUMENT, _EMBEDDING_DOCUMENT)
+    vectors = (EmbeddingVector((0.1, 0.2, 0.3)), EmbeddingVector((0.4, 0.5, 0.6)))
+
+    assert validate_embedding_batch(documents, vectors, _EMBEDDING_IDENTITY) is vectors
+
+
+def test_batch_validation_rejects_cardinality_mismatch() -> None:
+    from backend.embedding_vector_store.exceptions import EmbeddingInvalidResponseError
+
+    with pytest.raises(EmbeddingInvalidResponseError):
+        validate_embedding_batch((_EMBEDDING_DOCUMENT,), (), _EMBEDDING_IDENTITY)
+
+
+def test_batch_validation_rejects_a_later_invalid_vector_before_returning_any_result() -> None:
+    vectors = (
+        EmbeddingVector((0.1, 0.2, 0.3)),
+        EmbeddingVector((0.4, float("nan"), 0.6)),
+    )
+
+    from backend.embedding_vector_store.exceptions import EmbeddingInvalidResponseError
+
+    with pytest.raises(EmbeddingInvalidResponseError):
+        validate_embedding_batch(
+            (_EMBEDDING_DOCUMENT, _EMBEDDING_DOCUMENT), vectors, _EMBEDDING_IDENTITY
+        )

@@ -1,6 +1,7 @@
 """Validation at the immutable Module 4 to Module 5 boundary."""
 
 from dataclasses import dataclass
+import math
 import re
 
 from backend.code_chunker.models import (
@@ -12,11 +13,13 @@ from backend.code_chunker.models import (
 )
 from backend.code_parser.models import ParsedLanguage, SourceLocation, SymbolKind
 
-from .exceptions import InvalidCodeChunkInventory
+from .exceptions import EmbeddingInvalidResponseError, InvalidCodeChunkInventory
+from .models import EmbeddingDocument, EmbeddingModelIdentity, EmbeddingVector
 
 
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _INVALID_INVENTORY_MESSAGE = "Code chunk inventory contract is invalid."
+_INVALID_EMBEDDING_RESPONSE_MESSAGE = "Embedding provider response is invalid."
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,3 +161,36 @@ def validate_and_flatten_inventory(
         _invalid()
 
     return inventory.repository_namespace, tuple(inputs)
+
+
+def _invalid_embedding_response() -> None:
+    raise EmbeddingInvalidResponseError(_INVALID_EMBEDDING_RESPONSE_MESSAGE)
+
+
+def validate_embedding_vector(
+    vector: EmbeddingVector, identity: EmbeddingModelIdentity
+) -> EmbeddingVector:
+    """Return a vector only when it belongs to the declared embedding space."""
+    if not isinstance(vector, EmbeddingVector) or not isinstance(vector.values, tuple):
+        _invalid_embedding_response()
+    if len(vector.values) != identity.dimensions:
+        _invalid_embedding_response()
+    for value in vector.values:
+        if type(value) not in (int, float) or not math.isfinite(value):
+            _invalid_embedding_response()
+    return vector
+
+
+def validate_embedding_batch(
+    documents: tuple[EmbeddingDocument, ...],
+    vectors: tuple[EmbeddingVector, ...],
+    identity: EmbeddingModelIdentity,
+) -> tuple[EmbeddingVector, ...]:
+    """Validate every response vector before preserving request/result association."""
+    if type(documents) is not tuple or type(vectors) is not tuple:
+        _invalid_embedding_response()
+    if len(documents) != len(vectors):
+        _invalid_embedding_response()
+    for vector in vectors:
+        validate_embedding_vector(vector, identity)
+    return vectors
