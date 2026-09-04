@@ -171,11 +171,14 @@ def validate_embedding_vector(
     vector: EmbeddingVector, identity: EmbeddingModelIdentity
 ) -> EmbeddingVector:
     """Return a vector only when it belongs to the declared embedding space."""
-    if not isinstance(vector, EmbeddingVector) or not isinstance(vector.values, tuple):
+    if not isinstance(vector, EmbeddingVector):
         _invalid_embedding_response()
-    if len(vector.values) != identity.dimensions:
+    values = getattr(vector, "values", None)
+    if not isinstance(values, tuple):
         _invalid_embedding_response()
-    for value in vector.values:
+    if len(values) != identity.dimensions:
+        _invalid_embedding_response()
+    for value in values:
         if type(value) not in (int, float) or not math.isfinite(value):
             _invalid_embedding_response()
     return vector

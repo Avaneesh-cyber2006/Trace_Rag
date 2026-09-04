@@ -43,6 +43,11 @@ def _untrusted_vector(values: object) -> EmbeddingVector:
     return vector
 
 
+def _uninitialized_vector() -> EmbeddingVector:
+    """Construct an external value whose required slot is absent."""
+    return object.__new__(EmbeddingVector)
+
+
 class _InventorySubclass(CodeChunkInventory):
     pass
 
@@ -380,6 +385,13 @@ def test_vector_validation_rejects_a_non_vector_response() -> None:
 
     with pytest.raises(EmbeddingInvalidResponseError):
         validate_embedding_vector(None, _EMBEDDING_IDENTITY)  # type: ignore[arg-type]
+
+
+def test_vector_validation_rejects_a_response_with_a_missing_values_slot() -> None:
+    from backend.embedding_vector_store.exceptions import EmbeddingInvalidResponseError
+
+    with pytest.raises(EmbeddingInvalidResponseError):
+        validate_embedding_vector(_uninitialized_vector(), _EMBEDDING_IDENTITY)
 
 
 def test_batch_validation_returns_the_original_ordered_tuple_after_full_validation() -> None:
