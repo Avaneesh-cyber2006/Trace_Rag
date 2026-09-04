@@ -402,3 +402,68 @@ def test_external_vector_candidate_write_fails_closed_before_partial_persistence
         store._write_embedded_candidate(candidate, records)  # type: ignore[arg-type]
 
     assert store._candidate_collection(candidate).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "value"),
+    (
+        ("embedding_provider", "other-provider"),
+        ("document_version", "other-document-version"),
+        ("schema_version", "tracerag-chroma-schema-v2"),
+    ),
+    ids=("identity", "document_version", "schema_version"),
+)
+def test_manifest_rejects_record_metadata_inconsistent_with_candidate_control(
+    tmp_path: Path, target: str, value: str
+) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    records = _candidate_records()
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, records)
+    store._candidate_collection(candidate).update(
+        ids=[records[0].chunk_id], metadatas=[{target: value}]
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store._read_candidate_manifest(candidate)
+
+
+def test_huge_integer_embedding_fails_closed_as_corruption_error(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    encoded = store._encode_record(_record())
+    encoded["embedding"] = (10**10_000, 0.0, 0.0)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store._decode_record(NAMESPACE, **encoded)
+
+
+def test_huge_integer_candidate_embedding_fails_closed_as_write_error(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+
+    candidate = _candidate()
+    store._create_candidate_collection(candidate)
+    huge = _vector_record("1" * 64, "2" * 64, "huge", (10**10_000, 0.0, 0.0))
+    with pytest.raises(VectorStoreWriteError):
+        store._write_embedded_candidate(candidate, (huge, _candidate_records()[1]))
+
+
+def test_non_unit_external_vectors_reopen_with_exact_original_values(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = _candidate()
+    records = (
+        _vector_record("1" * 64, "2" * 64, "first", (0.1, -0.2, 0.3)),
+        _vector_record("3" * 64, "4" * 64, "second", (0.4, 0.5, -0.6)),
+    )
+    store._create_candidate_collection(candidate)
+    store._write_embedded_candidate(candidate, records)
+
+    manifest = _store(tmp_path)._read_candidate_manifest(candidate)
+
+    assert tuple(record.embedding for record in manifest) == tuple(
+        record.embedding for record in records
+    )

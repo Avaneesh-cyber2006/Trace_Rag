@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import json
 import math
 from numbers import Real
 from pathlib import Path
@@ -40,6 +41,7 @@ _RECORD_REQUIRED_KEYS = frozenset(
         "embedding_model",
         "embedding_dimensions",
         "embedding_compatibility_version",
+        "embedding_values",
         "document_version",
     }
 )
@@ -114,6 +116,40 @@ def _metadata_for_identity(identity: EmbeddingModelIdentity) -> dict[str, str | 
     }
 
 
+def _validated_embedding_values(
+    embedding: object, identity: EmbeddingModelIdentity
+) -> tuple[float, ...]:
+    if isinstance(embedding, (str, bytes)) or not isinstance(embedding, Iterable):
+        _raise_corruption()
+    try:
+        values = tuple(embedding)
+    except (TypeError, ValueError) as error:
+        raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+    if len(values) != identity.dimensions:
+        _raise_corruption()
+    normalized_values: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            _raise_corruption()
+        try:
+            normalized = float(value)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        if not math.isfinite(normalized):
+            _raise_corruption()
+        normalized_values.append(normalized)
+    return tuple(normalized_values)
+
+
+def _encoded_embedding_values(embedding: EmbeddingVector) -> str:
+    try:
+        return json.dumps(
+            embedding.values, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
+    except (OverflowError, TypeError, ValueError) as error:
+        raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+
 class ChromaVectorStore:
     """Own Chroma-specific persistence details behind the vector-store boundary."""
 
@@ -167,6 +203,7 @@ class ChromaVectorStore:
             "language": record.language,
             "chunk_kind": record.chunk_kind,
             "document_version": record.document_version,
+            "embedding_values": _encoded_embedding_values(record.embedding),
             **_metadata_for_identity(record.embedding_identity),
         }
         for key in _RECORD_OPTIONAL_KEYS:
@@ -218,22 +255,14 @@ class ChromaVectorStore:
             if key in metadata and not _is_nonempty_string(metadata[key]):
                 _raise_corruption()
         identity = _identity_from_metadata(metadata)
-        if isinstance(embedding, (str, bytes)) or not isinstance(embedding, Iterable):
+        if not isinstance(metadata.get("embedding_values"), str):
             _raise_corruption()
         try:
-            values = tuple(embedding)
-        except (TypeError, ValueError) as error:
+            original_embedding = json.loads(metadata["embedding_values"])
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
-        if len(values) != identity.dimensions:
-            _raise_corruption()
-        normalized_values: list[float] = []
-        for value in values:
-            if isinstance(value, bool) or not isinstance(value, Real):
-                _raise_corruption()
-            normalized = float(value)
-            if not math.isfinite(normalized):
-                _raise_corruption()
-            normalized_values.append(normalized)
+        _validated_embedding_values(embedding, identity)
+        normalized_values = _validated_embedding_values(original_embedding, identity)
         try:
             return StoredRecord(
                 repository_namespace=repository_namespace,
@@ -450,15 +479,20 @@ class ChromaVectorStore:
                 if not isinstance(identifier, str) or identifier in identifiers:
                     _raise_corruption()
                 identifiers.add(identifier)
-                records.append(
-                    self._decode_record(
-                        candidate.repository_namespace,
-                        identifier=identifier,
-                        embedding=embedding,
-                        document=document,
-                        metadata=metadata,
-                    )
+                record = self._decode_record(
+                    candidate.repository_namespace,
+                    identifier=identifier,
+                    embedding=embedding,
+                    document=document,
+                    metadata=metadata,
                 )
+                if (
+                    record.embedding_identity != candidate.identity
+                    or record.document_version != candidate.document_version
+                    or record.schema_version != candidate.schema_version
+                ):
+                    _raise_corruption()
+                records.append(record)
         if len(records) != count or len(identifiers) != count:
             _raise_corruption()
         return tuple(sorted(records, key=lambda record: record.chunk_id))
