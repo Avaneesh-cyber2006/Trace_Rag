@@ -16,6 +16,7 @@ import pytest
 from backend.embedding_vector_store.exceptions import (
     VectorStoreConfigurationError,
     VectorStoreCorruptionError,
+    VectorStorePublicationError,
     VectorStoreReadError,
     VectorStoreWriteError,
 )
@@ -341,6 +342,159 @@ def test_abort_removes_only_unpublished_candidate_and_never_active(
     assert reopened.snapshot is not None
     assert reopened.snapshot.document_version == "active-document-version"
     assert candidate_name not in {collection.name for collection in store._client.list_collections()}
+
+
+def test_candidate_write_failure_keeps_old_active_snapshot_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 2)
+
+    def fail_candidate_write(*args: object, **kwargs: object) -> None:
+        raise VectorStoreWriteError("injected candidate write failure")
+
+    monkeypatch.setattr(store, "_append_stored_candidate", fail_candidate_write)
+
+    with pytest.raises(VectorStoreWriteError):
+        store.add_embedded(candidate, _candidate_records())
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "old-document-version"
+
+
+def test_candidate_validation_failure_keeps_old_active_snapshot_authoritative(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 2)
+    store.add_embedded(candidate, (_candidate_records()[0],))
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.publish(candidate)
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "old-document-version"
+
+
+def test_publication_failure_with_corrupt_pointer_fails_closed_as_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+    pointer_path = store._active_pointer_path(NAMESPACE)
+
+    def interrupt_before_commit(source: str | Path, destination: str | Path) -> None:
+        pointer_path.write_bytes(b"not a pointer")
+        raise OSError("injected interruption before commit")
+
+    monkeypatch.setattr(os, "replace", interrupt_before_commit)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.publish(candidate)
+
+
+def test_boundary_interruption_returns_new_snapshot_only_after_pointer_proves_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+    real_replace = os.replace
+
+    def commit_then_interrupt(source: str | Path, destination: str | Path) -> None:
+        real_replace(source, destination)
+        raise OSError("injected interruption at commit boundary")
+
+    monkeypatch.setattr(os, "replace", commit_then_interrupt)
+
+    published = store.publish(candidate)
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert published.document_version == "new-document-version"
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "new-document-version"
+
+
+def test_restart_ignores_abandoned_candidate_after_precommit_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "abandoned-document-version", 0)
+
+    def interrupt_before_commit(source: str | Path, destination: str | Path) -> None:
+        raise OSError("injected interruption before commit")
+
+    monkeypatch.setattr(os, "replace", interrupt_before_commit)
+
+    with pytest.raises(VectorStorePublicationError):
+        store.publish(candidate)
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "old-document-version"
+
+
+def test_cleanup_failure_after_commit_keeps_new_active_snapshot_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+    cleanup_calls: list[tuple[str | None, str]] = []
+
+    def fail_cleanup(old_collection: str | None, new_collection: str) -> None:
+        cleanup_calls.append((old_collection, new_collection))
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(store, "_cleanup_obsolete_collection", fail_cleanup)
+
+    published = store.publish(candidate)
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert cleanup_calls == [
+        (store._candidate_collection_name(old), store._candidate_collection_name(candidate))
+    ]
+    assert published.document_version == "new-document-version"
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "new-document-version"
+
+
+def test_restart_uses_pointer_not_obsolete_generation_or_collection_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+
+    def retain_obsolete(old_collection: str | None, new_collection: str) -> None:
+        assert old_collection == store._candidate_collection_name(old)
+        assert new_collection == store._candidate_collection_name(candidate)
+
+    monkeypatch.setattr(store, "_cleanup_obsolete_collection", retain_obsolete)
+    store.publish(candidate)
+    monkeypatch.setattr(
+        store._client,
+        "list_collections",
+        lambda: (_ for _ in ()).throw(AssertionError("collection ordering must not select active")),
+    )
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "new-document-version"
 
 
 def test_active_pointer_requires_canonical_json_and_valid_checksum(tmp_path: Path) -> None:

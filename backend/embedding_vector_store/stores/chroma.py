@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+import logging
 import math
 from numbers import Real
 import os
@@ -79,6 +80,7 @@ _POINTER_KEYS = frozenset({"payload", "sha256"})
 _POINTER_PAYLOAD_KEYS = frozenset(
     {"schema_version", "repository_namespace", "active_collection"}
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -813,8 +815,42 @@ class ChromaVectorStore:
         """Validate the complete logical candidate before publication."""
         self._read_candidate_manifest(candidate)
 
+    def _resolve_publication_outcome(
+        self, candidate: CandidateIndex, old_collection: str | None
+    ) -> RepositoryIndexSnapshot:
+        """Accept only an explicitly committed, complete candidate pointer."""
+        try:
+            state = self.inspect_active(candidate.repository_namespace)
+        except VectorStoreCorruptionError:
+            raise
+        except VectorStoreReadError as error:
+            raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from error
+        if state.snapshot is not None and state.snapshot._token == self._candidate_collection_name(
+            candidate
+        ):
+            return state.snapshot
+        current_collection = state.snapshot._token if state.snapshot is not None else None
+        if current_collection == old_collection:
+            raise VectorStorePublicationError(_PUBLICATION_MESSAGE)
+        _raise_corruption()
+
+    def _cleanup_obsolete_collection(
+        self, old_collection: str | None, new_collection: str
+    ) -> None:
+        """Reserve non-authoritative retirement until reader lifetime tracking exists."""
+        # A published snapshot can still be serving an in-process reader.  Task 24
+        # adds the reader lifetime guard required before a collection is deleted;
+        # retaining an obsolete generation is safe and never changes pointer authority.
+        del old_collection, new_collection
+
     def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
         """Publish a complete candidate through one durable pointer replacement."""
+        previous_state = self.inspect_active(candidate.repository_namespace)
+        old_collection = (
+            previous_state.snapshot._token
+            if previous_state.snapshot is not None
+            else None
+        )
         self.validate_candidate(candidate)
         collection_name = self._candidate_collection_name(candidate)
         pointer_path = self._active_pointer_path(candidate.repository_namespace)
@@ -833,28 +869,16 @@ class ChromaVectorStore:
             os.replace(temporary_path, pointer_path)
         except OSError as error:
             try:
-                state = self.inspect_active(candidate.repository_namespace)
-            except (VectorStoreCorruptionError, VectorStoreReadError):
+                snapshot = self._resolve_publication_outcome(candidate, old_collection)
+            except VectorStorePublicationError:
                 raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from error
-            if (
-                not state.indexed
-                or state.snapshot is None
-                or state.snapshot._token != collection_name
-            ):
-                raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from error
-            return state.snapshot
-
+        else:
+            snapshot = self._resolve_publication_outcome(candidate, old_collection)
         try:
-            state = self.inspect_active(candidate.repository_namespace)
-        except (VectorStoreCorruptionError, VectorStoreReadError) as error:
-            raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from error
-        if (
-            not state.indexed
-            or state.snapshot is None
-            or state.snapshot._token != collection_name
-        ):
-            raise VectorStorePublicationError(_PUBLICATION_MESSAGE)
-        return state.snapshot
+            self._cleanup_obsolete_collection(old_collection, collection_name)
+        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+            _LOGGER.warning("Vector store cleanup failed.")
+        return snapshot
 
     def abort(self, candidate: CandidateIndex) -> None:
         """Remove an unreachable candidate without changing active authority."""
