@@ -2,13 +2,30 @@
 
 from dataclasses import dataclass
 
-from .documents import build_embedding_document
+from backend.code_chunker.models import CodeChunkInventory
+
+from .documents import EMBEDDING_DOCUMENT_VERSION, build_embedding_document
 from .exceptions import EmbeddingVectorStoreConfigurationError
-from .models import VectorRecord
+from .models import (
+    EmbeddingModelIdentity,
+    IndexSyncResult,
+    IndexSyncStatus,
+    VectorRecord,
+)
 from .providers.base import EmbeddingProvider
 from .retry import RetryPolicy, run_with_embedding_retries
-from .stores.base import StoredRecord
-from .validation import ChunkInput, validate_embedding_batch
+from .stores.base import StoredRecord, VectorStore
+from .validation import (
+    ChunkInput,
+    validate_and_flatten_inventory,
+    validate_embedding_batch,
+)
+
+
+_INVALID_DEPENDENCY_MESSAGE = "Semantic indexer dependency configuration is invalid."
+_UNSUPPORTED_INDEX_STATE_MESSAGE = (
+    "Semantic indexer requires a compatible active repository index."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +37,90 @@ class SyncDiff:
     updated: tuple[ChunkInput, ...]
     deleted: tuple[StoredRecord, ...]
     compatible: bool
+
+
+class SemanticIndexer:
+    """Synchronize validated chunk inventories into complete index candidates."""
+
+    def __init__(
+        self,
+        provider: EmbeddingProvider,
+        store: VectorStore,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
+        if not isinstance(provider, EmbeddingProvider) or not isinstance(
+            store, VectorStore
+        ):
+            raise EmbeddingVectorStoreConfigurationError(_INVALID_DEPENDENCY_MESSAGE)
+        identity = provider.identity
+        capacity = provider.max_batch_size
+        if (
+            not isinstance(identity, EmbeddingModelIdentity)
+            or type(capacity) is not int
+            or capacity <= 0
+            or (retry_policy is not None and not isinstance(retry_policy, RetryPolicy))
+        ):
+            raise EmbeddingVectorStoreConfigurationError(_INVALID_DEPENDENCY_MESSAGE)
+        self._provider = provider
+        self._store = store
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._identity = identity
+
+    def synchronize(self, inventory: CodeChunkInventory) -> IndexSyncResult:
+        """Publish a complete replacement for one changed compatible active index."""
+        repository_namespace, current = validate_and_flatten_inventory(inventory)
+        active_state = self._store.inspect_active(repository_namespace)
+        snapshot = active_state.snapshot
+        if snapshot is None:
+            diff = _classify_chunks(current, (), False, False)
+        else:
+            manifest = self._store.read_manifest(snapshot)
+            diff = _classify_chunks(
+                current,
+                manifest,
+                snapshot.identity == self._identity,
+                snapshot.document_version == EMBEDDING_DOCUMENT_VERSION,
+            )
+        if snapshot is None or not diff.compatible:
+            raise EmbeddingVectorStoreConfigurationError(
+                _UNSUPPORTED_INDEX_STATE_MESSAGE
+            )
+
+        candidate = self._store.begin_candidate(
+            repository_namespace,
+            self._identity,
+            EMBEDDING_DOCUMENT_VERSION,
+            len(current),
+        )
+        try:
+            self._store.add_reused(candidate, diff.unchanged)
+            embedded = _embed_chunk_inputs(
+                diff.new + diff.updated,
+                self._provider,
+                self._retry_policy,
+            )
+            self._store.add_embedded(candidate, embedded)
+            self._store.validate_candidate(candidate)
+            self._store.publish(candidate)
+        except Exception:
+            try:
+                self._store.abort(candidate)
+            except Exception:
+                pass
+            raise
+
+        return IndexSyncResult(
+            repository_namespace=repository_namespace,
+            status=IndexSyncStatus.SUCCESS,
+            total_chunks=len(current),
+            reused_chunks=len(diff.unchanged),
+            embedded_chunks=len(embedded),
+            inserted_chunks=len(diff.new),
+            updated_chunks=len(diff.updated),
+            deleted_chunks=len(diff.deleted),
+            embedding_identity=self._identity,
+            document_version=EMBEDDING_DOCUMENT_VERSION,
+        )
 
 
 def _embed_chunk_inputs(
