@@ -837,11 +837,13 @@ class ChromaVectorStore:
     def _cleanup_obsolete_collection(
         self, old_collection: str | None, new_collection: str
     ) -> None:
-        """Reserve non-authoritative retirement until reader lifetime tracking exists."""
-        # A published snapshot can still be serving an in-process reader.  Task 24
-        # adds the reader lifetime guard required before a collection is deleted;
-        # retaining an obsolete generation is safe and never changes pointer authority.
-        del old_collection, new_collection
+        """Best-effort retirement after durable pointer publication succeeds."""
+        if old_collection is None or old_collection == new_collection:
+            return
+        try:
+            self._client.delete_collection(old_collection)
+        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+            _LOGGER.warning("Vector store cleanup failed.")
 
     def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
         """Publish a complete candidate through one durable pointer replacement."""

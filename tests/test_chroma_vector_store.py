@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import inspect
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -446,7 +447,7 @@ def test_restart_ignores_abandoned_candidate_after_precommit_interruption(
 
 
 def test_cleanup_failure_after_commit_keeps_new_active_snapshot_authoritative(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     store = _store(tmp_path)
     old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
@@ -454,21 +455,64 @@ def test_cleanup_failure_after_commit_keeps_new_active_snapshot_authoritative(
     candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
     cleanup_calls: list[tuple[str | None, str]] = []
 
-    def fail_cleanup(old_collection: str | None, new_collection: str) -> None:
-        cleanup_calls.append((old_collection, new_collection))
-        raise OSError("injected cleanup failure")
+    def fail_delete_collection(collection_name: str) -> None:
+        cleanup_calls.append((store._candidate_collection_name(old), collection_name))
+        raise RuntimeError("injected cleanup failure")
 
-    monkeypatch.setattr(store, "_cleanup_obsolete_collection", fail_cleanup)
+    monkeypatch.setattr(store._client, "delete_collection", fail_delete_collection)
 
-    published = store.publish(candidate)
+    with caplog.at_level(logging.WARNING, logger="backend.embedding_vector_store.stores.chroma"):
+        published = store.publish(candidate)
     reopened = _store(tmp_path).inspect_active(NAMESPACE)
 
     assert cleanup_calls == [
-        (store._candidate_collection_name(old), store._candidate_collection_name(candidate))
+        (store._candidate_collection_name(old), store._candidate_collection_name(old))
     ]
+    assert caplog.messages == ["Vector store cleanup failed."]
     assert published.document_version == "new-document-version"
     assert reopened.snapshot is not None
     assert reopened.snapshot.document_version == "new-document-version"
+
+
+def test_successful_replacement_retires_previously_active_collection(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    old_collection = store._candidate_collection_name(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+
+    published = store.publish(candidate)
+    collection_names = {collection.name for collection in store._client.list_collections()}
+
+    assert old_collection not in collection_names
+    assert store._candidate_collection_name(candidate) in collection_names
+    assert published.document_version == "new-document-version"
+
+
+def test_publication_failure_with_valid_third_pointer_is_ambiguous_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
+    store.publish(old)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 0)
+    third = store.begin_candidate(NAMESPACE, IDENTITY, "third-document-version", 0)
+    pointer_path = store._active_pointer_path(NAMESPACE)
+
+    def replace_with_third_then_fail(source: str | Path, destination: str | Path) -> None:
+        pointer_path.write_bytes(
+            store._active_pointer_bytes(
+                NAMESPACE, store._candidate_collection_name(third)
+            )
+        )
+        raise OSError("injected replacement failure after competing commit")
+
+    monkeypatch.setattr(os, "replace", replace_with_third_then_fail)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.publish(candidate)
 
 
 def test_restart_uses_pointer_not_obsolete_generation_or_collection_order(
@@ -616,7 +660,7 @@ def test_add_reused_prevalidates_all_records_before_candidate_mutation(
     assert store._candidate_collection(candidate).count() == 0
 
 
-def test_read_manifest_uses_snapshot_token_not_current_pointer(
+def test_read_manifest_uses_snapshot_token_without_consulting_pointer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
@@ -626,8 +670,6 @@ def test_read_manifest_uses_snapshot_token_not_current_pointer(
     first_snapshot = store.inspect_active(NAMESPACE).snapshot
     assert first_snapshot is not None
 
-    second = store.begin_candidate(NAMESPACE, IDENTITY, "document-v2", 0)
-    store.publish(second)
     monkeypatch.setattr(
         store,
         "_read_active_collection_name",
