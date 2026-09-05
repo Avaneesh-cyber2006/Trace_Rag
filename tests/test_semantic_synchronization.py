@@ -643,6 +643,58 @@ def test_semantic_indexer_orchestration_builds_and_publishes_complete_candidate(
     assert store.active_snapshot is not store.old_snapshot
 
 
+def test_semantic_indexer_unchanged_fast_path_skips_provider_and_store_mutations():
+    events: list[object] = []
+    inventory, current, _ = _changed_compatible_inventory()
+    manifest = tuple(_stored_for_sync(item) for item in current)
+
+    class FailIfCalledProvider(_RecordingProvider):
+        def embed_documents(self, documents: tuple[object, ...]) -> tuple[EmbeddingVector, ...]:
+            raise AssertionError("unchanged synchronization must not embed documents")
+
+        def embed_query(self, query_text: str) -> EmbeddingVector:
+            raise AssertionError("unchanged synchronization must not embed queries")
+
+    class FailIfCalledStore(_RecordingStore):
+        def begin_candidate(self, *args: object, **kwargs: object) -> CandidateIndex:
+            raise AssertionError("unchanged synchronization must not create a candidate")
+
+        def add_reused(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("unchanged synchronization must not write reused records")
+
+        def add_embedded(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("unchanged synchronization must not write embedded records")
+
+        def validate_candidate(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("unchanged synchronization must not validate a candidate")
+
+        def publish(self, *args: object, **kwargs: object) -> RepositoryIndexSnapshot:
+            raise AssertionError("unchanged synchronization must not publish")
+
+        def abort(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("unchanged synchronization must not abort")
+
+    provider = FailIfCalledProvider(10)
+    store = FailIfCalledStore(manifest, events)
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(inventory)
+
+    assert result.status is IndexSyncStatus.UNCHANGED
+    assert result.total_chunks == len(current)
+    assert result.reused_chunks == len(current)
+    assert result.embedded_chunks == 0
+    assert result.inserted_chunks == 0
+    assert result.updated_chunks == 0
+    assert result.deleted_chunks == 0
+    assert provider.calls == []
+    assert events == [
+        ("inspect_active", "repo"),
+        ("read_manifest", store.old_snapshot),
+    ]
+
+
 @pytest.mark.parametrize(
     ("failure_stage", "failure"),
     (

@@ -85,6 +85,19 @@ class SemanticIndexer:
             raise EmbeddingVectorStoreConfigurationError(
                 _UNSUPPORTED_INDEX_STATE_MESSAGE
             )
+        if not diff.new and not diff.updated and not diff.deleted:
+            return IndexSyncResult(
+                repository_namespace=repository_namespace,
+                status=IndexSyncStatus.UNCHANGED,
+                total_chunks=len(current),
+                reused_chunks=len(diff.unchanged),
+                embedded_chunks=0,
+                inserted_chunks=0,
+                updated_chunks=0,
+                deleted_chunks=0,
+                embedding_identity=self._identity,
+                document_version=EMBEDDING_DOCUMENT_VERSION,
+            )
 
         candidate = self._store.begin_candidate(
             repository_namespace,
