@@ -13,13 +13,18 @@ from backend.code_chunker.models import (
 )
 from backend.code_parser.models import ParsedLanguage, SourceLocation, SymbolKind
 
-from .exceptions import EmbeddingInvalidResponseError, InvalidCodeChunkInventory
+from .exceptions import (
+    EmbeddingInvalidResponseError,
+    InvalidCodeChunkInventory,
+    InvalidSearchRequest,
+)
 from .models import EmbeddingDocument, EmbeddingModelIdentity, EmbeddingVector
 
 
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _INVALID_INVENTORY_MESSAGE = "Code chunk inventory contract is invalid."
 _INVALID_EMBEDDING_RESPONSE_MESSAGE = "Embedding provider response is invalid."
+_INVALID_SEARCH_REQUEST_MESSAGE = "Semantic search request is invalid."
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,3 +202,25 @@ def validate_embedding_batch(
     for vector in vectors:
         validate_embedding_vector(vector, identity)
     return vectors
+
+
+def validate_search_request(
+    repository_namespace: str,
+    query_text: str,
+    top_k: int,
+    max_query_chars: int,
+    max_top_k: int,
+) -> None:
+    """Reject malformed or unbounded semantic-search requests."""
+    if (
+        not isinstance(repository_namespace, str)
+        or not repository_namespace
+        or not isinstance(query_text, str)
+        or not query_text
+        or query_text.isspace()
+        or len(query_text) > max_query_chars
+        or type(top_k) is not int
+        or top_k < 1
+        or top_k > max_top_k
+    ):
+        raise InvalidSearchRequest(_INVALID_SEARCH_REQUEST_MESSAGE)
