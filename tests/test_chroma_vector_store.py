@@ -1,9 +1,11 @@
 """Chroma storage-schema and repository-isolation contracts."""
 
 from dataclasses import replace
+from hashlib import sha256
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -117,6 +119,346 @@ def _candidate_records() -> tuple[VectorRecord, VectorRecord]:
             (0.0, 1.0, 0.0),
         ),
     )
+
+
+def test_never_indexed_repository_has_explicit_inactive_state(tmp_path: Path) -> None:
+    state = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert state.indexed is False
+    assert state.snapshot is None
+
+
+def test_candidate_is_invisible_until_publish_and_active_survives_reopen(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    store.add_embedded(candidate, _candidate_records())
+    store.validate_candidate(candidate)
+
+    assert store.inspect_active(NAMESPACE).indexed is False
+
+    published = store.publish(candidate)
+    reopened_state = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert published.repository_namespace == NAMESPACE
+    assert reopened_state.indexed is True
+    assert reopened_state.snapshot is not None
+    assert reopened_state.snapshot.repository_namespace == NAMESPACE
+    assert reopened_state.snapshot.identity == IDENTITY
+    assert reopened_state.snapshot.document_version == "tracerag-embedding-document-v1"
+    assert reopened_state.snapshot.schema_version == STORAGE_SCHEMA_VERSION
+    assert reopened_state.snapshot.expected_chunk_count == 2
+
+
+def test_empty_state_is_published_and_distinct_from_never_indexed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        0,
+    )
+
+    store.validate_candidate(candidate)
+    store.publish(candidate)
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert reopened.indexed is True
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.expected_chunk_count == 0
+
+
+def test_add_reused_completes_candidate_without_core_vector_conversion(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    first = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    store.add_embedded(first, _candidate_records())
+    stored_records = store._read_candidate_manifest(first)
+    store.publish(first)
+    reused = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+
+    store.add_reused(reused, stored_records)
+    store.validate_candidate(reused)
+    store.publish(reused)
+
+    assert store._read_candidate_manifest(reused) == stored_records
+
+
+def test_candidate_validation_rejects_incomplete_logical_generation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    store.add_embedded(candidate, (_candidate_records()[0],))
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.validate_candidate(candidate)
+
+
+def test_publish_uses_canonical_checksummed_pointer_and_os_replace_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    store.add_embedded(old, _candidate_records())
+    store.publish(old)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v2",
+        0,
+    )
+    real_replace = os.replace
+    real_fsync = os.fsync
+    commit_events: list[str] = []
+    commit_observations: list[tuple[Path, Path]] = []
+
+    def observe_fsync(file_descriptor: int) -> None:
+        commit_events.append("fsync")
+        real_fsync(file_descriptor)
+
+    def observe_commit(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        active_before_commit = store.inspect_active(NAMESPACE)
+        assert active_before_commit.snapshot is not None
+        assert active_before_commit.snapshot.document_version == (
+            "tracerag-embedding-document-v1"
+        )
+        assert source_path.parent == destination_path.parent
+        commit_observations.append((source_path, destination_path))
+        commit_events.append("replace")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(os, "fsync", observe_fsync)
+    monkeypatch.setattr(os, "replace", observe_commit)
+    published = store.publish(candidate)
+    pointer_path = store._active_pointer_path(NAMESPACE)
+    pointer_bytes = pointer_path.read_bytes()
+    envelope = json.loads(pointer_bytes)
+    canonical_payload = json.dumps(
+        envelope["payload"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert len(commit_observations) == 1
+    assert commit_events == ["fsync", "replace"]
+    assert commit_observations[0][1] == pointer_path
+    assert set(envelope) == {"payload", "sha256"}
+    assert set(envelope["payload"]) == {
+        "schema_version",
+        "repository_namespace",
+        "active_collection",
+    }
+    assert envelope["sha256"] == sha256(canonical_payload).hexdigest()
+    assert pointer_bytes == json.dumps(
+        envelope,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert published.document_version == "tracerag-embedding-document-v2"
+
+
+def test_reopen_uses_published_pointer_not_newer_candidate_or_collection_order(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    published = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "published-document-version",
+        0,
+    )
+    store.publish(published)
+    abandoned = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "newer-unpublished-document-version",
+        0,
+    )
+    store.validate_candidate(abandoned)
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "published-document-version"
+
+
+def test_abort_removes_only_unpublished_candidate_and_never_active(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    active = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "active-document-version",
+        0,
+    )
+    store.publish(active)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "candidate-document-version",
+        0,
+    )
+    candidate_name = store._candidate_collection_name(candidate)
+
+    store.abort(candidate)
+    store.abort(active)
+
+    reopened = _store(tmp_path).inspect_active(NAMESPACE)
+    assert reopened.snapshot is not None
+    assert reopened.snapshot.document_version == "active-document-version"
+    assert candidate_name not in {collection.name for collection in store._client.list_collections()}
+
+
+def test_active_pointer_requires_canonical_json_and_valid_checksum(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+    store.publish(candidate)
+    pointer_path = store._active_pointer_path(NAMESPACE)
+
+    pointer_path.write_bytes(pointer_path.read_bytes() + b"\n")
+    with pytest.raises(VectorStoreCorruptionError):
+        store.inspect_active(NAMESPACE)
+
+    pointer_path.write_bytes(
+        store._active_pointer_bytes(NAMESPACE, store._candidate_collection_name(candidate))
+    )
+    envelope = json.loads(pointer_path.read_bytes())
+    envelope["sha256"] = "0" * 64
+    pointer_path.write_bytes(store._canonical_json(envelope))
+    with pytest.raises(VectorStoreCorruptionError):
+        store.inspect_active(NAMESPACE)
+
+
+def test_active_pointer_missing_target_is_corruption_not_not_indexed(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    missing = store._collection_identifier(NAMESPACE, "missinggeneration")
+    store._active_pointer_path(NAMESPACE).write_bytes(
+        store._active_pointer_bytes(NAMESPACE, missing)
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.inspect_active(NAMESPACE)
+
+
+def test_active_pointer_rejects_non_adapter_locator_even_with_valid_checksum(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store._active_pointer_path(NAMESPACE).write_bytes(
+        store._active_pointer_bytes(NAMESPACE, "foreign-collection")
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.inspect_active(NAMESPACE)
+
+
+def test_inspect_active_validates_the_published_manifest(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 2)
+    store.add_embedded(candidate, _candidate_records())
+    store.publish(candidate)
+    active = store.inspect_active(NAMESPACE)
+    assert active.snapshot is not None
+    collection = store._client.get_collection(
+        name=active.snapshot._token, embedding_function=None
+    )
+    collection.update(
+        ids=[_candidate_records()[0].chunk_id], metadatas=[{"unexpected": "x"}]
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.inspect_active(NAMESPACE)
+
+
+def test_add_embedded_prevalidates_all_records_before_candidate_mutation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 2)
+
+    with pytest.raises(VectorStoreWriteError):
+        store.add_embedded(candidate, (_candidate_records()[0], object()))  # type: ignore[arg-type]
+
+    assert store._candidate_collection(candidate).count() == 0
+
+
+def test_add_reused_prevalidates_all_records_before_candidate_mutation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 2)
+    malformed = StoredRecord(
+        NAMESPACE,
+        "a" * 64,
+        "b" * 64,
+        "src/main.py",
+        "python",
+        "symbol",
+        None,
+        None,
+        None,
+        "content",
+        EmbeddingVector((1.0,)),
+        IDENTITY,
+        "document-v1",
+        STORAGE_SCHEMA_VERSION,
+    )
+    valid = StoredRecord(
+        NAMESPACE,
+        _candidate_records()[1].chunk_id,
+        _candidate_records()[1].content_hash,
+        "src/main.py",
+        "python",
+        "symbol",
+        None,
+        None,
+        None,
+        "content",
+        EmbeddingVector((0.0, 1.0, 0.0)),
+        IDENTITY,
+        "document-v1",
+        STORAGE_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(VectorStoreWriteError):
+        store.add_reused(candidate, (malformed, valid))
+
+    assert store._candidate_collection(candidate).count() == 0
 
 
 def test_persistence_root_is_mandatory_resolved_and_not_inventory_inferred(
