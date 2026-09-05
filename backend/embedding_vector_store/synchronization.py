@@ -78,7 +78,13 @@ class SemanticIndexer:
                 snapshot.identity == self._identity,
                 snapshot.document_version == EMBEDDING_DOCUMENT_VERSION,
             )
-        if not diff.new and not diff.updated and not diff.deleted:
+        if (
+            snapshot is not None
+            and diff.compatible
+            and not diff.new
+            and not diff.updated
+            and not diff.deleted
+        ):
             return IndexSyncResult(
                 repository_namespace=repository_namespace,
                 status=IndexSyncStatus.UNCHANGED,

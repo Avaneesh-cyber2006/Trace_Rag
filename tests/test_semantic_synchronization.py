@@ -135,6 +135,23 @@ class _RecordingProvider:
         raise AssertionError("synchronization must not embed queries")
 
 
+class _FailIfCalledProvider(_RecordingProvider):
+    def __init__(self) -> None:
+        super().__init__(10)
+        self.document_calls = 0
+        self.query_calls = 0
+
+    def embed_documents(
+        self, documents: tuple[object, ...]
+    ) -> tuple[EmbeddingVector, ...]:
+        self.document_calls += 1
+        raise AssertionError("empty synchronization must not embed documents")
+
+    def embed_query(self, query_text: str) -> EmbeddingVector:
+        self.query_calls += 1
+        raise AssertionError("synchronization must not embed queries")
+
+
 class _RecordingStore:
     def __init__(
         self,
@@ -549,6 +566,10 @@ def _changed_compatible_inventory(
     return inventory, current, manifest
 
 
+def _empty_inventory() -> CodeChunkInventory:
+    return CodeChunkInventory(".", "repo", 0, 0, 0, 0, 0, ())
+
+
 def test_semantic_indexer_orchestration_builds_and_publishes_complete_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -731,6 +752,128 @@ def test_first_index_embeds_every_current_chunk_without_reused_records():
     assert result.reused_chunks + result.embedded_chunks == result.total_chunks
     assert ("add_reused", ()) in events
     assert ("embed_documents", current_ids) in events
+
+
+def test_never_indexed_empty_inventory_publishes_zero_count_candidate():
+    events: list[object] = []
+    provider = _FailIfCalledProvider()
+    store = _RecordingStore((), events)
+    store.active_snapshot = None
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(_empty_inventory())
+
+    assert result.status is IndexSyncStatus.SUCCESS
+    assert result.total_chunks == 0
+    assert result.reused_chunks == 0
+    assert result.embedded_chunks == 0
+    assert result.inserted_chunks == 0
+    assert result.updated_chunks == 0
+    assert result.deleted_chunks == 0
+    assert provider.document_calls == 0
+    assert provider.query_calls == 0
+    assert events == [
+        ("inspect_active", "repo"),
+        (
+            "begin_candidate",
+            "repo",
+            IDENTITY,
+            EMBEDDING_DOCUMENT_VERSION,
+            0,
+        ),
+        ("add_reused", ()),
+        ("add_embedded", ()),
+        "validate_candidate",
+        "publish",
+    ]
+    assert store.active_snapshot is not None
+    assert store.active_snapshot.expected_chunk_count == 0
+
+
+def test_active_nonempty_empty_inventory_publishes_replacement_and_counts_deletions():
+    events: list[object] = []
+    manifest = (
+        _stored("a" * 64, "b" * 64),
+        _stored("c" * 64, "d" * 64),
+    )
+    provider = _FailIfCalledProvider()
+    store = _RecordingStore(manifest, events)
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(_empty_inventory())
+
+    assert result.status is IndexSyncStatus.SUCCESS
+    assert result.total_chunks == 0
+    assert result.reused_chunks == 0
+    assert result.embedded_chunks == 0
+    assert result.inserted_chunks == 0
+    assert result.updated_chunks == 0
+    assert result.deleted_chunks == len(manifest)
+    assert provider.document_calls == 0
+    assert provider.query_calls == 0
+    assert events == [
+        ("inspect_active", "repo"),
+        ("read_manifest", store.old_snapshot),
+        (
+            "begin_candidate",
+            "repo",
+            IDENTITY,
+            EMBEDDING_DOCUMENT_VERSION,
+            0,
+        ),
+        ("add_reused", ()),
+        ("add_embedded", ()),
+        "validate_candidate",
+        "publish",
+    ]
+    assert store.active_snapshot is not store.old_snapshot
+    assert store.active_snapshot.expected_chunk_count == 0
+
+
+def test_active_compatible_empty_empty_inventory_returns_unchanged():
+    events: list[object] = []
+    provider = _FailIfCalledProvider()
+
+    class FailIfMutatedStore(_RecordingStore):
+        def begin_candidate(self, *args: object, **kwargs: object) -> CandidateIndex:
+            raise AssertionError("compatible empty synchronization must not create a candidate")
+
+        def add_reused(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("compatible empty synchronization must not write reused records")
+
+        def add_embedded(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("compatible empty synchronization must not write embedded records")
+
+        def validate_candidate(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("compatible empty synchronization must not validate a candidate")
+
+        def publish(self, *args: object, **kwargs: object) -> RepositoryIndexSnapshot:
+            raise AssertionError("compatible empty synchronization must not publish")
+
+        def abort(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("compatible empty synchronization must not abort")
+
+    store = FailIfMutatedStore((), events)
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(_empty_inventory())
+
+    assert result.status is IndexSyncStatus.UNCHANGED
+    assert result.total_chunks == 0
+    assert result.reused_chunks == 0
+    assert result.embedded_chunks == 0
+    assert result.inserted_chunks == 0
+    assert result.updated_chunks == 0
+    assert result.deleted_chunks == 0
+    assert provider.document_calls == 0
+    assert provider.query_calls == 0
+    assert events == [
+        ("inspect_active", "repo"),
+        ("read_manifest", store.old_snapshot),
+    ]
 
 
 def test_semantic_indexer_unchanged_fast_path_skips_provider_and_store_mutations():
