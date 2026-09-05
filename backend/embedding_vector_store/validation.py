@@ -49,20 +49,20 @@ def _invalid() -> None:
 
 
 def _is_lowercase_sha256(value: object) -> bool:
-    return isinstance(value, str) and _LOWERCASE_SHA256.fullmatch(value) is not None
+    return type(value) is str and _LOWERCASE_SHA256.fullmatch(value) is not None
 
 
 def _is_optional_nonempty_string(value: object) -> bool:
-    return value is None or (isinstance(value, str) and bool(value))
+    return value is None or (type(value) is str and bool(value))
 
 
 def _is_nonempty_string(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
+    return type(value) is str and bool(value)
 
 
 def _is_posix_relative_path(value: object) -> bool:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or not value
         or "\x00" in value
         or "\\" in value
@@ -253,7 +253,8 @@ def validate_and_normalize_search_results(
             raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
         try:
             valid = (
-                result.repository_namespace == repository_namespace
+                _is_nonempty_string(result.repository_namespace)
+                and result.repository_namespace == repository_namespace
                 and _is_lowercase_sha256(result.chunk_id)
                 and _is_lowercase_sha256(result.content_hash)
                 and _is_posix_relative_path(result.relative_path)

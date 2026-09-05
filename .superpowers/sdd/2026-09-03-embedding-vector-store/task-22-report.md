@@ -17,6 +17,14 @@
 - Full semantic-search suite: `88 passed`.
 - Adjacent semantic-search, validation, public-model, vector-store-contract, and Chroma-store suites: `350 passed`.
 
+## Review Fix Evidence
+
+- RED hostile-subclass selector: `13 failed, 88 deselected`; ten store-provided string subclasses were accepted, and hostile namespace equality, chunk-ID hashing, and path ordering each escaped as `RuntimeError`.
+- Exact primitive-type validation now rejects every string field before equality, hashing, public-model construction, or sorting.
+- Focused hostile-subclass GREEN selector: `13 passed, 88 deselected`.
+- Fresh full semantic-search suite: `101 passed`.
+- Fresh combined semantic-search, validation, public-model, vector-store-contract, and Chroma-store suites: `363 passed`.
+
 ## Self-review
 
 - Confirmed the entire tuple is validated before any public result is constructed.

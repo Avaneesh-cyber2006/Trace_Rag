@@ -202,6 +202,25 @@ def _corrupt_result(attribute: str, invalid_value: object) -> StoreSearchResult:
     return result
 
 
+class _StringSubclass(str):
+    pass
+
+
+class _HostileEqualityString(str):
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("hostile equality")
+
+
+class _HostileHashString(str):
+    def __hash__(self) -> int:
+        raise RuntimeError("hostile hash")
+
+
+class _HostileCasefoldString(str):
+    def casefold(self) -> str:
+        raise RuntimeError("hostile ordering")
+
+
 @pytest.mark.parametrize("repository_namespace", [None, 0, False, ""])
 def test_request_rejects_invalid_repository_namespace(
     repository_namespace: object,
@@ -503,6 +522,52 @@ def test_corrupt_result_metadata_content_hashes_and_scores_fail_closed(
             (valid_result, corrupt_result),
             "repo",
             2,
+        )
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "repository_namespace",
+        "chunk_id",
+        "content_hash",
+        "relative_path",
+        "language",
+        "chunk_kind",
+        "symbol_kind",
+        "qualified_name",
+        "parent_qualified_name",
+        "content",
+    ],
+)
+def test_result_normalization_rejects_string_subclasses(attribute: str) -> None:
+    result = _store_result()
+    original_value = getattr(result, attribute)
+    if original_value is None:
+        original_value = "parent"
+    object.__setattr__(result, attribute, _StringSubclass(original_value))
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(
+            (result,), "repo", 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value"),
+    [
+        ("repository_namespace", _HostileEqualityString("repo")),
+        ("chunk_id", _HostileHashString("a" * 64)),
+        ("relative_path", _HostileCasefoldString("src/example.py")),
+    ],
+)
+def test_hostile_primitive_subclasses_fail_as_store_corruption(
+    attribute: str,
+    invalid_value: object,
+) -> None:
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(
+            (_corrupt_result(attribute, invalid_value),), "repo", 1
         )
 
 
