@@ -15,7 +15,7 @@ from typing import Iterable
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.errors import ChromaError
+from chromadb.errors import ChromaError, NotFoundError
 
 from ..exceptions import (
     EmbeddingVectorStoreConfigurationError,
@@ -277,20 +277,13 @@ class ChromaVectorStore:
     def _snapshot_for_collection(
         self, repository_namespace: str, collection_name: str
     ) -> RepositoryIndexSnapshot:
-        if not self._is_collection_locator(repository_namespace, collection_name):
-            _raise_corruption()
-        try:
-            collection = self._client.get_collection(
-                name=collection_name, embedding_function=None
-            )
-            snapshot = self._decode_snapshot_metadata(
-                repository_namespace, collection.metadata, collection_name
-            )
-            count = collection.count()
-        except VectorStoreCorruptionError:
-            raise
-        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        collection = self._read_collection(repository_namespace, collection_name)
+        snapshot = self._decode_snapshot_metadata(
+            repository_namespace,
+            self._read_collection_metadata(collection),
+            collection_name,
+        )
+        count = self._read_collection_count(collection)
         if type(count) is not int or count != snapshot.expected_chunk_count:
             _raise_corruption()
         self._read_manifest_from_collection(
@@ -313,6 +306,43 @@ class ChromaVectorStore:
             snapshot=self._snapshot_for_collection(repository_namespace, collection_name),
         )
 
+    def _read_collection(self, repository_namespace: str, collection_name: object):
+        """Open one adapter-owned collection, separating outage from corruption."""
+        if not self._is_collection_locator(repository_namespace, collection_name):
+            _raise_corruption()
+        try:
+            return self._client.get_collection(
+                name=collection_name, embedding_function=None
+            )
+        except NotFoundError as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        except (ChromaError, OSError, RuntimeError) as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+        except (TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+    @staticmethod
+    def _read_collection_metadata(collection: object) -> object:
+        try:
+            return collection.metadata
+        except NotFoundError as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        except (ChromaError, OSError, RuntimeError) as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+        except (TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+    @staticmethod
+    def _read_collection_count(collection: object) -> object:
+        try:
+            return collection.count()
+        except NotFoundError as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        except (ChromaError, OSError, RuntimeError) as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+        except (TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
     def begin_candidate(
         self,
         repository_namespace: str,
@@ -334,6 +364,36 @@ class ChromaVectorStore:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE) from error
         self._create_candidate_collection(candidate)
         return candidate
+
+    def read_manifest(
+        self, snapshot: RepositoryIndexSnapshot
+    ) -> tuple[StoredRecord, ...]:
+        """Read one explicit snapshot without consulting the active pointer."""
+        if not isinstance(snapshot, RepositoryIndexSnapshot):
+            raise VectorStoreReadError(_READ_MESSAGE)
+        collection = self._read_collection(
+            snapshot.repository_namespace, snapshot._token
+        )
+        decoded = self._decode_snapshot_metadata(
+            snapshot.repository_namespace,
+            self._read_collection_metadata(collection),
+            snapshot._token,
+        )
+        if (
+            decoded.identity != snapshot.identity
+            or decoded.document_version != snapshot.document_version
+            or decoded.schema_version != snapshot.schema_version
+            or decoded.expected_chunk_count != snapshot.expected_chunk_count
+        ):
+            _raise_corruption()
+        return self._read_manifest_from_collection(
+            snapshot.repository_namespace,
+            snapshot.identity,
+            snapshot.document_version,
+            snapshot.schema_version,
+            snapshot.expected_chunk_count,
+            collection,
+        )
 
     def _encode_record(self, record: StoredRecord) -> dict[str, object]:
         if not isinstance(record, StoredRecord):
@@ -669,10 +729,7 @@ class ChromaVectorStore:
         collection: object,
     ) -> tuple[StoredRecord, ...]:
         """Read every record after exact evidence and completeness validation."""
-        try:
-            count = collection.count()
-        except (ChromaError, RuntimeError, TypeError, ValueError) as error:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        count = self._read_collection_count(collection)
         if type(count) is not int or count != expected_chunk_count:
             _raise_corruption()
 
@@ -690,7 +747,11 @@ class ChromaVectorStore:
                 documents = page["documents"]
                 embeddings = page["embeddings"]
                 metadatas = page["metadatas"]
-            except (ChromaError, KeyError, RuntimeError, TypeError, ValueError) as error:
+            except NotFoundError as error:
+                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+            except (ChromaError, OSError, RuntimeError) as error:
+                raise VectorStoreReadError(_READ_MESSAGE) from error
+            except (KeyError, TypeError, ValueError) as error:
                 raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
             if isinstance(embeddings, (str, bytes)) or not isinstance(
                 embeddings, Iterable

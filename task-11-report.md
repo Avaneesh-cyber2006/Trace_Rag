@@ -84,3 +84,42 @@ is intentionally not part of publication correctness. The capability gate's
 single-process/local-persistence-root concurrency limitation remains unchanged.
 No Gemini request, credential, source content outside synthetic fixtures, or
 Task 12 failure-resolution behavior was added.
+
+## Fix round 1: validated explicit manifest reads and outage mapping
+
+The focused RED selector was:
+
+```text
+python -m pytest tests/test_chroma_vector_store.py -q -k "read_manifest or read_outage"
+4 failed, 71 deselected
+```
+
+Failures showed the missing protocol method and generic backend `RuntimeError`
+being translated to `VectorStoreCorruptionError`.
+
+The fix adds public `read_manifest(snapshot)`. It resolves only the snapshot's
+opaque collection token, validates the physical locator and complete control
+metadata against the supplied snapshot, then returns the fully validated
+manifest. It never reads the current active pointer, so an older snapshot can
+be reused after a newer generation is published.
+
+Read paths now distinguish missing targets and malformed persisted values
+(`VectorStoreCorruptionError`) from Chroma/OSError/runtime backend outages
+(`VectorStoreReadError`) with a fixed sanitized message.
+
+Fix GREEN results:
+
+```text
+python -m pytest tests/test_chroma_vector_store.py -q -k "candidate or active or publish or empty_state or read_manifest or read_outage"
+31 passed, 44 deselected
+
+python -m pytest tests/test_chroma_vector_store.py tests/capability/test_module5_dependency_capabilities.py tests/test_vector_store_contract.py -q
+132 passed, 1 warning
+```
+
+The warning remains the pre-existing Chroma legacy embedding-function
+configuration deprecation warning. Updated files are
+`backend/embedding_vector_store/stores/chroma.py`,
+`tests/test_chroma_vector_store.py`, and this report. Remaining concerns are
+unchanged: cleanup is deferred maintenance, and the capability gate supports a
+single owning process/local persistence root rather than distributed locking.

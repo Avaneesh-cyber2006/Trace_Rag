@@ -16,6 +16,7 @@ import pytest
 from backend.embedding_vector_store.exceptions import (
     VectorStoreConfigurationError,
     VectorStoreCorruptionError,
+    VectorStoreReadError,
     VectorStoreWriteError,
 )
 from backend.embedding_vector_store.models import (
@@ -459,6 +460,78 @@ def test_add_reused_prevalidates_all_records_before_candidate_mutation(
         store.add_reused(candidate, (malformed, valid))
 
     assert store._candidate_collection(candidate).count() == 0
+
+
+def test_read_manifest_uses_snapshot_token_not_current_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    first = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 2)
+    store.add_embedded(first, _candidate_records())
+    store.publish(first)
+    first_snapshot = store.inspect_active(NAMESPACE).snapshot
+    assert first_snapshot is not None
+
+    second = store.begin_candidate(NAMESPACE, IDENTITY, "document-v2", 0)
+    store.publish(second)
+    monkeypatch.setattr(
+        store,
+        "_read_active_collection_name",
+        lambda namespace: (_ for _ in ()).throw(AssertionError("pointer consulted")),
+    )
+
+    manifest = store.read_manifest(first_snapshot)
+
+    assert tuple(record.chunk_id for record in manifest) == ("c" * 64, "e" * 64)
+    assert all(record.document_version == "document-v1" for record in manifest)
+
+
+def test_read_manifest_rejects_snapshot_control_mismatch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 2)
+    store.add_embedded(candidate, _candidate_records())
+    store.publish(candidate)
+    snapshot = store.inspect_active(NAMESPACE).snapshot
+    assert snapshot is not None
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.read_manifest(replace(snapshot, document_version="document-v2"))
+
+
+def test_inspect_active_maps_backend_read_outage_to_typed_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+    store.publish(candidate)
+
+    def fail_get_collection(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("backend unavailable: secret detail")
+
+    monkeypatch.setattr(store._client, "get_collection", fail_get_collection)
+
+    with pytest.raises(VectorStoreReadError, match="^Vector store data could not be read\\.$"):
+        store.inspect_active(NAMESPACE)
+
+
+def test_read_manifest_maps_backend_chroma_outage_to_typed_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+    store.publish(candidate)
+    snapshot = store.inspect_active(NAMESPACE).snapshot
+    assert snapshot is not None
+
+    def fail_get_collection(*args: object, **kwargs: object) -> object:
+        from chromadb.errors import ChromaError
+
+        raise ChromaError("backend unavailable: secret detail")
+
+    monkeypatch.setattr(store._client, "get_collection", fail_get_collection)
+
+    with pytest.raises(VectorStoreReadError, match="^Vector store data could not be read\\.$"):
+        store.read_manifest(snapshot)
 
 
 def test_persistence_root_is_mandatory_resolved_and_not_inventory_inferred(
