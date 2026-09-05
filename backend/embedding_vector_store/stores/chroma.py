@@ -31,6 +31,7 @@ from .base import (
     CandidateIndex,
     RepositoryIndexSnapshot,
     RepositoryIndexState,
+    StoreSearchResult,
     StoredRecord,
 )
 
@@ -76,6 +77,7 @@ _WRITE_MESSAGE = "Vector store record is invalid."
 _PUBLICATION_MESSAGE = "Vector store publication failed."
 _READ_MESSAGE = "Vector store data could not be read."
 _MANIFEST_PAGE_SIZE = 100
+_COSINE_DISTANCE_ENDPOINT_TOLERANCE = 1e-6
 _POINTER_KEYS = frozenset({"payload", "sha256"})
 _POINTER_PAYLOAD_KEYS = frozenset(
     {"schema_version", "repository_namespace", "active_collection"}
@@ -171,6 +173,24 @@ def _project_embedding_values(
     if not all(math.isfinite(value) for value in projected):
         raise VectorStoreWriteError(_WRITE_MESSAGE)
     return EmbeddingVector(projected)
+
+
+def _score_from_cosine_distance(distance: object) -> float:
+    if isinstance(distance, bool) or not isinstance(distance, Real):
+        _raise_corruption()
+    try:
+        normalized = float(distance)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+    if not math.isfinite(normalized):
+        _raise_corruption()
+    if abs(normalized) <= _COSINE_DISTANCE_ENDPOINT_TOLERANCE:
+        normalized = 0.0
+    elif abs(normalized - 2.0) <= _COSINE_DISTANCE_ENDPOINT_TOLERANCE:
+        normalized = 2.0
+    elif not 0.0 <= normalized <= 2.0:
+        _raise_corruption()
+    return 1.0 - normalized / 2.0
 
 
 class ChromaVectorStore:
@@ -397,6 +417,122 @@ class ChromaVectorStore:
             collection,
         )
 
+    def search(
+        self,
+        snapshot: RepositoryIndexSnapshot,
+        query: EmbeddingVector,
+        top_k: int,
+    ) -> tuple[StoreSearchResult, ...]:
+        """Search one explicit immutable snapshot using cosine distance."""
+        if (
+            not isinstance(snapshot, RepositoryIndexSnapshot)
+            or not isinstance(query, EmbeddingVector)
+            or type(top_k) is not int
+            or top_k <= 0
+        ):
+            raise VectorStoreReadError(_READ_MESSAGE)
+        try:
+            query_values = _validated_embedding_values(query.values, snapshot.identity)
+        except VectorStoreCorruptionError as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+
+        collection = self._read_collection(
+            snapshot.repository_namespace, snapshot._token
+        )
+        decoded_snapshot = self._decode_snapshot_metadata(
+            snapshot.repository_namespace,
+            self._read_collection_metadata(collection),
+            snapshot._token,
+        )
+        if (
+            decoded_snapshot.identity != snapshot.identity
+            or decoded_snapshot.document_version != snapshot.document_version
+            or decoded_snapshot.schema_version != snapshot.schema_version
+            or decoded_snapshot.expected_chunk_count != snapshot.expected_chunk_count
+        ):
+            _raise_corruption()
+        count = self._read_collection_count(collection)
+        if type(count) is not int or count != snapshot.expected_chunk_count:
+            _raise_corruption()
+        if count == 0:
+            return ()
+
+        n_results = min(top_k, count)
+        try:
+            query_result = collection.query(
+                query_embeddings=[list(query_values)],
+                n_results=n_results,
+                include=["documents", "metadatas", "distances"],
+            )
+            identifiers = query_result["ids"]
+            documents = query_result["documents"]
+            metadatas = query_result["metadatas"]
+            distances = query_result["distances"]
+        except NotFoundError as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        except (ChromaError, OSError, RuntimeError) as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+        rows: list[object] = []
+        for value in (identifiers, documents, metadatas, distances):
+            if not isinstance(value, list) or len(value) != 1:
+                _raise_corruption()
+            row = value[0]
+            if not isinstance(row, list):
+                _raise_corruption()
+            rows.append(row)
+        identifier_row, document_row, metadata_row, distance_row = rows
+        result_count = len(identifier_row)  # type: ignore[arg-type]
+        if (
+            result_count > n_results
+            or len(document_row) != result_count  # type: ignore[arg-type]
+            or len(metadata_row) != result_count  # type: ignore[arg-type]
+            or len(distance_row) != result_count  # type: ignore[arg-type]
+        ):
+            _raise_corruption()
+
+        results: list[StoreSearchResult] = []
+        for identifier, document, metadata, distance in zip(
+            identifier_row,  # type: ignore[arg-type]
+            document_row,  # type: ignore[arg-type]
+            metadata_row,  # type: ignore[arg-type]
+            distance_row,  # type: ignore[arg-type]
+            strict=True,
+        ):
+            identity = self._validated_record_evidence(
+                snapshot.repository_namespace,
+                identifier=identifier,
+                document=document,
+                metadata=metadata,
+            )
+            if (
+                identity != snapshot.identity
+                or metadata["document_version"] != snapshot.document_version
+                or metadata["schema_version"] != snapshot.schema_version
+            ):
+                _raise_corruption()
+            try:
+                results.append(
+                    StoreSearchResult(
+                        repository_namespace=snapshot.repository_namespace,
+                        chunk_id=identifier,
+                        content_hash=metadata["content_hash"],
+                        relative_path=metadata["relative_path"],
+                        language=metadata["language"],
+                        chunk_kind=metadata["chunk_kind"],
+                        symbol_kind=metadata.get("symbol_kind"),
+                        qualified_name=metadata.get("qualified_name"),
+                        parent_qualified_name=metadata.get("parent_qualified_name"),
+                        content=document,
+                        score=_score_from_cosine_distance(distance),
+                    )
+                )
+            except (EmbeddingVectorStoreConfigurationError, ValueError) as error:
+                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        return tuple(results)
+
     def _encode_record(self, record: StoredRecord) -> dict[str, object]:
         if not isinstance(record, StoredRecord):
             raise VectorStoreWriteError(_WRITE_MESSAGE)
@@ -436,6 +572,41 @@ class ChromaVectorStore:
         document: object,
         metadata: object,
     ) -> StoredRecord:
+        identity = self._validated_record_evidence(
+            repository_namespace,
+            identifier=identifier,
+            document=document,
+            metadata=metadata,
+        )
+        normalized_values = _validated_embedding_values(embedding, identity)
+        try:
+            return StoredRecord(
+                repository_namespace=repository_namespace,
+                chunk_id=identifier,  # type: ignore[arg-type]
+                content_hash=metadata["content_hash"],  # type: ignore[index,arg-type]
+                relative_path=metadata["relative_path"],  # type: ignore[index,arg-type]
+                language=metadata["language"],  # type: ignore[index,arg-type]
+                chunk_kind=metadata["chunk_kind"],  # type: ignore[index,arg-type]
+                symbol_kind=metadata.get("symbol_kind"),  # type: ignore[union-attr,arg-type]
+                qualified_name=metadata.get("qualified_name"),  # type: ignore[union-attr,arg-type]
+                parent_qualified_name=metadata.get("parent_qualified_name"),  # type: ignore[union-attr,arg-type]
+                content=document,  # type: ignore[arg-type]
+                embedding=EmbeddingVector(tuple(normalized_values)),
+                embedding_identity=identity,
+                document_version=metadata["document_version"],  # type: ignore[index,arg-type]
+                schema_version=STORAGE_SCHEMA_VERSION,
+            )
+        except (EmbeddingVectorStoreConfigurationError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+    def _validated_record_evidence(
+        self,
+        repository_namespace: str,
+        *,
+        identifier: object,
+        document: object,
+        metadata: object,
+    ) -> EmbeddingModelIdentity:
         if not _is_nonempty_string(repository_namespace) or type(metadata) is not dict:
             _raise_corruption()
         keys = frozenset(metadata)
@@ -459,27 +630,7 @@ class ChromaVectorStore:
         for key in _RECORD_OPTIONAL_KEYS:
             if key in metadata and not _is_nonempty_string(metadata[key]):
                 _raise_corruption()
-        identity = _identity_from_metadata(metadata)
-        normalized_values = _validated_embedding_values(embedding, identity)
-        try:
-            return StoredRecord(
-                repository_namespace=repository_namespace,
-                chunk_id=identifier,
-                content_hash=metadata["content_hash"],  # type: ignore[arg-type]
-                relative_path=metadata["relative_path"],  # type: ignore[arg-type]
-                language=metadata["language"],  # type: ignore[arg-type]
-                chunk_kind=metadata["chunk_kind"],  # type: ignore[arg-type]
-                symbol_kind=metadata.get("symbol_kind"),  # type: ignore[arg-type]
-                qualified_name=metadata.get("qualified_name"),  # type: ignore[arg-type]
-                parent_qualified_name=metadata.get("parent_qualified_name"),  # type: ignore[arg-type]
-                content=document,
-                embedding=EmbeddingVector(tuple(normalized_values)),
-                embedding_identity=identity,
-                document_version=metadata["document_version"],  # type: ignore[arg-type]
-                schema_version=STORAGE_SCHEMA_VERSION,
-            )
-        except (EmbeddingVectorStoreConfigurationError, ValueError) as error:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+        return _identity_from_metadata(metadata)
 
     def _encode_control_metadata(
         self, handle: RepositoryIndexSnapshot | CandidateIndex

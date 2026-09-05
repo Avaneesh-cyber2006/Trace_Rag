@@ -29,6 +29,7 @@ from backend.embedding_vector_store.models import (
 from backend.embedding_vector_store.stores.base import (
     CandidateIndex,
     RepositoryIndexSnapshot,
+    StoreSearchResult,
     StoredRecord,
 )
 from backend.embedding_vector_store.stores.chroma import (
@@ -1205,3 +1206,261 @@ def test_direct_chroma_query_uses_persisted_external_embedding_field(tmp_path: P
 
     assert result["ids"][0][0] == records[0].chunk_id
     assert abs(result["distances"][0][0]) <= 1e-6
+
+
+def test_search_converts_cosine_landmarks_and_decodes_exact_evidence(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        4,
+    )
+    records = (
+        _vector_record("1" * 64, "2" * 64, "identical\r\n", (1.0, 0.0, 0.0)),
+        _vector_record("3" * 64, "4" * 64, "intermediate λ\n", (1.0, 1.0, 0.0)),
+        _vector_record("5" * 64, "6" * 64, "orthogonal\n", (0.0, 1.0, 0.0)),
+        _vector_record("7" * 64, "8" * 64, "opposite\n", (-1.0, 0.0, 0.0)),
+    )
+    store.add_embedded(candidate, records)
+    snapshot = store.publish(candidate)
+
+    results = store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 4)
+
+    by_id = {result.chunk_id: result for result in results}
+    assert tuple(result.score for result in results) == tuple(
+        sorted((result.score for result in results), reverse=True)
+    )
+    assert by_id["1" * 64].score == 1.0
+    assert by_id["3" * 64].score == pytest.approx(
+        0.8535533905932737, abs=1e-6
+    )
+    assert by_id["5" * 64].score == pytest.approx(0.5, abs=1e-6)
+    assert by_id["7" * 64].score == 0.0
+    assert by_id["1" * 64] == StoreSearchResult(
+        repository_namespace=NAMESPACE,
+        chunk_id="1" * 64,
+        content_hash="2" * 64,
+        relative_path="src/資料/δelta.py",
+        language="python",
+        chunk_kind="symbol",
+        symbol_kind="function",
+        qualified_name="資料.計算",
+        parent_qualified_name="資料",
+        content="identical\r\n",
+        score=1.0,
+    )
+    for private_name in (
+        "distance",
+        "embedding",
+        "vector",
+        "generation",
+        "collection",
+        "_token",
+    ):
+        assert not hasattr(by_id["1" * 64], private_name)
+
+
+def test_search_uses_chroma_authoritative_persisted_binary32_vector(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    records = (
+        _vector_record("1" * 64, "2" * 64, "ordinary", (0.1, -0.2, 0.3)),
+        _vector_record("3" * 64, "4" * 64, "other", (-0.7, -1.1, 0.9)),
+    )
+    store.add_embedded(candidate, records)
+    snapshot = store.publish(candidate)
+    collection = store._read_collection(NAMESPACE, snapshot._token)
+    persisted = tuple(
+        float(value)
+        for value in collection.get(
+            ids=[records[0].chunk_id], include=["embeddings"]
+        )["embeddings"][0]
+    )
+
+    results = store.search(snapshot, EmbeddingVector(persisted), 1)
+
+    assert persisted != records[0].embedding.values
+    assert tuple(result.chunk_id for result in results) == (records[0].chunk_id,)
+    assert results[0].score == 1.0
+
+
+def test_search_queries_only_supplied_snapshot_and_bounds_n_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        2,
+    )
+    store.add_embedded(candidate, _candidate_records())
+    snapshot = store.publish(candidate)
+    collection = store._read_collection(NAMESPACE, snapshot._token)
+    query_calls: list[dict[str, object]] = []
+    original_query = collection.query
+
+    def recording_query(**kwargs: object) -> object:
+        query_calls.append(kwargs)
+        return original_query(**kwargs)
+
+    monkeypatch.setattr(collection, "query", recording_query)
+
+    def read_only_snapshot_collection(
+        repository_namespace: str, collection_name: object
+    ) -> object:
+        assert repository_namespace == snapshot.repository_namespace
+        assert collection_name == snapshot._token
+        return collection
+
+    monkeypatch.setattr(store, "_read_collection", read_only_snapshot_collection)
+    monkeypatch.setattr(
+        store,
+        "_read_active_collection_name",
+        lambda namespace: (_ for _ in ()).throw(AssertionError("pointer consulted")),
+    )
+
+    results = store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
+
+    assert len(results) == 1
+    assert query_calls == [
+        {
+            "query_embeddings": [[1.0, 0.0, 0.0]],
+            "n_results": 1,
+            "include": ["documents", "metadatas", "distances"],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("distance", "expected_score"),
+    ((-0.0000005, 1.0), (2.0000005, 0.0)),
+    ids=("near_zero", "near_two"),
+)
+def test_search_maps_only_in_tolerance_cosine_endpoint_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    distance: float,
+    expected_score: float,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        1,
+    )
+    record = _candidate_records()[0]
+    store.add_embedded(candidate, (record,))
+    snapshot = store.publish(candidate)
+    collection = store._read_collection(NAMESPACE, snapshot._token)
+    physical = collection.get(include=["documents", "metadatas"])
+
+    class DistanceCollection:
+        metadata = collection.metadata
+
+        @staticmethod
+        def count() -> int:
+            return 1
+
+        @staticmethod
+        def query(**kwargs: object) -> dict[str, object]:
+            return {
+                "ids": [[record.chunk_id]],
+                "documents": [[physical["documents"][0]]],
+                "metadatas": [[physical["metadatas"][0]]],
+                "distances": [[distance]],
+            }
+
+    monkeypatch.setattr(store, "_read_collection", lambda *args: DistanceCollection())
+
+    result = store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
+
+    assert result[0].score == expected_score
+
+
+@pytest.mark.parametrize(
+    "distance",
+    (-0.0000011, 2.0000011, float("nan"), float("inf"), float("-inf")),
+    ids=("below_zero", "above_two", "nan", "positive_infinity", "negative_infinity"),
+)
+def test_search_rejects_out_of_domain_or_nonfinite_cosine_distance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    distance: float,
+) -> None:
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(
+        NAMESPACE,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        1,
+    )
+    record = _candidate_records()[0]
+    store.add_embedded(candidate, (record,))
+    snapshot = store.publish(candidate)
+    collection = store._read_collection(NAMESPACE, snapshot._token)
+    physical = collection.get(include=["documents", "metadatas"])
+
+    class DistanceCollection:
+        metadata = collection.metadata
+
+        @staticmethod
+        def count() -> int:
+            return 1
+
+        @staticmethod
+        def query(**kwargs: object) -> dict[str, object]:
+            return {
+                "ids": [[record.chunk_id]],
+                "documents": [[physical["documents"][0]]],
+                "metadatas": [[physical["metadatas"][0]]],
+                "distances": [[distance]],
+            }
+
+    monkeypatch.setattr(store, "_read_collection", lambda *args: DistanceCollection())
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
+
+
+@pytest.mark.parametrize("top_k", (0, -1, True, 1.0, "1"))
+def test_search_rejects_invalid_top_k_before_opening_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    top_k: object,
+) -> None:
+    store = _store(tmp_path)
+    snapshot = _snapshot(expected_chunk_count=1)
+    monkeypatch.setattr(
+        store,
+        "_read_collection",
+        lambda *args: (_ for _ in ()).throw(AssertionError("collection opened")),
+    )
+
+    with pytest.raises(VectorStoreReadError):
+        store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), top_k)  # type: ignore[arg-type]
+
+
+def test_search_rejects_invalid_snapshot_before_opening_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    monkeypatch.setattr(
+        store,
+        "_read_collection",
+        lambda *args: (_ for _ in ()).throw(AssertionError("collection opened")),
+    )
+
+    with pytest.raises(VectorStoreReadError):
+        store.search(object(), EmbeddingVector((1.0, 0.0, 0.0)), 1)  # type: ignore[arg-type]
