@@ -23,9 +23,6 @@ from .validation import (
 
 
 _INVALID_DEPENDENCY_MESSAGE = "Semantic indexer dependency configuration is invalid."
-_UNSUPPORTED_INDEX_STATE_MESSAGE = (
-    "Semantic indexer requires a compatible active repository index."
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +64,7 @@ class SemanticIndexer:
         self._identity = identity
 
     def synchronize(self, inventory: CodeChunkInventory) -> IndexSyncResult:
-        """Publish a complete replacement for one changed compatible active index."""
+        """Publish a complete replacement for one repository index."""
         repository_namespace, current = validate_and_flatten_inventory(inventory)
         active_state = self._store.inspect_active(repository_namespace)
         snapshot = active_state.snapshot
@@ -80,10 +77,6 @@ class SemanticIndexer:
                 manifest,
                 snapshot.identity == self._identity,
                 snapshot.document_version == EMBEDDING_DOCUMENT_VERSION,
-            )
-        if snapshot is None or not diff.compatible:
-            raise EmbeddingVectorStoreConfigurationError(
-                _UNSUPPORTED_INDEX_STATE_MESSAGE
             )
         if not diff.new and not diff.updated and not diff.deleted:
             return IndexSyncResult(

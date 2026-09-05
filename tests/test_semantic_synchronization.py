@@ -165,7 +165,9 @@ class _RecordingStore:
 
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState:
         self.events.append(("inspect_active", repository_namespace))
-        return RepositoryIndexState(True, self.active_snapshot)
+        return RepositoryIndexState(
+            self.active_snapshot is not None, self.active_snapshot
+        )
 
     def read_manifest(
         self, snapshot: RepositoryIndexSnapshot
@@ -641,6 +643,94 @@ def test_semantic_indexer_orchestration_builds_and_publishes_complete_candidate(
         record.chunk_id for record in candidate_records
     }
     assert store.active_snapshot is not store.old_snapshot
+
+
+@pytest.mark.parametrize(
+    ("identity", "document_version"),
+    (
+        (
+            EmbeddingModelIdentity("other", "model", 3, "v1"),
+            EMBEDDING_DOCUMENT_VERSION,
+        ),
+        (
+            EmbeddingModelIdentity("provider", "other", 3, "v1"),
+            EMBEDDING_DOCUMENT_VERSION,
+        ),
+        (
+            EmbeddingModelIdentity("provider", "model", 4, "v1"),
+            EMBEDDING_DOCUMENT_VERSION,
+        ),
+        (
+            EmbeddingModelIdentity("provider", "model", 3, "v2"),
+            EMBEDDING_DOCUMENT_VERSION,
+        ),
+        (IDENTITY, "document-v2"),
+    ),
+    ids=("provider", "model", "dimension", "compatibility-version", "document"),
+)
+def test_full_reindex_on_incompatible_embedding_space_embeds_all_current_chunks(
+    identity: EmbeddingModelIdentity,
+    document_version: str,
+):
+    events: list[object] = []
+    inventory, current, manifest = _changed_compatible_inventory()
+    provider = _RecordingProvider(10, events=events)
+    store = _RecordingStore(manifest, events)
+    store.old_snapshot = replace(
+        store.old_snapshot,
+        identity=identity,
+        document_version=document_version,
+    )
+    store.active_snapshot = store.old_snapshot
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(inventory)
+
+    current_ids = tuple(item.chunk.chunk_id for item in current)
+    assert result.status is IndexSyncStatus.SUCCESS
+    assert result.reused_chunks == 0
+    assert result.embedded_chunks == result.total_chunks == len(current)
+    assert result.inserted_chunks == 1
+    assert result.updated_chunks == 2
+    assert result.deleted_chunks == 1
+    assert result.inserted_chunks + result.updated_chunks == result.embedded_chunks
+    assert result.reused_chunks + result.embedded_chunks == result.total_chunks
+    assert ("add_reused", ()) in events
+    assert (
+        "embed_documents",
+        (current_ids[2], current_ids[0], current_ids[1]),
+    ) in events
+    candidate_records = next(iter(store.candidate_records.values()))
+    assert tuple(record.chunk_id for record in candidate_records) == (
+        current_ids[2],
+        current_ids[0],
+        current_ids[1],
+    )
+
+
+def test_first_index_embeds_every_current_chunk_without_reused_records():
+    events: list[object] = []
+    inventory, current, _ = _changed_compatible_inventory()
+    provider = _RecordingProvider(10, events=events)
+    store = _RecordingStore((), events)
+    store.active_snapshot = None
+
+    result = synchronization_module.SemanticIndexer(
+        provider, store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(inventory)
+
+    current_ids = tuple(item.chunk.chunk_id for item in current)
+    assert result.status is IndexSyncStatus.SUCCESS
+    assert result.reused_chunks == 0
+    assert result.embedded_chunks == result.total_chunks == len(current)
+    assert result.inserted_chunks == len(current)
+    assert result.updated_chunks == 0
+    assert result.deleted_chunks == 0
+    assert result.inserted_chunks + result.updated_chunks == result.embedded_chunks
+    assert result.reused_chunks + result.embedded_chunks == result.total_chunks
+    assert ("add_reused", ()) in events
+    assert ("embed_documents", current_ids) in events
 
 
 def test_semantic_indexer_unchanged_fast_path_skips_provider_and_store_mutations():
