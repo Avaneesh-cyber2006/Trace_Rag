@@ -17,14 +17,22 @@ from .exceptions import (
     EmbeddingInvalidResponseError,
     InvalidCodeChunkInventory,
     InvalidSearchRequest,
+    VectorStoreCorruptionError,
 )
-from .models import EmbeddingDocument, EmbeddingModelIdentity, EmbeddingVector
+from .models import (
+    EmbeddingDocument,
+    EmbeddingModelIdentity,
+    EmbeddingVector,
+    VectorSearchResult,
+)
+from .stores.base import StoreSearchResult
 
 
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _INVALID_INVENTORY_MESSAGE = "Code chunk inventory contract is invalid."
 _INVALID_EMBEDDING_RESPONSE_MESSAGE = "Embedding provider response is invalid."
 _INVALID_SEARCH_REQUEST_MESSAGE = "Semantic search request is invalid."
+_STORE_CORRUPTION_MESSAGE = "Vector store data is incompatible or corrupt."
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +54,10 @@ def _is_lowercase_sha256(value: object) -> bool:
 
 def _is_optional_nonempty_string(value: object) -> bool:
     return value is None or (isinstance(value, str) and bool(value))
+
+
+def _is_nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
 
 
 def _is_posix_relative_path(value: object) -> bool:
@@ -224,3 +236,71 @@ def validate_search_request(
         or top_k > max_top_k
     ):
         raise InvalidSearchRequest(_INVALID_SEARCH_REQUEST_MESSAGE)
+
+
+def validate_and_normalize_search_results(
+    results: tuple[StoreSearchResult, ...],
+    repository_namespace: str,
+    top_k: int,
+) -> tuple[VectorSearchResult, ...]:
+    """Fail closed on malformed store evidence, then expose public results."""
+    if type(results) is not tuple or len(results) > top_k:
+        raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
+
+    chunk_ids: set[str] = set()
+    for result in results:
+        if type(result) is not StoreSearchResult:
+            raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
+        try:
+            valid = (
+                result.repository_namespace == repository_namespace
+                and _is_lowercase_sha256(result.chunk_id)
+                and _is_lowercase_sha256(result.content_hash)
+                and _is_posix_relative_path(result.relative_path)
+                and _is_nonempty_string(result.language)
+                and _is_nonempty_string(result.chunk_kind)
+                and _is_optional_nonempty_string(result.symbol_kind)
+                and _is_optional_nonempty_string(result.qualified_name)
+                and _is_optional_nonempty_string(result.parent_qualified_name)
+                and _is_nonempty_string(result.content)
+                and type(result.score) in (int, float)
+                and math.isfinite(result.score)
+                and 0.0 <= result.score <= 1.0
+                and result.chunk_id not in chunk_ids
+            )
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
+        chunk_ids.add(result.chunk_id)
+
+    try:
+        normalized = tuple(
+            VectorSearchResult(
+                chunk_id=result.chunk_id,
+                content_hash=result.content_hash,
+                relative_path=result.relative_path,
+                language=result.language,
+                chunk_kind=result.chunk_kind,
+                symbol_kind=result.symbol_kind,
+                qualified_name=result.qualified_name,
+                parent_qualified_name=result.parent_qualified_name,
+                content=result.content,
+                score=result.score,
+            )
+            for result in results
+        )
+    except (AttributeError, InvalidSearchRequest):
+        raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE) from None
+
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda result: (
+                -result.score,
+                result.relative_path.casefold(),
+                result.relative_path,
+                result.chunk_id,
+            ),
+        )
+    )

@@ -11,7 +11,11 @@ from .models import EmbeddingModelIdentity, VectorSearchResult
 from .providers.base import EmbeddingProvider
 from .retry import RetryPolicy, run_with_embedding_retries
 from .stores.base import RepositoryIndexSnapshot, RepositoryIndexState, VectorStore
-from .validation import validate_embedding_vector, validate_search_request
+from .validation import (
+    validate_and_normalize_search_results,
+    validate_embedding_vector,
+    validate_search_request,
+)
 
 
 _INVALID_SEARCH_CONFIGURATION_MESSAGE = "Semantic search configuration is invalid."
@@ -105,5 +109,9 @@ class SemanticSearcher:
             self._retry_policy,
         )
         validate_embedding_vector(query_vector, snapshot.identity)
-        self._store.search(snapshot, query_vector, top_k)
-        return ()
+        store_results = self._store.search(snapshot, query_vector, top_k)
+        return validate_and_normalize_search_results(
+            store_results,
+            repository_namespace,
+            top_k,
+        )

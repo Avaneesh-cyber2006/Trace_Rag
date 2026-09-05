@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import fields
 import re
 
 import pytest
 
+import backend.embedding_vector_store.validation as embedding_validation
 from backend.embedding_vector_store.exceptions import (
     EmbeddingInvalidResponseError,
     EmbeddingSpaceMismatch,
@@ -18,12 +20,14 @@ from backend.embedding_vector_store.documents import EMBEDDING_DOCUMENT_VERSION
 from backend.embedding_vector_store.models import (
     EmbeddingModelIdentity,
     EmbeddingVector,
+    VectorSearchResult,
 )
 from backend.embedding_vector_store.retry import RetryPolicy
 from backend.embedding_vector_store.search import SemanticSearcher
 from backend.embedding_vector_store.stores.base import (
     RepositoryIndexSnapshot,
     RepositoryIndexState,
+    StoreSearchResult,
 )
 from backend.embedding_vector_store.validation import validate_search_request
 
@@ -82,9 +86,11 @@ class RecordingStore:
     def __init__(
         self,
         state: RepositoryIndexState | None = None,
+        search_results: tuple[object, ...] = (),
     ) -> None:
         self.calls: list[tuple[str, object]] = []
         self.state = state or RepositoryIndexState(indexed=False, snapshot=None)
+        self.search_results = search_results
 
     def _record(self, name: str, value: object = None) -> None:
         self.calls.append((name, value))
@@ -121,7 +127,7 @@ class RecordingStore:
         self, snapshot: object, query: EmbeddingVector, top_k: int
     ) -> tuple[object, ...]:
         self._record("search", (snapshot, query, top_k))
-        return ()
+        return self.search_results
 
     def delete_repository_index(self, repository_namespace: str) -> None:
         self._record("delete_repository_index", repository_namespace)
@@ -159,6 +165,41 @@ def _snapshot(
 
 def _active(snapshot: RepositoryIndexSnapshot) -> RepositoryIndexState:
     return RepositoryIndexState(indexed=True, snapshot=snapshot)
+
+
+def _store_result(
+    *,
+    repository_namespace: str = "repo",
+    chunk_id: str = "a" * 64,
+    content_hash: str = "b" * 64,
+    relative_path: str = "src/example.py",
+    language: str = "python",
+    chunk_kind: str = "symbol",
+    symbol_kind: str | None = "function",
+    qualified_name: str | None = "example",
+    parent_qualified_name: str | None = None,
+    content: str = "def example():\r\n\treturn 'exact source'\n",
+    score: float = 0.75,
+) -> StoreSearchResult:
+    return StoreSearchResult(
+        repository_namespace=repository_namespace,
+        chunk_id=chunk_id,
+        content_hash=content_hash,
+        relative_path=relative_path,
+        language=language,
+        chunk_kind=chunk_kind,
+        symbol_kind=symbol_kind,
+        qualified_name=qualified_name,
+        parent_qualified_name=parent_qualified_name,
+        content=content,
+        score=score,
+    )
+
+
+def _corrupt_result(attribute: str, invalid_value: object) -> StoreSearchResult:
+    result = _store_result()
+    object.__setattr__(result, attribute, invalid_value)
+    return result
 
 
 @pytest.mark.parametrize("repository_namespace", [None, 0, False, ""])
@@ -398,6 +439,193 @@ def test_snapshot_is_resolved_once_and_remains_pinned_during_publication() -> No
     assert searched_snapshot is not new_snapshot
     assert searched_vector == EmbeddingVector((1.0, 0.0))
     assert searched_top_k == 3
+
+
+def test_result_normalization_rejects_more_records_than_top_k() -> None:
+    results = (
+        _store_result(chunk_id="a" * 64),
+        _store_result(chunk_id="b" * 64),
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(results, "repo", 1)
+
+
+def test_result_normalization_rejects_duplicate_chunk_ids() -> None:
+    results = (
+        _store_result(relative_path="src/first.py"),
+        _store_result(relative_path="src/second.py"),
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(results, "repo", 2)
+
+
+def test_result_normalization_rejects_wrong_complete_namespace() -> None:
+    results = (_store_result(repository_namespace="repo/subtree"),)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(results, "repo", 1)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value"),
+    [
+        ("chunk_id", "A" * 64),
+        ("chunk_id", "a" * 63),
+        ("content_hash", "not-a-content-hash"),
+        ("relative_path", ""),
+        ("relative_path", "../escape.py"),
+        ("relative_path", "src\\example.py"),
+        ("language", ""),
+        ("chunk_kind", ""),
+        ("symbol_kind", ""),
+        ("qualified_name", ""),
+        ("parent_qualified_name", ""),
+        ("content", ""),
+        ("score", True),
+        ("score", float("nan")),
+        ("score", float("inf")),
+        ("score", 10**1_000),
+        ("score", -0.000_001),
+        ("score", 1.000_001),
+    ],
+)
+def test_corrupt_result_metadata_content_hashes_and_scores_fail_closed(
+    attribute: str,
+    invalid_value: object,
+) -> None:
+    valid_result = _store_result(chunk_id="c" * 64)
+    corrupt_result = _corrupt_result(attribute, invalid_value)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(
+            (valid_result, corrupt_result),
+            "repo",
+            2,
+        )
+
+
+@pytest.mark.parametrize("results", [None, [], (object(),)])
+def test_corrupt_result_container_or_missing_record_fields_fail_closed(
+    results: object,
+) -> None:
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(  # type: ignore[attr-defined,arg-type]
+            results, "repo", 1
+        )
+
+
+def test_result_ordering_uses_exact_score_path_case_and_chunk_id_key() -> None:
+    results = (
+        _store_result(
+            chunk_id="e" * 64,
+            relative_path="z.py",
+            score=0.9,
+        ),
+        _store_result(
+            chunk_id="d" * 64,
+            relative_path="a.py",
+            score=0.9,
+        ),
+        _store_result(
+            chunk_id="c" * 64,
+            relative_path="A.py",
+            score=0.9,
+        ),
+        _store_result(
+            chunk_id="b" * 64,
+            relative_path="A.py",
+            score=0.9,
+        ),
+        _store_result(
+            chunk_id="a" * 64,
+            relative_path="0.py",
+            score=0.8,
+        ),
+    )
+
+    normalized = embedding_validation.validate_and_normalize_search_results(
+        results, "repo", 5
+    )
+
+    assert [result.chunk_id for result in normalized] == [
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+        "e" * 64,
+        "a" * 64,
+    ]
+
+
+def test_search_returns_exact_source_in_public_results_without_private_fields() -> None:
+    snapshot = _snapshot()
+    exact_source = "  # Unicode: λ\r\n\tprint('unchanged')\n\x00suffix  "
+    store_result = _store_result(content=exact_source)
+    store = RecordingStore(_active(snapshot), (store_result,))
+
+    results = SemanticSearcher(
+        RecordingProvider(identity=snapshot.identity),
+        store,
+    ).search("repo", "query", 1)
+
+    assert results == (
+        VectorSearchResult(
+            chunk_id="a" * 64,
+            content_hash="b" * 64,
+            relative_path="src/example.py",
+            language="python",
+            chunk_kind="symbol",
+            symbol_kind="function",
+            qualified_name="example",
+            parent_qualified_name=None,
+            content=exact_source,
+            score=0.75,
+        ),
+    )
+    assert results[0].content == exact_source
+    assert [field.name for field in fields(results[0])] == [
+        "chunk_id",
+        "content_hash",
+        "relative_path",
+        "language",
+        "chunk_kind",
+        "symbol_kind",
+        "qualified_name",
+        "parent_qualified_name",
+        "content",
+        "score",
+    ]
+    for forbidden in (
+        "embedding_text",
+        "text",
+        "embedding",
+        "vector",
+        "distance",
+        "repository_namespace",
+        "generation",
+        "collection",
+        "locator",
+        "_token",
+    ):
+        assert not hasattr(results[0], forbidden)
+
+
+def test_search_rejects_entire_corrupt_result_tuple_without_filtering() -> None:
+    snapshot = _snapshot()
+    store = RecordingStore(
+        _active(snapshot),
+        (
+            _store_result(chunk_id="a" * 64),
+            _corrupt_result("repository_namespace", "other-repo"),
+        ),
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        SemanticSearcher(
+            RecordingProvider(identity=snapshot.identity),
+            store,
+        ).search("repo", "query", 2)
 
 
 @pytest.mark.parametrize("invalid_bound", [None, True, False, 0, -1, 1.0, "1"])
