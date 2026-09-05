@@ -1,14 +1,47 @@
 """Provider-independent semantic-search request orchestration."""
 
-from .exceptions import EmbeddingVectorStoreConfigurationError
-from .models import VectorSearchResult
+from .documents import EMBEDDING_DOCUMENT_VERSION
+from .exceptions import (
+    EmbeddingSpaceMismatch,
+    EmbeddingVectorStoreConfigurationError,
+    RepositoryIndexNotFound,
+    VectorStoreCorruptionError,
+)
+from .models import EmbeddingModelIdentity, VectorSearchResult
 from .providers.base import EmbeddingProvider
-from .retry import RetryPolicy
-from .stores.base import VectorStore
-from .validation import validate_search_request
+from .retry import RetryPolicy, run_with_embedding_retries
+from .stores.base import RepositoryIndexSnapshot, RepositoryIndexState, VectorStore
+from .validation import validate_embedding_vector, validate_search_request
 
 
 _INVALID_SEARCH_CONFIGURATION_MESSAGE = "Semantic search configuration is invalid."
+_INDEX_NOT_FOUND_MESSAGE = "Repository semantic index is not found."
+_EMBEDDING_SPACE_MISMATCH_MESSAGE = "Semantic index embedding space is incompatible."
+_STORE_CORRUPTION_MESSAGE = "Vector store data is incompatible or corrupt."
+_STORAGE_SCHEMA_VERSION = "tracerag-chroma-schema-v1"
+
+
+def _resolve_snapshot(
+    state: RepositoryIndexState,
+    repository_namespace: str,
+) -> RepositoryIndexSnapshot:
+    if not isinstance(state, RepositoryIndexState):
+        raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
+    if state.indexed is False and state.snapshot is None:
+        raise RepositoryIndexNotFound(_INDEX_NOT_FOUND_MESSAGE)
+    snapshot = state.snapshot
+    if (
+        state.indexed is not True
+        or not isinstance(snapshot, RepositoryIndexSnapshot)
+        or snapshot.repository_namespace != repository_namespace
+        or not isinstance(snapshot.identity, EmbeddingModelIdentity)
+        or snapshot.document_version != EMBEDDING_DOCUMENT_VERSION
+        or snapshot.schema_version != _STORAGE_SCHEMA_VERSION
+        or type(snapshot.expected_chunk_count) is not int
+        or snapshot.expected_chunk_count < 0
+    ):
+        raise VectorStoreCorruptionError(_STORE_CORRUPTION_MESSAGE)
+    return snapshot
 
 
 class SemanticSearcher:
@@ -51,7 +84,7 @@ class SemanticSearcher:
         query_text: str,
         top_k: int,
     ) -> tuple[VectorSearchResult, ...]:
-        """Validate a request before semantic-search flow is resolved."""
+        """Query one immutable active repository-index snapshot."""
         validate_search_request(
             repository_namespace,
             query_text,
@@ -59,4 +92,18 @@ class SemanticSearcher:
             self._max_query_chars,
             self._max_top_k,
         )
+        snapshot = _resolve_snapshot(
+            self._store.inspect_active(repository_namespace),
+            repository_namespace,
+        )
+        if snapshot.identity != self._provider.identity:
+            raise EmbeddingSpaceMismatch(_EMBEDDING_SPACE_MISMATCH_MESSAGE)
+        if snapshot.expected_chunk_count == 0:
+            return ()
+        query_vector = run_with_embedding_retries(
+            lambda: self._provider.embed_query(query_text),
+            self._retry_policy,
+        )
+        validate_embedding_vector(query_vector, snapshot.identity)
+        self._store.search(snapshot, query_vector, top_k)
         return ()
