@@ -1,6 +1,7 @@
 """Validation at the immutable Module 4 to Module 5 boundary."""
 
 from dataclasses import dataclass
+from hashlib import sha256
 import math
 import re
 
@@ -264,6 +265,8 @@ def validate_and_normalize_search_results(
                 and _is_optional_nonempty_string(result.qualified_name)
                 and _is_optional_nonempty_string(result.parent_qualified_name)
                 and _is_nonempty_string(result.content)
+                and sha256(result.content.encode("utf-8")).hexdigest()
+                == result.content_hash
                 and type(result.score) in (int, float)
                 and math.isfinite(result.score)
                 and 0.0 <= result.score <= 1.0

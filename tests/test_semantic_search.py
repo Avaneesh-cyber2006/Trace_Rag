@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import fields
+from hashlib import sha256
 import re
 
 import pytest
@@ -171,7 +172,7 @@ def _store_result(
     *,
     repository_namespace: str = "repo",
     chunk_id: str = "a" * 64,
-    content_hash: str = "b" * 64,
+    content_hash: str | None = None,
     relative_path: str = "src/example.py",
     language: str = "python",
     chunk_kind: str = "symbol",
@@ -181,6 +182,8 @@ def _store_result(
     content: str = "def example():\r\n\treturn 'exact source'\n",
     score: float = 0.75,
 ) -> StoreSearchResult:
+    if content_hash is None:
+        content_hash = sha256(content.encode("utf-8")).hexdigest()
     return StoreSearchResult(
         repository_namespace=repository_namespace,
         chunk_id=chunk_id,
@@ -555,6 +558,24 @@ def test_corrupt_result_metadata_content_hashes_and_scores_fail_closed(
         )
 
 
+def test_result_normalization_rejects_valid_looking_mismatched_content_hash_without_partial_results() -> None:
+    results = (
+        _store_result(chunk_id="a" * 64, content="first exact source"),
+        _store_result(
+            chunk_id="b" * 64,
+            content_hash="0" * 64,
+            content="second exact source",
+        ),
+    )
+
+    with pytest.raises(VectorStoreCorruptionError):
+        embedding_validation.validate_and_normalize_search_results(
+            results,
+            "repo",
+            2,
+        )
+
+
 @pytest.mark.parametrize(
     "attribute",
     [
@@ -667,7 +688,7 @@ def test_search_returns_exact_source_in_public_results_without_private_fields() 
     assert results == (
         VectorSearchResult(
             chunk_id="a" * 64,
-            content_hash="b" * 64,
+            content_hash=sha256(exact_source.encode("utf-8")).hexdigest(),
             relative_path="src/example.py",
             language="python",
             chunk_kind="symbol",
