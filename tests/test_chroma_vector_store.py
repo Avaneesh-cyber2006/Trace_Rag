@@ -1,5 +1,6 @@
 """Chroma storage-schema and repository-isolation contracts."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 import inspect
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from threading import Event
 
 import pytest
 
@@ -36,6 +38,7 @@ from backend.embedding_vector_store.stores.chroma import (
     STORAGE_SCHEMA_VERSION,
     ChromaVectorStore,
 )
+import backend.embedding_vector_store.stores.chroma as chroma_module
 
 
 NAMESPACE = "tracerag-repository-v1:github:example/資料庫"
@@ -668,6 +671,69 @@ def test_successful_replacement_retires_previously_active_collection(
     assert old_collection not in collection_names
     assert store._candidate_collection_name(candidate) in collection_names
     assert published.document_version == "new-document-version"
+
+
+def test_concurrent_reader_keeps_its_snapshot_until_search_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old_record = _vector_record("c" * 64, "d" * 64, "old content", (1.0, 0.0, 0.0))
+    old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
+    new_record = _vector_record("e" * 64, "f" * 64, "new content", (1.0, 0.0, 0.0))
+    new_candidate = store.begin_candidate(
+        NAMESPACE, IDENTITY, "tracerag-embedding-document-v1", 1
+    )
+    store.add_embedded(new_candidate, (new_record,))
+    entered = Event()
+    release = Event()
+    old_collection = store._read_collection(NAMESPACE, old_snapshot._token)
+    original_query = old_collection.query
+    original_read_collection = store._read_collection
+
+    def blocking_query(**kwargs: object) -> object:
+        entered.set()
+        if not release.wait(5):
+            raise AssertionError("test did not release the snapshot reader")
+        return original_query(**kwargs)
+
+    def read_collection(repository_namespace: str, collection_name: object) -> object:
+        if collection_name == old_snapshot._token:
+            return old_collection
+        return original_read_collection(repository_namespace, collection_name)
+
+    monkeypatch.setattr(old_collection, "query", blocking_query)
+    monkeypatch.setattr(store, "_read_collection", read_collection)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(
+            store.search, old_snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1
+        )
+        assert entered.wait(5)
+        published = store.publish(new_candidate)
+        names_during_read = {
+            collection.name for collection in store._client.list_collections()
+        }
+        assert old_snapshot._token in names_during_read
+        release.set()
+        old_results = reader.result(timeout=5)
+
+    names_after_read = {collection.name for collection in store._client.list_collections()}
+    assert old_snapshot._token not in names_after_read
+    assert old_results[0].content == "old content"
+    assert store.search(published, EmbeddingVector((1.0, 0.0, 0.0)), 1)[0].content == (
+        "new content"
+    )
+
+
+def test_writer_mutation_rejects_use_from_a_non_owning_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    owner_process = os.getpid()
+    monkeypatch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
+
+    with pytest.raises(VectorStoreConfigurationError):
+        store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
 
 
 def test_publication_failure_with_valid_third_pointer_is_ambiguous_corruption(

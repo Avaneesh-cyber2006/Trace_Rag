@@ -1,6 +1,9 @@
 """Provider-independent synchronization helpers for semantic indexes."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import Lock
+from typing import Iterator
 
 from backend.code_chunker.models import CodeChunkInventory
 
@@ -23,6 +26,34 @@ from .validation import (
 
 
 _INVALID_DEPENDENCY_MESSAGE = "Semantic indexer dependency configuration is invalid."
+_WRITER_BUSY_MESSAGE = "Repository index synchronization is already in progress."
+_WRITER_GUARDS_LOCK = Lock()
+_ACTIVE_WRITER_GUARDS: set[tuple[object, str]] = set()
+
+
+@contextmanager
+def _repository_writer_guard(
+    store: VectorStore, repository_namespace: str
+) -> Iterator[None]:
+    """Acquire one nonblocking in-process writer lease for an exact namespace."""
+    key_factory = getattr(store, "_writer_guard_key", None)
+    scope = key_factory(repository_namespace) if callable(key_factory) else id(store)
+    try:
+        key = (scope, repository_namespace)
+        hash(key)
+    except (TypeError, ValueError) as error:
+        raise EmbeddingVectorStoreConfigurationError(
+            _INVALID_DEPENDENCY_MESSAGE
+        ) from error
+    with _WRITER_GUARDS_LOCK:
+        if key in _ACTIVE_WRITER_GUARDS:
+            raise EmbeddingVectorStoreConfigurationError(_WRITER_BUSY_MESSAGE)
+        _ACTIVE_WRITER_GUARDS.add(key)
+    try:
+        yield
+    finally:
+        with _WRITER_GUARDS_LOCK:
+            _ACTIVE_WRITER_GUARDS.discard(key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,73 +97,74 @@ class SemanticIndexer:
     def synchronize(self, inventory: CodeChunkInventory) -> IndexSyncResult:
         """Publish a complete replacement for one repository index."""
         repository_namespace, current = validate_and_flatten_inventory(inventory)
-        active_state = self._store.inspect_active(repository_namespace)
-        snapshot = active_state.snapshot
-        if snapshot is None:
-            diff = _classify_chunks(current, (), False, False)
-        else:
-            manifest = self._store.read_manifest(snapshot)
-            diff = _classify_chunks(
-                current,
-                manifest,
-                snapshot.identity == self._identity,
-                snapshot.document_version == EMBEDDING_DOCUMENT_VERSION,
+        with _repository_writer_guard(self._store, repository_namespace):
+            active_state = self._store.inspect_active(repository_namespace)
+            snapshot = active_state.snapshot
+            if snapshot is None:
+                diff = _classify_chunks(current, (), False, False)
+            else:
+                manifest = self._store.read_manifest(snapshot)
+                diff = _classify_chunks(
+                    current,
+                    manifest,
+                    snapshot.identity == self._identity,
+                    snapshot.document_version == EMBEDDING_DOCUMENT_VERSION,
+                )
+            if (
+                snapshot is not None
+                and diff.compatible
+                and not diff.new
+                and not diff.updated
+                and not diff.deleted
+            ):
+                return IndexSyncResult(
+                    repository_namespace=repository_namespace,
+                    status=IndexSyncStatus.UNCHANGED,
+                    total_chunks=len(current),
+                    reused_chunks=len(diff.unchanged),
+                    embedded_chunks=0,
+                    inserted_chunks=0,
+                    updated_chunks=0,
+                    deleted_chunks=0,
+                    embedding_identity=self._identity,
+                    document_version=EMBEDDING_DOCUMENT_VERSION,
+                )
+
+            candidate = self._store.begin_candidate(
+                repository_namespace,
+                self._identity,
+                EMBEDDING_DOCUMENT_VERSION,
+                len(current),
             )
-        if (
-            snapshot is not None
-            and diff.compatible
-            and not diff.new
-            and not diff.updated
-            and not diff.deleted
-        ):
+            try:
+                self._store.add_reused(candidate, diff.unchanged)
+                embedded = _embed_chunk_inputs(
+                    diff.new + diff.updated,
+                    self._provider,
+                    self._retry_policy,
+                )
+                self._store.add_embedded(candidate, embedded)
+                self._store.validate_candidate(candidate)
+                self._store.publish(candidate)
+            except Exception:
+                try:
+                    self._store.abort(candidate)
+                except Exception:
+                    pass
+                raise
+
             return IndexSyncResult(
                 repository_namespace=repository_namespace,
-                status=IndexSyncStatus.UNCHANGED,
+                status=IndexSyncStatus.SUCCESS,
                 total_chunks=len(current),
                 reused_chunks=len(diff.unchanged),
-                embedded_chunks=0,
-                inserted_chunks=0,
-                updated_chunks=0,
-                deleted_chunks=0,
+                embedded_chunks=len(embedded),
+                inserted_chunks=len(diff.new),
+                updated_chunks=len(diff.updated),
+                deleted_chunks=len(diff.deleted),
                 embedding_identity=self._identity,
                 document_version=EMBEDDING_DOCUMENT_VERSION,
             )
-
-        candidate = self._store.begin_candidate(
-            repository_namespace,
-            self._identity,
-            EMBEDDING_DOCUMENT_VERSION,
-            len(current),
-        )
-        try:
-            self._store.add_reused(candidate, diff.unchanged)
-            embedded = _embed_chunk_inputs(
-                diff.new + diff.updated,
-                self._provider,
-                self._retry_policy,
-            )
-            self._store.add_embedded(candidate, embedded)
-            self._store.validate_candidate(candidate)
-            self._store.publish(candidate)
-        except Exception:
-            try:
-                self._store.abort(candidate)
-            except Exception:
-                pass
-            raise
-
-        return IndexSyncResult(
-            repository_namespace=repository_namespace,
-            status=IndexSyncStatus.SUCCESS,
-            total_chunks=len(current),
-            reused_chunks=len(diff.unchanged),
-            embedded_chunks=len(embedded),
-            inserted_chunks=len(diff.new),
-            updated_chunks=len(diff.updated),
-            deleted_chunks=len(diff.deleted),
-            embedding_identity=self._identity,
-            document_version=EMBEDDING_DOCUMENT_VERSION,
-        )
 
 
 def _embed_chunk_inputs(

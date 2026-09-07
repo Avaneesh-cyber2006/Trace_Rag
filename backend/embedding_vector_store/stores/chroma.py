@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import struct
+from threading import Lock
 from typing import Iterable
 
 import chromadb
@@ -83,6 +84,29 @@ _POINTER_PAYLOAD_KEYS = frozenset(
     {"schema_version", "repository_namespace", "active_collection"}
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+class _PersistenceConcurrencyState:
+    """Process-local reader state shared by stores for one persistence root."""
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.readers: dict[str, int] = {}
+        self.pending_cleanup: set[str] = set()
+
+
+_PERSISTENCE_STATES_LOCK = Lock()
+_PERSISTENCE_STATES: dict[str, _PersistenceConcurrencyState] = {}
+
+
+def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
+    key = os.path.normcase(str(root))
+    with _PERSISTENCE_STATES_LOCK:
+        state = _PERSISTENCE_STATES.get(key)
+        if state is None:
+            state = _PersistenceConcurrencyState()
+            _PERSISTENCE_STATES[key] = state
+        return state
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -212,6 +236,42 @@ class ChromaVectorStore:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE) from error
         self._persistence_root = root
         self._client = client
+        self._owner_process_id = os.getpid()
+        self._concurrency_state = _persistence_concurrency_state(root)
+
+    def _assert_owner_process(self) -> None:
+        if os.getpid() != self._owner_process_id:
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+
+    def _writer_guard_key(self, repository_namespace: str) -> str:
+        """Identify one supported process/storage deployment for core guarding."""
+        self._assert_owner_process()
+        if not _is_nonempty_string(repository_namespace):
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        return os.path.normcase(str(self._persistence_root))
+
+    def _acquire_snapshot_reader(self, collection_name: str) -> None:
+        with self._concurrency_state.lock:
+            self._concurrency_state.readers[collection_name] = (
+                self._concurrency_state.readers.get(collection_name, 0) + 1
+            )
+
+    def _release_snapshot_reader(self, collection_name: str) -> None:
+        delete_pending = False
+        with self._concurrency_state.lock:
+            remaining = self._concurrency_state.readers.get(collection_name, 0) - 1
+            if remaining > 0:
+                self._concurrency_state.readers[collection_name] = remaining
+            else:
+                self._concurrency_state.readers.pop(collection_name, None)
+                if collection_name in self._concurrency_state.pending_cleanup:
+                    self._concurrency_state.pending_cleanup.remove(collection_name)
+                    delete_pending = True
+        if delete_pending:
+            try:
+                self._client.delete_collection(collection_name)
+            except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+                _LOGGER.warning("Vector store cleanup failed.")
 
     @staticmethod
     def _namespace_digest(repository_namespace: str) -> str:
@@ -373,6 +433,7 @@ class ChromaVectorStore:
         expected_chunk_count: int,
     ) -> CandidateIndex:
         """Create one private immutable-generation candidate."""
+        self._assert_owner_process()
         try:
             candidate = CandidateIndex(
                 repository_namespace=repository_namespace,
@@ -418,6 +479,23 @@ class ChromaVectorStore:
         )
 
     def search(
+        self,
+        snapshot: RepositoryIndexSnapshot,
+        query: EmbeddingVector,
+        top_k: int,
+    ) -> tuple[StoreSearchResult, ...]:
+        """Search while retaining the immutable snapshot against publication cleanup."""
+        if not isinstance(snapshot, RepositoryIndexSnapshot) or not isinstance(
+            snapshot._token, str
+        ):
+            return self._search_snapshot(snapshot, query, top_k)
+        self._acquire_snapshot_reader(snapshot._token)
+        try:
+            return self._search_snapshot(snapshot, query, top_k)
+        finally:
+            self._release_snapshot_reader(snapshot._token)
+
+    def _search_snapshot(
         self,
         snapshot: RepositoryIndexSnapshot,
         query: EmbeddingVector,
@@ -832,12 +910,14 @@ class ChromaVectorStore:
         self, candidate: CandidateIndex, records: tuple[StoredRecord, ...]
     ) -> None:
         """Copy store-authoritative records into an isolated candidate."""
+        self._assert_owner_process()
         self._append_stored_candidate(candidate, records)
 
     def add_embedded(
         self, candidate: CandidateIndex, records: tuple[VectorRecord, ...]
     ) -> None:
         """Append validated external-vector records to an isolated candidate."""
+        self._assert_owner_process()
         if (
             not isinstance(candidate, CandidateIndex)
             or type(records) is not tuple
@@ -964,6 +1044,7 @@ class ChromaVectorStore:
 
     def validate_candidate(self, candidate: CandidateIndex) -> None:
         """Validate the complete logical candidate before publication."""
+        self._assert_owner_process()
         self._read_candidate_manifest(candidate)
 
     def _resolve_publication_outcome(
@@ -991,6 +1072,10 @@ class ChromaVectorStore:
         """Best-effort retirement after durable pointer publication succeeds."""
         if old_collection is None or old_collection == new_collection:
             return
+        with self._concurrency_state.lock:
+            if self._concurrency_state.readers.get(old_collection, 0) > 0:
+                self._concurrency_state.pending_cleanup.add(old_collection)
+                return
         try:
             self._client.delete_collection(old_collection)
         except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
@@ -1023,6 +1108,7 @@ class ChromaVectorStore:
 
     def delete_repository_index(self, repository_namespace: str) -> None:
         """Delete only the fully validated index for one exact namespace."""
+        self._assert_owner_process()
         if not _is_nonempty_string(repository_namespace):
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
 
@@ -1049,6 +1135,7 @@ class ChromaVectorStore:
 
     def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
         """Publish a complete candidate through one durable pointer replacement."""
+        self._assert_owner_process()
         previous_state = self.inspect_active(candidate.repository_namespace)
         old_collection = (
             previous_state.snapshot._token
@@ -1086,6 +1173,7 @@ class ChromaVectorStore:
 
     def abort(self, candidate: CandidateIndex) -> None:
         """Remove an unreachable candidate without changing active authority."""
+        self._assert_owner_process()
         collection_name = self._candidate_collection_name(candidate)
         active = self.inspect_active(candidate.repository_namespace)
         if active.snapshot is not None and active.snapshot._token == collection_name:

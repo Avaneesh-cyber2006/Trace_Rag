@@ -1,6 +1,8 @@
 """Linear synchronization diff classification contracts."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, is_dataclass, replace
+from threading import Event, Lock
 
 from backend.code_chunker.models import (
     ChunkFileStatus,
@@ -1007,3 +1009,140 @@ def test_semantic_indexer_orchestration_validates_dependencies_eagerly():
         synchronization_module.SemanticIndexer(
             _RecordingProvider(10), store, object()  # type: ignore[arg-type]
         )
+
+
+class _FirstCallBlockingProvider(_RecordingProvider):
+    def __init__(self, entered: Event, release: Event) -> None:
+        super().__init__(10)
+        self._entered = entered
+        self._release = release
+        self._call_lock = Lock()
+        self._call_count = 0
+
+    def embed_documents(
+        self, documents: tuple[object, ...]
+    ) -> tuple[EmbeddingVector, ...]:
+        with self._call_lock:
+            self._call_count += 1
+            call_number = self._call_count
+        if call_number == 1:
+            self._entered.set()
+            if not self._release.wait(5):
+                raise AssertionError("test did not release the first writer")
+        return super().embed_documents(documents)
+
+
+def _inventory_for_namespace(repository_namespace: str) -> CodeChunkInventory:
+    inventory, _, _ = _changed_compatible_inventory()
+    return replace(inventory, repository_namespace=repository_namespace)
+
+
+def test_concurrent_same_namespace_writer_fails_before_active_inspection() -> None:
+    entered = Event()
+    release = Event()
+    events: list[object] = []
+    inventory, _, manifest = _changed_compatible_inventory()
+    store = _RecordingStore(manifest, events)
+    indexer = synchronization_module.SemanticIndexer(
+        _FirstCallBlockingProvider(entered, release),
+        store,
+        RetryPolicy(sleeper=lambda _: None),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(indexer.synchronize, inventory)
+        assert entered.wait(5)
+        inspections_before = events.count(("inspect_active", "repo"))
+        try:
+            with pytest.raises(EmbeddingVectorStoreConfigurationError):
+                indexer.synchronize(inventory)
+            assert events.count(("inspect_active", "repo")) == inspections_before
+        finally:
+            release.set()
+        assert first.result(timeout=5).status is IndexSyncStatus.SUCCESS
+
+
+def test_concurrent_different_namespace_writer_is_not_serialized() -> None:
+    entered = Event()
+    release = Event()
+    events: list[object] = []
+    inventory, _, manifest = _changed_compatible_inventory()
+    store = _RecordingStore(manifest, events)
+    indexer = synchronization_module.SemanticIndexer(
+        _FirstCallBlockingProvider(entered, release),
+        store,
+        RetryPolicy(sleeper=lambda _: None),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(indexer.synchronize, inventory)
+        assert entered.wait(5)
+        try:
+            neighbor = indexer.synchronize(_inventory_for_namespace("repo-neighbor"))
+            assert neighbor.repository_namespace == "repo-neighbor"
+            assert neighbor.status is IndexSyncStatus.SUCCESS
+        finally:
+            release.set()
+        assert first.result(timeout=5).status is IndexSyncStatus.SUCCESS
+
+
+def test_same_namespace_writer_guard_is_held_through_publication_outcome() -> None:
+    entered = Event()
+    release = Event()
+    inventory, _, manifest = _changed_compatible_inventory()
+
+    class FirstPublishBlockingStore(_RecordingStore):
+        def __init__(self) -> None:
+            super().__init__(manifest, [])
+            self._publish_lock = Lock()
+            self._publish_count = 0
+
+        def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
+            with self._publish_lock:
+                self._publish_count += 1
+                call_number = self._publish_count
+            if call_number == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("test did not release publication")
+            return super().publish(candidate)
+
+    store = FirstPublishBlockingStore()
+    indexer = synchronization_module.SemanticIndexer(
+        _RecordingProvider(10), store, RetryPolicy(sleeper=lambda _: None)
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(indexer.synchronize, inventory)
+        assert entered.wait(5)
+        try:
+            with pytest.raises(EmbeddingVectorStoreConfigurationError):
+                indexer.synchronize(inventory)
+        finally:
+            release.set()
+        assert first.result(timeout=5).status is IndexSyncStatus.SUCCESS
+
+
+def test_same_namespace_writer_guard_is_released_after_abort_outcome() -> None:
+    entered = Event()
+    release = Event()
+    inventory, _, manifest = _changed_compatible_inventory()
+    store = _RecordingStore(manifest, [])
+    primary = EmbeddingInvalidRequestError("injected provider failure")
+    blocking = _FirstCallBlockingProvider(entered, release)
+    blocking.outcomes = [primary]
+    failing_indexer = synchronization_module.SemanticIndexer(
+        blocking, store, RetryPolicy(sleeper=lambda _: None)
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(failing_indexer.synchronize, inventory)
+        assert entered.wait(5)
+        release.set()
+        with pytest.raises(EmbeddingInvalidRequestError):
+            first.result(timeout=5)
+
+    result = synchronization_module.SemanticIndexer(
+        _RecordingProvider(10), store, RetryPolicy(sleeper=lambda _: None)
+    ).synchronize(inventory)
+    assert result.status is IndexSyncStatus.SUCCESS
