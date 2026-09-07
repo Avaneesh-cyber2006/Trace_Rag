@@ -211,6 +211,11 @@ class _HostileEqualityString(str):
         raise RuntimeError("hostile equality")
 
 
+class _HostileIsspaceString(str):
+    def isspace(self) -> bool:
+        raise RuntimeError("hostile whitespace check")
+
+
 class _HostileHashString(str):
     def __hash__(self) -> int:
         raise RuntimeError("hostile hash")
@@ -284,6 +289,31 @@ def test_request_validation_precedes_all_provider_and_store_calls(
 
     with pytest.raises(InvalidSearchRequest, match=REQUEST_PATTERN):
         searcher.search(repository_namespace, query_text, top_k)  # type: ignore[arg-type]
+
+    assert provider.calls == []
+    assert store.calls == []
+
+
+@pytest.mark.parametrize(
+    ("repository_namespace", "query_text"),
+    [
+        (_HostileEqualityString("repo"), "query"),
+        ("repo", _HostileIsspaceString("query")),
+    ],
+)
+def test_request_rejects_hostile_string_subclasses_before_all_dependency_calls(
+    repository_namespace: str,
+    query_text: str,
+) -> None:
+    provider = RecordingProvider()
+    store = RecordingStore(_active(_snapshot()))
+
+    with pytest.raises(InvalidSearchRequest, match=REQUEST_PATTERN):
+        SemanticSearcher(provider, store).search(
+            repository_namespace,
+            query_text,
+            1,
+        )
 
     assert provider.calls == []
     assert store.calls == []

@@ -225,9 +225,9 @@ def validate_search_request(
 ) -> None:
     """Reject malformed or unbounded semantic-search requests."""
     if (
-        not isinstance(repository_namespace, str)
+        type(repository_namespace) is not str
         or not repository_namespace
-        or not isinstance(query_text, str)
+        or type(query_text) is not str
         or not query_text
         or query_text.isspace()
         or len(query_text) > max_query_chars

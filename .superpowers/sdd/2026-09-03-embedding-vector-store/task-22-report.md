@@ -25,11 +25,21 @@
 - Fresh full semantic-search suite: `101 passed`.
 - Fresh combined semantic-search, validation, public-model, vector-store-contract, and Chroma-store suites: `363 passed`.
 
+## Second Review Fix Evidence
+
+- RED request-subclass selector: `2 failed, 101 deselected`; a hostile query leaked `RuntimeError` from its overridden `isspace`, while a hostile namespace was accepted and reached the store instead of raising `InvalidSearchRequest`.
+- Request validation now requires exact `str` instances before string truthiness, method calls, length checks, dependency calls, or later comparisons.
+- Existing exact-`int` guards continue to reject booleans for `top_k`, `max_query_chars`, and `max_top_k`; valid boundary integers remain covered.
+- Focused request-subclass GREEN selector: `2 passed, 101 deselected`.
+- Fresh full semantic-search suite: `103 passed`.
+- Fresh combined semantic-search, validation, public-model, vector-store-contract, and Chroma-store suites: `365 passed`.
+
 ## Self-review
 
 - Confirmed the entire tuple is validated before any public result is constructed.
 - Confirmed no invalid record is filtered or shortened into apparent success.
 - Confirmed equality uses the complete requested namespace and uniqueness uses exact chunk IDs.
 - Confirmed fixed corruption errors do not interpolate store-controlled values.
+- Confirmed ordinary exact strings remain accepted and query text remains unchanged through validation, embedding, and search orchestration.
 - Confirmed `git diff --check` reports no whitespace errors.
 - Task 23 was not started.
