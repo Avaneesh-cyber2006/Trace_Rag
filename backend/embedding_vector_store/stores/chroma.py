@@ -87,12 +87,39 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class _PersistenceConcurrencyState:
-    """Process-local reader state shared by stores for one persistence root."""
+    """Process-lifetime ownership and reader state for one local root.
 
-    def __init__(self) -> None:
+    Chroma caches its persistent clients for the process lifetime, so ownership
+    must outlive individual adapter objects too. The OS releases the file lock
+    on normal exit or termination. Never unlink its path: that would allow a
+    second process to lock a different inode for the same persistence root.
+    """
+
+    def __init__(self, root: Path) -> None:
         self.lock = Lock()
         self.readers: dict[str, int] = {}
         self.pending_cleanup: set[str] = set()
+        self.owner_process_id = os.getpid()
+        self.ownership_file = (root / ".tr5-owner.lock").open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                # Byte-range locks also cover bytes beyond the end of a file.
+                self.ownership_file.seek(0)
+                msvcrt.locking(self.ownership_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    self.ownership_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            self.client = chromadb.PersistentClient(
+                path=str(root), settings=Settings(anonymized_telemetry=False)
+            )
+        except BaseException:
+            self.ownership_file.close()
+            raise
 
 
 _PERSISTENCE_STATES_LOCK = Lock()
@@ -104,9 +131,24 @@ def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
     with _PERSISTENCE_STATES_LOCK:
         state = _PERSISTENCE_STATES.get(key)
         if state is None:
-            state = _PersistenceConcurrencyState()
+            state = _PersistenceConcurrencyState(root)
             _PERSISTENCE_STATES[key] = state
+        elif state.owner_process_id != os.getpid():
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
         return state
+
+
+def _release_inherited_ownership() -> None:
+    """A forked child must not prolong the parent's OS ownership lease."""
+    global _PERSISTENCE_STATES_LOCK
+    _PERSISTENCE_STATES_LOCK = Lock()
+    for state in _PERSISTENCE_STATES.values():
+        # Close only; explicit flock unlock would release the parent's lock too.
+        state.ownership_file.close()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_release_inherited_ownership)
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -228,16 +270,13 @@ class ChromaVectorStore:
             if root.exists() and not root.is_dir():
                 raise OSError("persistence root is not a directory")
             root.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(
-                path=str(root),
-                settings=Settings(anonymized_telemetry=False),
-            )
+            concurrency_state = _persistence_concurrency_state(root)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE) from error
         self._persistence_root = root
-        self._client = client
-        self._owner_process_id = os.getpid()
-        self._concurrency_state = _persistence_concurrency_state(root)
+        self._client = concurrency_state.client
+        self._owner_process_id = concurrency_state.owner_process_id
+        self._concurrency_state = concurrency_state
 
     def _assert_owner_process(self) -> None:
         if os.getpid() != self._owner_process_id:

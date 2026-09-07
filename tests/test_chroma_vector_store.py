@@ -736,6 +736,90 @@ def test_writer_mutation_rejects_use_from_a_non_owning_process(
         store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
 
 
+_SUBPROCESS_WRITER = """
+import json
+import os
+import sys
+from backend.embedding_vector_store.exceptions import VectorStoreConfigurationError
+from backend.embedding_vector_store.models import EmbeddingModelIdentity
+from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
+
+try:
+    store = ChromaVectorStore(sys.argv[1])
+    candidate = store.begin_candidate(
+        "subprocess-repository", EmbeddingModelIdentity("test", "test", 3, "v1"),
+        "subprocess-document-v1", 0,
+    )
+    store.publish(candidate)
+except VectorStoreConfigurationError as error:
+    print(json.dumps({"outcome": "rejected", "message": str(error)}))
+else:
+    print(json.dumps({"outcome": "published"}), flush=True)
+    if sys.argv[2] == "abrupt":
+        os._exit(0)
+"""
+
+
+def _run_subprocess_writer(root: Path, exit_mode: str = "normal") -> dict[str, str]:
+    result = subprocess.run(
+        [sys.executable, "-c", _SUBPROCESS_WRITER, str(root), exit_mode],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def test_concurrent_subprocess_writer_rejected_for_owned_persistence_root(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    # A second same-process instance shares ownership and can publish normally.
+    same_process_store = ChromaVectorStore(store._persistence_root / ".")
+    snapshot = same_process_store.publish(
+        same_process_store.begin_candidate(NAMESPACE, IDENTITY, "owner-document-v1", 0)
+    )
+
+    result = _run_subprocess_writer(store._persistence_root)
+
+    assert result == {
+        "outcome": "rejected", "message": "Vector store configuration is invalid."
+    }
+    assert store.inspect_active(NAMESPACE).snapshot == snapshot
+    assert not store.inspect_active("subprocess-repository").indexed
+
+
+@pytest.mark.parametrize("exit_mode", ("normal", "abrupt"))
+def test_subprocess_writer_ownership_released_on_process_exit(
+    tmp_path: Path, exit_mode: str,
+) -> None:
+    root = tmp_path / "external-vector-data"
+    assert _run_subprocess_writer(root, exit_mode) == {"outcome": "published"}
+
+    reopened = ChromaVectorStore(root)
+
+    assert reopened.inspect_active("subprocess-repository").indexed
+    snapshot = reopened.publish(
+        reopened.begin_candidate(NAMESPACE, IDENTITY, "restarted-document-v1", 0)
+    )
+    assert reopened.inspect_active(NAMESPACE).snapshot == snapshot
+
+
+def test_writer_ownership_released_after_client_initialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_client(**kwargs: object) -> None:
+        raise RuntimeError("private initialization failure")
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fail_client)
+    root = tmp_path / "external-vector-data"
+    with pytest.raises(VectorStoreConfigurationError):
+        ChromaVectorStore(root)
+
+    assert _run_subprocess_writer(root) == {"outcome": "published"}
+
+
 def test_publication_failure_with_valid_third_pointer_is_ambiguous_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
