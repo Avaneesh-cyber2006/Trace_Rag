@@ -996,6 +996,57 @@ class ChromaVectorStore:
         except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
             _LOGGER.warning("Vector store cleanup failed.")
 
+    def _repository_collection_names(
+        self, repository_namespace: str
+    ) -> tuple[str, ...]:
+        """Discover and fully validate adapter collections for one exact namespace."""
+        prefix = f"tr5-{self._namespace_digest(repository_namespace)}-"
+        try:
+            listed = self._client.list_collections()
+        except (ChromaError, OSError, RuntimeError) as error:
+            raise VectorStoreReadError(_READ_MESSAGE) from error
+        except (TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+        names: list[str] = []
+        try:
+            for collection in listed:
+                collection_name = collection.name
+                if isinstance(collection_name, str) and collection_name.startswith(prefix):
+                    names.append(collection_name)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from error
+
+        for collection_name in sorted(names):
+            self._snapshot_for_collection(repository_namespace, collection_name)
+        return tuple(sorted(names))
+
+    def delete_repository_index(self, repository_namespace: str) -> None:
+        """Delete only the fully validated index for one exact namespace."""
+        if not _is_nonempty_string(repository_namespace):
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+
+        active_collection = self._read_active_collection_name(repository_namespace)
+        collection_names = self._repository_collection_names(repository_namespace)
+        if active_collection is not None and active_collection not in collection_names:
+            _raise_corruption()
+
+        pointer_path = self._active_pointer_path(repository_namespace)
+        if active_collection is not None:
+            try:
+                pointer_path.unlink()
+            except OSError as error:
+                raise VectorStoreWriteError(_WRITE_MESSAGE) from error
+
+        failed = False
+        for collection_name in collection_names:
+            try:
+                self._client.delete_collection(collection_name)
+            except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+                failed = True
+        if failed:
+            raise VectorStoreWriteError(_WRITE_MESSAGE)
+
     def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
         """Publish a complete candidate through one durable pointer replacement."""
         previous_state = self.inspect_active(candidate.repository_namespace)

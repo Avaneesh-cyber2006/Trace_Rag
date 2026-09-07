@@ -125,6 +125,21 @@ def _candidate_records() -> tuple[VectorRecord, VectorRecord]:
     )
 
 
+def _publish_records(
+    store: ChromaVectorStore,
+    repository_namespace: str,
+    records: tuple[VectorRecord, ...],
+) -> RepositoryIndexSnapshot:
+    candidate = store.begin_candidate(
+        repository_namespace,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        len(records),
+    )
+    store.add_embedded(candidate, records)
+    return store.publish(candidate)
+
+
 def test_never_indexed_repository_has_explicit_inactive_state(tmp_path: Path) -> None:
     state = _store(tmp_path).inspect_active(NAMESPACE)
 
@@ -176,6 +191,169 @@ def test_empty_state_is_published_and_distinct_from_never_indexed(tmp_path: Path
     assert reopened.indexed is True
     assert reopened.snapshot is not None
     assert reopened.snapshot.expected_chunk_count == 0
+
+
+def test_delete_repository_index_removes_only_exact_namespace_and_survives_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    deleted_namespace = "tracerag-repository-v1:github:example/delete-me"
+    retained_namespace = "tracerag-repository-v1:github:example/delete-me-too"
+    first = _publish_records(store, deleted_namespace, ())
+    old_collection = first._token
+
+    monkeypatch.setattr(store, "_cleanup_obsolete_collection", lambda *args: None)
+    current = _publish_records(store, deleted_namespace, _candidate_records())
+    abandoned = store.begin_candidate(
+        deleted_namespace,
+        IDENTITY,
+        "tracerag-embedding-document-v1",
+        0,
+    )
+    retained = _publish_records(store, retained_namespace, _candidate_records())
+    retained_before = store.search(retained, EmbeddingVector((1.0, 0.0, 0.0)), 2)
+    deleted_collections = {
+        old_collection,
+        current._token,
+        store._candidate_collection_name(abandoned),
+    }
+    retained_collection = retained._token
+    events: list[tuple[str, str]] = []
+    pointer_path = store._active_pointer_path(deleted_namespace)
+    path_type = type(pointer_path)
+    original_unlink = path_type.unlink
+    original_delete_collection = store._client.delete_collection
+
+    def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == pointer_path:
+            events.append(("pointer", path.name))
+        original_unlink(path, *args, **kwargs)
+
+    def record_delete_collection(collection_name: str) -> None:
+        events.append(("collection", collection_name))
+        original_delete_collection(collection_name)
+
+    monkeypatch.setattr(path_type, "unlink", record_unlink)
+    monkeypatch.setattr(store._client, "delete_collection", record_delete_collection)
+
+    store.delete_repository_index(deleted_namespace)
+
+    assert events[0][0] == "pointer"
+    assert {name for kind, name in events if kind == "collection"} == deleted_collections
+    assert retained_collection not in {name for kind, name in events if kind == "collection"}
+    reopened = _store(tmp_path)
+    assert reopened.inspect_active(deleted_namespace).indexed is False
+    retained_after = reopened.inspect_active(retained_namespace)
+    assert retained_after.snapshot is not None
+    assert retained_after.snapshot._token == retained_collection
+    assert (
+        reopened.search(
+            retained_after.snapshot,
+            EmbeddingVector((1.0, 0.0, 0.0)),
+            2,
+        )
+        == retained_before
+    )
+
+
+@pytest.mark.parametrize("namespace", ("", None, 5))
+def test_delete_repository_index_rejects_invalid_namespace(
+    tmp_path: Path, namespace: object
+) -> None:
+    with pytest.raises(VectorStoreConfigurationError):
+        _store(tmp_path).delete_repository_index(namespace)  # type: ignore[arg-type]
+
+
+def test_delete_repository_index_never_expands_substrings_display_names_or_patterns(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    full_namespace = "tracerag-repository-v1:github:example/project"
+    snapshot = _publish_records(store, full_namespace, _candidate_records())
+
+    store.delete_repository_index("project")
+    store.delete_repository_index(full_namespace[:-4])
+    store.delete_repository_index("*")
+
+    active = store.inspect_active(full_namespace)
+    assert active.snapshot is not None
+    assert active.snapshot._token == snapshot._token
+
+
+def test_delete_repository_index_rejects_digest_collision_before_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    first = "tracerag-repository-v1:github:example/first"
+    colliding = "tracerag-repository-v1:github:example/second"
+    monkeypatch.setattr(store, "_namespace_digest", lambda namespace: "f" * 64)
+    snapshot = _publish_records(store, first, _candidate_records())
+    pointer_path = store._active_pointer_path(first)
+    collections_before = {item.name for item in store._client.list_collections()}
+
+    with pytest.raises(VectorStoreCorruptionError):
+        store.delete_repository_index(colliding)
+
+    assert pointer_path.exists()
+    assert {item.name for item in store._client.list_collections()} == collections_before
+    assert store.inspect_active(first).snapshot == snapshot
+
+
+def test_delete_repository_index_never_touches_source_repository_files(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-repository"
+    source_root.mkdir()
+    source_file = source_root / "evidence.py"
+    source_file.write_bytes(b"print('exact source')\r\n")
+    namespace = str(source_root)
+    store = _store(tmp_path)
+    _publish_records(store, namespace, _candidate_records())
+
+    store.delete_repository_index(namespace)
+
+    assert source_root.is_dir()
+    assert source_file.read_bytes() == b"print('exact source')\r\n"
+
+
+def test_delete_repository_index_maps_pointer_removal_failure_to_typed_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    snapshot = _publish_records(store, NAMESPACE, _candidate_records())
+    pointer_path = store._active_pointer_path(NAMESPACE)
+    path_type = type(pointer_path)
+    original_unlink = path_type.unlink
+
+    def fail_pointer_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == pointer_path:
+            raise OSError("injected pointer removal failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "unlink", fail_pointer_unlink)
+
+    with pytest.raises(VectorStoreWriteError):
+        store.delete_repository_index(NAMESPACE)
+
+    assert pointer_path.exists()
+    assert {item.name for item in store._client.list_collections()} >= {snapshot._token}
+
+
+def test_delete_repository_index_maps_collection_failure_after_logical_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    _publish_records(store, NAMESPACE, _candidate_records())
+
+    def fail_collection_delete(collection_name: str) -> None:
+        raise RuntimeError("injected collection removal failure")
+
+    monkeypatch.setattr(store._client, "delete_collection", fail_collection_delete)
+
+    with pytest.raises(VectorStoreWriteError):
+        store.delete_repository_index(NAMESPACE)
+
+    assert store.inspect_active(NAMESPACE).indexed is False
 
 
 def test_add_reused_completes_candidate_without_core_vector_conversion(
