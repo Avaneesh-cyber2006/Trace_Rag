@@ -1302,11 +1302,18 @@ Register `gemini_live`. At module setup, skip unless both `TRACERAG_RUN_GEMINI_L
 
 ```powershell
 Remove-Item Env:TRACERAG_RUN_GEMINI_LIVE -ErrorAction SilentlyContinue
-python -m pytest tests/integration/test_gemini_embeddings_live.py -q -rs
-python -m pytest -q -m "not gemini_live"
+python -m pytest tests/integration/test_gemini_embeddings_live.py -q -rs -m gemini_live
+python -m pytest -q -m "not integration and not gemini_live"
 ```
 
 Expected: live test skips and ordinary suite passes without network.
+
+The original exact `-m "not gemini_live"` selector overrides, rather than combines
+with, pytest.ini's marker filter and selects the existing networked GitHub-clone
+integration test. Use the combined selector above (or default pytest selection)
+for a fully offline run. Default addopts excludes both markers even when both
+live guards are set; explicitly select `-m gemini_live` to exercise the guards
+or intentionally execute the live check.
 
 - [ ] **Step 3: Keep the live path minimal**
 
@@ -1316,7 +1323,7 @@ Use only `GeminiEmbeddingProvider` public operations; do not persist returned ve
 
 ```powershell
 python -m pytest --markers
-python -m pytest tests/integration/test_gemini_embeddings_live.py -q -rs
+python -m pytest tests/integration/test_gemini_embeddings_live.py -q -rs -m gemini_live
 ```
 
 - [ ] **Step 5: Commit**
