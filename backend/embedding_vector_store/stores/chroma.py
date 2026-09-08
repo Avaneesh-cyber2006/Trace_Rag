@@ -1067,17 +1067,26 @@ class ChromaVectorStore:
         collection = self._candidate_collection(candidate)
         mapped_failure = None
         try:
-            existing_ids = collection.get(include=[])["ids"]
+            count = collection.count()
             if (
-                not isinstance(existing_ids, list)
-                or len(existing_ids) + len(records) > candidate.expected_chunk_count
-                or not set(existing_ids).isdisjoint(record.chunk_id for record in records)
+                not _is_nonnegative_integer(count)
+                or count + len(records) > candidate.expected_chunk_count
             ):
                 raise ValueError("candidate record set is invalid")
             if not records:
                 return
+            # Look up only this batch: scanning the accumulated candidate at
+            # every append makes bounded synchronization writes quadratic.
+            # Read persisted state so a reopened adapter needs no ID cache.
+            incoming_ids = [record["identifier"] for record in encoded_records]
+            existing_ids = collection.get(ids=incoming_ids, include=[])["ids"]
+            # Only an exact empty list proves no incoming ID already exists.
+            # Nonempty results (including malformed/unrequested IDs) and all
+            # other response types fail closed before any candidate mutation.
+            if type(existing_ids) is not list or existing_ids:
+                raise ValueError("candidate record set is invalid")
             collection.add(
-                ids=[record["identifier"] for record in encoded_records],
+                ids=incoming_ids,
                 embeddings=[list(record["embedding"]) for record in encoded_records],
                 documents=[record["document"] for record in encoded_records],
                 metadatas=[record["metadata"] for record in encoded_records],

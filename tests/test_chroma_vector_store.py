@@ -150,6 +150,92 @@ def _publish_records(
     return store.publish(candidate)
 
 
+@pytest.mark.parametrize("operation", ["add_embedded", "add_reused"])
+def test_candidate_appends_reject_duplicates_and_overflow_after_reopen(tmp_path, operation):
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, _candidate().document_version, 2)
+    records = _candidate_records() if operation == "add_embedded" else (
+        _record(chunk_id="c" * 64), _record(chunk_id="e" * 64),
+    )
+    append = getattr(store, operation)
+    with pytest.raises(VectorStoreWriteError):
+        append(candidate, (records[0], records[0]))
+    assert store._candidate_collection(candidate).count() == 0
+    append(candidate, (records[0],))
+
+    reopened = _store(tmp_path)
+    append = getattr(reopened, operation)
+    with pytest.raises(VectorStoreWriteError):
+        append(candidate, (records[0],))
+    assert reopened._candidate_collection(candidate).count() == 1
+    append(candidate, (records[1],))
+    with pytest.raises(VectorStoreWriteError):
+        append(candidate, (replace(records[0], chunk_id="f" * 64),))
+    assert reopened._candidate_collection(candidate).count() == 2
+    reopened.validate_candidate(candidate)
+    snapshot = reopened.publish(candidate)
+    assert {record.chunk_id for record in reopened.read_manifest(snapshot)} == {
+        "c" * 64, "e" * 64,
+    }
+
+
+def test_candidate_append_checks_persisted_ids_after_writer_process_exit(tmp_path):
+    # The first batch belongs to a different process; duplicate checks cannot
+    # depend on a process-local cache populated by earlier append calls.
+    script = """
+import runpy
+import sys
+from pathlib import Path
+fixtures = runpy.run_path("tests/test_chroma_vector_store.py")
+store = fixtures["_store"](Path(sys.argv[1]))
+candidate = fixtures["_candidate"]()
+store._create_candidate_collection(candidate)
+store.add_embedded(candidate, (fixtures["_candidate_records"]()[0],))
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], check=True,
+        capture_output=True, text=True, timeout=30,
+    )
+    reopened = _store(tmp_path)
+    candidate = _candidate()
+    records = _candidate_records()
+    with pytest.raises(VectorStoreWriteError):
+        reopened.add_embedded(candidate, (records[0],))
+    assert reopened._candidate_collection(candidate).count() == 1
+    reopened.add_embedded(candidate, (records[1],))
+    snapshot = reopened.publish(candidate)
+    assert {record.chunk_id for record in reopened.read_manifest(snapshot)} == {
+        "c" * 64, "e" * 64,
+    }
+
+
+@pytest.mark.parametrize("count", [True, -1, 1.0, "1", None, 3])
+@pytest.mark.parametrize("empty", [False, True])
+def test_candidate_append_rejects_invalid_persisted_count(tmp_path, monkeypatch, count, empty):
+    from chromadb.api.models.Collection import Collection
+
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, _candidate().document_version, 2)
+    original_count = Collection.count
+    monkeypatch.setattr(Collection, "count", lambda self: count)
+    with pytest.raises(VectorStoreWriteError):
+        store.add_embedded(candidate, () if empty else (_candidate_records()[0],))
+    assert original_count(store._candidate_collection(candidate)) == 0
+
+
+@pytest.mark.parametrize("ids", [None, (), "", [None], [True], [1], [[]],
+                                    ["z" * 64], ["f" * 64], ["c" * 64, "c" * 64]])
+def test_candidate_append_rejects_malformed_or_unrequested_lookup_ids(tmp_path, monkeypatch, ids):
+    from chromadb.api.models.Collection import Collection
+
+    store = _store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, _candidate().document_version, 2)
+    monkeypatch.setattr(Collection, "get", lambda self, *args, **kwargs: {"ids": ids})
+    with pytest.raises(VectorStoreWriteError):
+        store.add_embedded(candidate, (_candidate_records()[0],))
+    assert store._candidate_collection(candidate).count() == 0
+
+
 def test_never_indexed_repository_has_explicit_inactive_state(tmp_path: Path) -> None:
     state = _store(tmp_path).inspect_active(NAMESPACE)
 

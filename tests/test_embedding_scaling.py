@@ -3,6 +3,7 @@
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
+import gc
 from hashlib import sha256
 import weakref
 
@@ -24,6 +25,7 @@ from backend.embedding_vector_store.stores.base import (
     CandidateIndex, RepositoryIndexSnapshot, RepositoryIndexState,
     StoreSearchResult, StoredRecord,
 )
+from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
 import backend.embedding_vector_store.synchronization as synchronization
 from backend.embedding_vector_store.validation import ChunkInput
 
@@ -86,6 +88,7 @@ class _CountingProvider:
         if self.vector_tracker is not None:
             for vector in vectors:
                 self.vector_tracker.watch(vector)
+            self.vector_tracker.observe()
         return vectors
 
     def embed_query(self, query_text):
@@ -169,27 +172,34 @@ class _CountingStore:
 
 
 class _TrackedDocument(EmbeddingDocument):
-    __slots__ = ("__weakref__",)
+    __slots__ = ("__weakref__", "_gc_cycle")
 
 
 class _TrackedVector(EmbeddingVector):
-    __slots__ = ("__weakref__",)
+    __slots__ = ("__weakref__", "_gc_cycle")
 
 
 class _LifetimeCounter:
     def __init__(self):
-        self.live = 0
+        self.references = []
         self.peak = 0
         self.created = 0
 
     def watch(self, value):
-        self.live += 1
+        # Cycles deliberately defeat immediate reference-count disposal even
+        # on CPython, exercising collection rather than incidental timing.
+        object.__setattr__(value, "_gc_cycle", value)
         self.created += 1
-        self.peak = max(self.peak, self.live)
-        weakref.finalize(value, self._released)
+        self.references.append(weakref.ref(value))
 
-    def _released(self):
-        self.live -= 1
+    def observe(self):
+        # Explicit collection makes observations independent of refcount timing.
+        # Keep only weak references: this harness must not own the payloads.
+        gc.collect()
+        self.references = [reference for reference in self.references if reference() is not None]
+        live = len(self.references)
+        self.peak = max(self.peak, live)
+        return live
 
 
 class _CountingId(str):
@@ -255,6 +265,53 @@ def test_provider_and_candidate_writes_are_bounded_and_cover_each_chunk_once(siz
     assert provider.query_calls == store.calls["abort"] == 0
 
 
+@pytest.mark.parametrize("size", [257, 1025])
+@pytest.mark.parametrize("reuse", [False, True])
+def test_real_chroma_candidate_id_work_is_linear(tmp_path, monkeypatch, size, reuse):
+    # Re-reading the accumulated candidate on each small append makes total
+    # returned IDs quadratic. Count real adapter/Chroma I/O, including validation.
+    from chromadb.api.models.Collection import Collection
+
+    capacity = 17
+    provider = _CountingProvider(capacity)
+    store = ChromaVectorStore(tmp_path / "vectors")
+    chunks = tuple(_chunk(i) for i in range(size))
+    indexer = synchronization.SemanticIndexer(provider, store)
+    if reuse:
+        indexer.synchronize(_inventory(chunks))
+        chunks = chunks[:-1] + (_chunk(size - 1, "changed"),)
+
+    work = Counter()
+    original_get = Collection.get
+    original_count = Collection.count
+
+    def counted_get(collection, *args, **kwargs):
+        result = original_get(collection, *args, **kwargs)
+        work["returned"] += len(result["ids"])
+        if kwargs.get("include") == []:
+            requested = kwargs.get("ids")
+            work["unbounded"] += requested is None
+            work["requested"] += len(requested) if requested is not None else 0
+            work["largest_lookup"] = max(work["largest_lookup"], len(requested or ()))
+        return result
+
+    def counted_count(collection):
+        work["counts"] += 1
+        return original_count(collection)
+
+    monkeypatch.setattr(Collection, "get", counted_get)
+    monkeypatch.setattr(Collection, "count", counted_count)
+    result = indexer.synchronize(_inventory(chunks))
+
+    assert result.total_chunks == size
+    assert work["returned"] <= 10 * size
+    assert work["unbounded"] == 0
+    assert work["requested"] == size
+    assert work["largest_lookup"] <= capacity
+    assert work["counts"] <= 2 * ((size + capacity - 1) // capacity) + 20
+    assert len(store.read_manifest(store.inspect_active("repo").snapshot)) == size
+
+
 def test_rendered_documents_are_released_before_rendering_the_next_batch(monkeypatch):
     # Rendering eagerly, or retaining the preceding document tuple while the
     # next tuple is built, exceeds one batch of live rendered documents.
@@ -265,6 +322,10 @@ def test_rendered_documents_are_released_before_rendering_the_next_batch(monkeyp
         rendered = original(*args)
         tracked = _TrackedDocument(rendered.chunk_id, rendered.text)
         tracker.watch(tracked)
+        # Observe both the first and last object in each batch. The first
+        # catches overlap while a new tuple is still being constructed.
+        if tracker.created % 17 in (0, 1):
+            tracker.observe()
         return tracked
 
     monkeypatch.setattr(synchronization, "build_embedding_document", tracked_render)
@@ -273,8 +334,8 @@ def test_rendered_documents_are_released_before_rendering_the_next_batch(monkeyp
         _inventory(tuple(_chunk(i) for i in range(1025)))
     )
     assert tracker.created == 1025
+    assert tracker.observe() == 0
     assert tracker.peak <= 17
-    assert tracker.live == 0
 
 
 def test_incremental_candidate_bounds_reuse_writes_and_embeds_only_changes():
@@ -307,8 +368,8 @@ def test_core_does_not_retain_repository_wide_vectors_between_candidate_writes()
         _inventory(tuple(_chunk(i) for i in range(1025)))
     )
     assert tracker.created == 1025
+    assert tracker.observe() == 0
     assert tracker.peak <= 17
-    assert tracker.live == 0
 
 
 def test_large_noop_does_not_render_embed_or_write_candidates(monkeypatch):
