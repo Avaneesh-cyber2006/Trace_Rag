@@ -25,6 +25,7 @@ from ..exceptions import (
     EmbeddingVectorStoreConfigurationError,
     VectorStoreConfigurationError,
     VectorStoreCorruptionError,
+    VectorStoreError,
     VectorStorePublicationError,
     VectorStoreReadError,
     VectorStoreWriteError,
@@ -194,6 +195,7 @@ def _identity_from_metadata(metadata: dict[str, object]) -> EmbeddingModelIdenti
         metadata.get("embedding_dimensions")
     ):
         _raise_corruption()
+    mapped_failure = None
     try:
         return EmbeddingModelIdentity(
             provider=metadata["embedding_provider"],  # type: ignore[arg-type]
@@ -202,7 +204,9 @@ def _identity_from_metadata(metadata: dict[str, object]) -> EmbeddingModelIdenti
             compatibility_version=metadata["embedding_compatibility_version"],  # type: ignore[arg-type]
         )
     except EmbeddingVectorStoreConfigurationError:
-        raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+        mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+    if mapped_failure is not None:
+        raise mapped_failure
 
 
 def _metadata_for_identity(identity: EmbeddingModelIdentity) -> dict[str, str | int]:
@@ -219,20 +223,26 @@ def _validated_embedding_values(
 ) -> tuple[float, ...]:
     if isinstance(embedding, (str, bytes)) or not isinstance(embedding, Iterable):
         _raise_corruption()
+    mapped_failure = None
     try:
         values = tuple(embedding)
     except (TypeError, ValueError):
-        raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+        mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+    if mapped_failure is not None:
+        raise mapped_failure
     if len(values) != identity.dimensions:
         _raise_corruption()
     normalized_values: list[float] = []
     for value in values:
         if isinstance(value, bool) or not isinstance(value, Real):
             _raise_corruption()
+        mapped_failure = None
         try:
             normalized = float(value)
         except (OverflowError, TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         if not math.isfinite(normalized):
             _raise_corruption()
         normalized_values.append(normalized)
@@ -242,13 +252,16 @@ def _validated_embedding_values(
 def _project_embedding_values(
     embedding: EmbeddingVector, identity: EmbeddingModelIdentity
 ) -> EmbeddingVector:
+    mapped_failure = None
     try:
         values = _validated_embedding_values(embedding.values, identity)
         projected = tuple(
             struct.unpack("!f", struct.pack("!f", value))[0] for value in values
         )
     except (OverflowError, struct.error, VectorStoreCorruptionError):
-        raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+        mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+    if mapped_failure is not None:
+        raise mapped_failure
     if not all(math.isfinite(value) for value in projected):
         raise VectorStoreWriteError(_WRITE_MESSAGE)
     return EmbeddingVector(projected)
@@ -257,10 +270,13 @@ def _project_embedding_values(
 def _score_from_cosine_distance(distance: object) -> float:
     if isinstance(distance, bool) or not isinstance(distance, Real):
         _raise_corruption()
+    mapped_failure = None
     try:
         normalized = float(distance)
     except (OverflowError, TypeError, ValueError):
-        raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+        mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+    if mapped_failure is not None:
+        raise mapped_failure
     if not math.isfinite(normalized):
         _raise_corruption()
     if abs(normalized) <= _COSINE_DISTANCE_ENDPOINT_TOLERANCE:
@@ -278,14 +294,19 @@ class ChromaVectorStore:
     def __init__(self, persistence_root: str | Path) -> None:
         if not isinstance(persistence_root, (str, Path)) or not str(persistence_root):
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        mapped_failure = None
         try:
             root = Path(persistence_root).expanduser().resolve()
             if root.exists() and not root.is_dir():
                 raise OSError("persistence root is not a directory")
             root.mkdir(parents=True, exist_ok=True)
             concurrency_state = _persistence_concurrency_state(root)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE) from None
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         self._persistence_root = root
         self._client = concurrency_state.client
         self._owner_process_id = concurrency_state.owner_process_id
@@ -315,7 +336,7 @@ class ChromaVectorStore:
         """Run a reserved best-effort delete without holding the state lock."""
         try:
             self._client.delete_collection(collection_name)
-        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+        except Exception:
             _LOGGER.warning("Vector store cleanup failed.")
         finally:
             with self._concurrency_state.lock:
@@ -393,12 +414,16 @@ class ChromaVectorStore:
 
     def _read_active_collection_name(self, repository_namespace: str) -> str | None:
         pointer_path = self._active_pointer_path(repository_namespace)
+        mapped_failure = None
         try:
             pointer_bytes = pointer_path.read_bytes()
         except FileNotFoundError:
             return None
         except OSError:
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
+        mapped_failure = None
         try:
             envelope = json.loads(pointer_bytes.decode("utf-8"))
             if (
@@ -421,7 +446,9 @@ class ChromaVectorStore:
                 _raise_corruption()
             return payload["active_collection"]
         except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def _snapshot_for_collection(
         self, repository_namespace: str, collection_name: str
@@ -488,38 +515,53 @@ class ChromaVectorStore:
         """Open one adapter-owned collection, separating outage from corruption."""
         if not self._is_collection_locator(repository_namespace, collection_name):
             _raise_corruption()
+        mapped_failure = None
         try:
             return self._client.get_collection(
                 name=collection_name, embedding_function=None
             )
         except NotFoundError:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
-        except (ChromaError, OSError, RuntimeError):
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
         except (TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     @staticmethod
     def _read_collection_metadata(collection: object) -> object:
+        mapped_failure = None
         try:
             return collection.metadata
         except NotFoundError:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
-        except (ChromaError, OSError, RuntimeError):
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
         except (TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     @staticmethod
     def _read_collection_count(collection: object) -> object:
+        mapped_failure = None
         try:
             return collection.count()
         except NotFoundError:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
-        except (ChromaError, OSError, RuntimeError):
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
         except (TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def begin_candidate(
         self,
@@ -530,6 +572,7 @@ class ChromaVectorStore:
     ) -> CandidateIndex:
         """Create one private immutable-generation candidate."""
         self._assert_owner_process()
+        mapped_failure = None
         try:
             candidate = CandidateIndex(
                 repository_namespace=repository_namespace,
@@ -540,7 +583,9 @@ class ChromaVectorStore:
                 _token=secrets.token_hex(16),
             )
         except ValueError:
-            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE) from None
+            mapped_failure = VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         self._create_candidate_collection(candidate)
         return candidate
 
@@ -608,10 +653,13 @@ class ChromaVectorStore:
             or top_k <= 0
         ):
             raise VectorStoreReadError(_READ_MESSAGE)
+        mapped_failure = None
         try:
             query_values = _validated_embedding_values(query.values, snapshot.identity)
         except VectorStoreCorruptionError:
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
         collection = self._read_collection(
             snapshot.repository_namespace, snapshot._token
@@ -635,6 +683,7 @@ class ChromaVectorStore:
             return ()
 
         n_results = min(top_k, count)
+        mapped_failure = None
         try:
             query_result = collection.query(
                 query_embeddings=[list(query_values)],
@@ -646,11 +695,15 @@ class ChromaVectorStore:
             metadatas = query_result["metadatas"]
             distances = query_result["distances"]
         except NotFoundError:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
-        except (ChromaError, OSError, RuntimeError):
-            raise VectorStoreReadError(_READ_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
         except (AttributeError, KeyError, TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
         rows: list[object] = []
         for value in (identifiers, documents, metadatas, distances):
@@ -690,6 +743,7 @@ class ChromaVectorStore:
                 or metadata["schema_version"] != snapshot.schema_version
             ):
                 _raise_corruption()
+            mapped_failure = None
             try:
                 results.append(
                     StoreSearchResult(
@@ -707,7 +761,9 @@ class ChromaVectorStore:
                     )
                 )
             except (EmbeddingVectorStoreConfigurationError, ValueError):
-                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
         return tuple(results)
 
     def _encode_record(self, record: StoredRecord) -> dict[str, object]:
@@ -734,10 +790,13 @@ class ChromaVectorStore:
             "document": record.content,
             "metadata": metadata,
         }
+        mapped_failure = None
         try:
             self._decode_record(record.repository_namespace, **encoded)
         except VectorStoreCorruptionError:
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         return encoded
 
     def _decode_record(
@@ -756,6 +815,7 @@ class ChromaVectorStore:
             metadata=metadata,
         )
         normalized_values = _validated_embedding_values(embedding, identity)
+        mapped_failure = None
         try:
             return StoredRecord(
                 repository_namespace=repository_namespace,
@@ -774,7 +834,9 @@ class ChromaVectorStore:
                 schema_version=STORAGE_SCHEMA_VERSION,
             )
         except (EmbeddingVectorStoreConfigurationError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def _validated_record_evidence(
         self,
@@ -821,10 +883,13 @@ class ChromaVectorStore:
             "expected_chunk_count": handle.expected_chunk_count,
             **_metadata_for_identity(handle.identity),
         }
+        mapped_failure = None
         try:
             self._decode_snapshot_metadata(handle.repository_namespace, metadata, object())
         except VectorStoreCorruptionError:
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         return metadata
 
     def _decode_snapshot_metadata(
@@ -841,6 +906,7 @@ class ChromaVectorStore:
         ):
             _raise_corruption()
         identity = _identity_from_metadata(metadata)
+        mapped_failure = None
         try:
             return RepositoryIndexSnapshot(
                 repository_namespace=repository_namespace,
@@ -851,20 +917,25 @@ class ChromaVectorStore:
                 _token=token,
             )
         except ValueError:
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def _candidate_collection_name(self, candidate: CandidateIndex) -> str:
         if not isinstance(candidate, CandidateIndex) or not isinstance(
             candidate._token, str
         ):
             raise VectorStoreWriteError(_WRITE_MESSAGE)
+        mapped_failure = None
         try:
             self._encode_control_metadata(candidate)
             return self._collection_identifier(
                 candidate.repository_namespace, candidate._token
             )
         except (VectorStoreConfigurationError, VectorStoreWriteError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def _is_collection_locator(
         self, repository_namespace: str, collection_name: object
@@ -885,6 +956,7 @@ class ChromaVectorStore:
         """Create one isolated, externally embedded physical candidate."""
         collection_name = self._candidate_collection_name(candidate)
         metadata = self._encode_control_metadata(candidate)
+        mapped_failure = None
         try:
             self._client.create_collection(
                 name=collection_name,
@@ -892,20 +964,21 @@ class ChromaVectorStore:
                 embedding_function=None,
                 configuration={"hnsw": {"space": "cosine"}},
             )
-        except (ChromaError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def _candidate_collection(self, candidate: CandidateIndex):
         """Open a candidate only after its complete control metadata validates."""
         collection_name = self._candidate_collection_name(candidate)
-        try:
-            collection = self._client.get_collection(
-                name=collection_name, embedding_function=None
-            )
-        except (ChromaError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+        collection = self._read_collection(candidate.repository_namespace, collection_name)
         decoded = self._decode_snapshot_metadata(
-            candidate.repository_namespace, collection.metadata, candidate._token
+            candidate.repository_namespace,
+            self._read_collection_metadata(collection),
+            candidate._token,
         )
         if (
             decoded.identity != candidate.identity
@@ -932,6 +1005,7 @@ class ChromaVectorStore:
 
         stored_records: list[StoredRecord] = []
         for record in records:
+            mapped_failure = None
             try:
                 stored = StoredRecord(
                     repository_namespace=candidate.repository_namespace,
@@ -953,16 +1027,21 @@ class ChromaVectorStore:
                 )
                 stored_records.append(stored)
             except (ValueError, VectorStoreCorruptionError):
-                raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+                mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
 
         collection = self._candidate_collection(candidate)
+        mapped_failure = None
         try:
-            if collection.count() != 0:
+            if self._read_collection_count(collection) != 0:
                 raise ValueError("candidate already contains records")
         except (ChromaError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         self._append_stored_candidate(candidate, tuple(stored_records))
-        if self._candidate_collection(candidate).count() != candidate.expected_chunk_count:
+        if self._read_collection_count(self._candidate_collection(candidate)) != candidate.expected_chunk_count:
             raise VectorStoreWriteError(_WRITE_MESSAGE)
 
     def _append_stored_candidate(
@@ -986,6 +1065,7 @@ class ChromaVectorStore:
                 raise VectorStoreWriteError(_WRITE_MESSAGE)
             encoded_records.append(self._encode_record(record))
         collection = self._candidate_collection(candidate)
+        mapped_failure = None
         try:
             existing_ids = collection.get(include=[])["ids"]
             if (
@@ -1002,8 +1082,12 @@ class ChromaVectorStore:
                 documents=[record["document"] for record in encoded_records],
                 metadatas=[record["metadata"] for record in encoded_records],
             )
-        except (ChromaError, KeyError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
     def add_reused(
         self, candidate: CandidateIndex, records: tuple[StoredRecord, ...]
@@ -1025,6 +1109,7 @@ class ChromaVectorStore:
         ):
             raise VectorStoreWriteError(_WRITE_MESSAGE)
         stored_records: list[StoredRecord] = []
+        mapped_failure = None
         try:
             for record in records:
                 stored_records.append(
@@ -1048,7 +1133,9 @@ class ChromaVectorStore:
                     )
                 )
         except (ValueError, VectorStoreCorruptionError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         self._append_stored_candidate(candidate, tuple(stored_records))
 
     def _read_manifest_from_collection(
@@ -1069,6 +1156,7 @@ class ChromaVectorStore:
         identifiers: set[str] = set()
         for offset in range(0, count, _MANIFEST_PAGE_SIZE):
             limit = min(_MANIFEST_PAGE_SIZE, count - offset)
+            mapped_failure = None
             try:
                 page = collection.get(
                     limit=limit,
@@ -1080,19 +1168,26 @@ class ChromaVectorStore:
                 embeddings = page["embeddings"]
                 metadatas = page["metadatas"]
             except NotFoundError:
-                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
-            except (ChromaError, OSError, RuntimeError):
-                raise VectorStoreReadError(_READ_MESSAGE) from None
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
             except (KeyError, TypeError, ValueError):
-                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+            except VectorStoreError:
+                raise
+            except Exception:
+                mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
             if isinstance(embeddings, (str, bytes)) or not isinstance(
                 embeddings, Iterable
             ):
                 _raise_corruption()
+            mapped_failure = None
             try:
                 embedding_rows = tuple(embeddings)
             except (TypeError, ValueError):
-                raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
             if (
                 not isinstance(page_ids, list)
                 or not isinstance(documents, list)
@@ -1150,12 +1245,15 @@ class ChromaVectorStore:
         self, candidate: CandidateIndex, old_collection: str | None
     ) -> RepositoryIndexSnapshot:
         """Accept only an explicitly committed, complete candidate pointer."""
+        mapped_failure = None
         try:
             state = self.inspect_active(candidate.repository_namespace)
         except VectorStoreCorruptionError:
             raise
         except VectorStoreReadError:
-            raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from None
+            mapped_failure = VectorStorePublicationError(_PUBLICATION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
         if state.snapshot is not None and state.snapshot._token == self._candidate_collection_name(
             candidate
         ):
@@ -1188,21 +1286,33 @@ class ChromaVectorStore:
     ) -> tuple[str, ...]:
         """Discover and fully validate adapter collections for one exact namespace."""
         prefix = f"tr5-{self._namespace_digest(repository_namespace)}-"
+        mapped_failure = None
         try:
             listed = self._client.list_collections()
-        except (ChromaError, OSError, RuntimeError):
-            raise VectorStoreReadError(_READ_MESSAGE) from None
         except (TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
         names: list[str] = []
+        mapped_failure = None
         try:
             for collection in listed:
                 collection_name = collection.name
                 if isinstance(collection_name, str) and collection_name.startswith(prefix):
                     names.append(collection_name)
         except (AttributeError, TypeError, ValueError):
-            raise VectorStoreCorruptionError(_CORRUPTION_MESSAGE) from None
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
         for collection_name in sorted(names):
             self._snapshot_for_collection(repository_namespace, collection_name)
@@ -1221,16 +1331,21 @@ class ChromaVectorStore:
 
         pointer_path = self._active_pointer_path(repository_namespace)
         if active_collection is not None:
+            mapped_failure = None
             try:
                 pointer_path.unlink()
             except OSError:
-                raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+                mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
 
         failed = False
         for collection_name in collection_names:
             try:
                 self._client.delete_collection(collection_name)
-            except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+            except VectorStoreError:
+                raise
+            except Exception:
                 failed = True
         if failed:
             raise VectorStoreWriteError(_WRITE_MESSAGE)
@@ -1261,15 +1376,13 @@ class ChromaVectorStore:
             self.validate_candidate(candidate)
             os.replace(temporary_path, pointer_path)
         except OSError:
-            try:
-                snapshot = self._resolve_publication_outcome(candidate, old_collection)
-            except VectorStorePublicationError:
-                raise VectorStorePublicationError(_PUBLICATION_MESSAGE) from None
-        else:
-            snapshot = self._resolve_publication_outcome(candidate, old_collection)
+            pass
+        # Resolve outside the I/O handler: even a failed recovery must never
+        # retain the raw write/replace exception through implicit context.
+        snapshot = self._resolve_publication_outcome(candidate, old_collection)
         try:
             self._cleanup_obsolete_collection(old_collection, collection_name)
-        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+        except Exception:
             _LOGGER.warning("Vector store cleanup failed.")
         return snapshot
 
@@ -1280,10 +1393,15 @@ class ChromaVectorStore:
         active = self.inspect_active(candidate.repository_namespace)
         if active.snapshot is not None and active.snapshot._token == collection_name:
             return
+        mapped_failure = None
         try:
             self._client.delete_collection(collection_name)
-        except (ChromaError, RuntimeError, TypeError, ValueError):
-            raise VectorStoreWriteError(_WRITE_MESSAGE) from None
+        except VectorStoreError:
+            raise
+        except Exception:
+            mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
 
 
 __all__ = ("ChromaVectorStore",)

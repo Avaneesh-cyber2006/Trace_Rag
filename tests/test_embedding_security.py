@@ -17,6 +17,7 @@ import traceback
 
 import httpx
 import pytest
+from chromadb.errors import ChromaError, NotFoundError
 
 from backend.code_chunker.models import (
     ChunkFileStatus,
@@ -30,7 +31,11 @@ from backend.embedding_vector_store.documents import EMBEDDING_DOCUMENT_VERSION
 from backend.embedding_vector_store.exceptions import (
     EmbeddingTransientError,
     EmbeddingVectorStoreConfigurationError,
+    VectorStoreConfigurationError,
+    VectorStoreCorruptionError,
+    VectorStorePublicationError,
     VectorStoreReadError,
+    VectorStoreWriteError,
 )
 from backend.embedding_vector_store.models import (
     EmbeddingDocument,
@@ -50,11 +55,13 @@ from backend.embedding_vector_store.stores.base import (
     StoredRecord,
 )
 from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
+import backend.embedding_vector_store.stores.chroma as chroma_module
 from backend.embedding_vector_store.synchronization import SemanticIndexer
 
 
 SECRET = "TRACERAG_TEST_SECRET_DO_NOT_LEAK"
-SOURCE = "# TRACERAG_TEST_SOURCE_DO_NOT_LEAK\nprint('exact evidence')\n"
+SOURCE_MARKER = "TRACERAG_TEST_SOURCE_DO_NOT_LEAK"
+SOURCE = f"# {SOURCE_MARKER}\nprint('exact evidence')\n"
 AUTH_HEADER = "Authorization: Bearer TRACERAG_TEST_AUTH_HEADER_DO_NOT_LEAK"
 RAW_RESPONSE = "TRACERAG_TEST_RAW_RESPONSE_DO_NOT_LEAK"
 PRIVATE_COLLECTION = "TRACERAG_TEST_PRIVATE_COLLECTION_DO_NOT_LEAK"
@@ -77,7 +84,7 @@ def _assert_sensitive_text_absent(value: object, *, include_source: bool = True)
     rendered = str(value)
     sentinels = [SECRET, AUTH_HEADER, RAW_RESPONSE]
     if include_source:
-        sentinels.append(SOURCE)
+        sentinels.append(SOURCE_MARKER)
     for sentinel in sentinels:
         assert sentinel not in rendered
 
@@ -88,6 +95,24 @@ def _assert_sanitized_exception(error: BaseException) -> None:
     _assert_sensitive_text_absent(repr(error))
     _assert_sensitive_text_absent(rendered)
     assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("render", [str, repr, json.dumps])
+def test_source_detector_rejects_raw_and_escaped_source(render) -> None:
+    with pytest.raises(AssertionError):
+        _assert_sensitive_text_absent(render(SOURCE))
+
+
+def test_public_result_allows_source_only_in_exact_content() -> None:
+    result = VectorSearchResult(
+        CHUNK_ID, CONTENT_HASH, "src/security.py", "python", "symbol",
+        "function", "security", None, SOURCE, 0.75,
+    )
+    public_fields = asdict(result)
+    assert public_fields.pop("content") == SOURCE
+    _assert_sensitive_text_absent(json.dumps(public_fields))
+    _assert_sensitive_text_absent(repr(result))
 
 
 def _vector_record(values: tuple[float, ...] = VECTOR_VALUES) -> VectorRecord:
@@ -372,6 +397,268 @@ def test_cleanup_logging_omits_sensitive_and_private_storage_details(
     assert caplog.messages == ["Vector store cleanup failed."]
     _assert_sensitive_text_absent(caplog.text)
     assert PRIVATE_COLLECTION not in caplog.text
+
+
+class _FaultBoundary:
+    """Inject at a single SDK call/property, forwarding every other access."""
+
+    def __init__(self, wrapped: object, boundary: str, failure: Exception) -> None:
+        self.wrapped = wrapped
+        self.boundary = boundary
+        self.failure = failure
+
+    def __getattr__(self, name: str) -> object:
+        if name == self.boundary:
+            raise self.failure
+        return getattr(self.wrapped, name)
+
+
+@pytest.fixture(scope="module")
+def fault_store(tmp_path_factory):
+    store = ChromaVectorStore(tmp_path_factory.mktemp("security-boundaries"))
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 1)
+    store.add_embedded(candidate, (_vector_record(),))
+    snapshot = store.publish(candidate)
+    return store, snapshot
+
+
+_READ_OPERATIONS = (
+    "inspect_active", "acquire_active", "read_manifest", "search",
+    "validate_candidate", "publish", "abort", "delete_repository_index",
+)
+_READ_BOUNDARIES = [
+    (operation, boundary)
+    for operation in _READ_OPERATIONS
+    for boundary in ("get_collection", "metadata", "count", "get")
+    if (operation, boundary) != ("search", "get")
+] + [("search", "query"), ("delete_repository_index", "list_collections"),
+     ("delete_repository_index", "name")]
+_WRITE_BOUNDARIES = [
+    (operation, boundary)
+    for operation in ("add_reused", "add_embedded")
+    for boundary in ("get_collection", "metadata", "get", "add")
+] + [("begin_candidate", "create_collection"), ("abort", "delete_collection"),
+     ("delete_repository_index", "delete_collection")]
+
+
+@pytest.mark.parametrize("failure_type", [
+    OSError, RuntimeError, ChromaError, LookupError,
+    NotFoundError, TypeError, ValueError,
+    VectorStoreReadError, VectorStoreWriteError, VectorStoreCorruptionError,
+])
+@pytest.mark.parametrize("operation,boundary", _READ_BOUNDARIES + _WRITE_BOUNDARIES)
+def test_chroma_public_operations_sanitize_each_backend_boundary(
+    fault_store, monkeypatch, caplog, operation, boundary, failure_type,
+) -> None:
+    store, snapshot = fault_store
+    candidate = CandidateIndex(
+        NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION,
+        "tracerag-chroma-schema-v1", 1, "securitycandidate",
+    )
+    # All calls still execute real adapter validation, decoding, and mapping.
+    # The SDK surface alone is substituted to make failures deterministic.
+    encoded = store._encode_record(_stored_record())
+    page = {
+        "ids": [CHUNK_ID], "documents": [SOURCE],
+        "embeddings": [list(VECTOR_VALUES)], "metadatas": [encoded["metadata"]],
+    }
+    collection = SimpleNamespace(
+        metadata=store._encode_control_metadata(snapshot), count=lambda: 1,
+        get=lambda **kwargs: {"ids": []} if kwargs.get("include") == [] else page,
+        add=lambda **kwargs: None,
+        query=lambda **kwargs: {
+            "ids": [[CHUNK_ID]], "documents": [[SOURCE]],
+            "metadatas": [[encoded["metadata"]]], "distances": [[0.0]],
+        },
+    )
+    typed_failure = failure_type in (
+        VectorStoreReadError, VectorStoreWriteError, VectorStoreCorruptionError,
+    )
+    failure = failure_type(
+        "Already classified adapter failure." if typed_failure
+        else SENSITIVE_TEXT + PRIVATE_COLLECTION
+    )
+    collection = _FaultBoundary(collection, boundary, failure)
+    listed = _FaultBoundary(SimpleNamespace(name=snapshot._token), boundary, failure)
+    client = SimpleNamespace(
+        get_collection=lambda **kwargs: collection,
+        create_collection=lambda **kwargs: collection,
+        list_collections=lambda: [listed], delete_collection=lambda *args: None,
+    )
+    monkeypatch.setattr(store, "_client", _FaultBoundary(client, boundary, failure))
+    store._active_pointer_path(NAMESPACE).write_bytes(
+        store._active_pointer_bytes(NAMESPACE, snapshot._token)
+    )
+    calls = {
+        "inspect_active": lambda: store.inspect_active(NAMESPACE),
+        "read_manifest": lambda: store.read_manifest(snapshot),
+        "search": lambda: store.search(snapshot, EmbeddingVector(VECTOR_VALUES), 1),
+        "validate_candidate": lambda: store.validate_candidate(candidate),
+        "publish": lambda: store.publish(candidate),
+        "abort": lambda: store.abort(candidate),
+        "delete_repository_index": lambda: store.delete_repository_index(NAMESPACE),
+        "begin_candidate": lambda: store.begin_candidate(
+            NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 1
+        ),
+        "add_reused": lambda: store.add_reused(candidate, (_stored_record(),)),
+        "add_embedded": lambda: store.add_embedded(candidate, (_vector_record(),)),
+    }
+    expected = VectorStoreReadError
+    if (operation, boundary) in _WRITE_BOUNDARIES and boundary not in (
+        "get_collection", "metadata",
+    ):
+        expected = VectorStoreWriteError
+    elif failure_type in (TypeError, ValueError) or (
+        failure_type is NotFoundError and boundary not in ("list_collections", "name")
+    ):
+        expected = VectorStoreCorruptionError
+    if typed_failure:
+        expected = failure_type
+    with pytest.raises(expected) as captured:
+        if operation == "acquire_active":
+            with store.acquire_active(NAMESPACE):
+                pytest.fail("injected failure was not reached")
+        else:
+            calls[operation]()
+    assert type(captured.value) is expected
+    if typed_failure:
+        assert captured.value is failure
+    _assert_sanitized_exception(captured.value)
+    _assert_sensitive_text_absent(caplog.text)
+    assert PRIVATE_COLLECTION not in repr(captured.value)
+
+
+@pytest.mark.parametrize("failure_type", [OSError, RuntimeError, ChromaError, LookupError])
+def test_chroma_constructor_sanitizes_backend_failures(tmp_path, monkeypatch, failure_type):
+    def fail(**kwargs):
+        raise failure_type(SENSITIVE_TEXT)
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fail)
+    with pytest.raises(VectorStoreConfigurationError) as captured:
+        ChromaVectorStore(tmp_path / "constructor-failure")
+    _assert_sanitized_exception(captured.value)
+
+
+@pytest.mark.parametrize("failure_type", [OSError, RuntimeError, ChromaError, LookupError])
+def test_cleanup_sanitizes_ordinary_backend_failures(fault_store, monkeypatch, caplog, failure_type):
+    store, _ = fault_store
+    monkeypatch.setattr(store, "_client", _FaultBoundary(
+        object(), "delete_collection", failure_type(SENSITIVE_TEXT + PRIVATE_COLLECTION)
+    ))
+    store._delete_reserved_collection(PRIVATE_COLLECTION)
+    assert caplog.messages == ["Vector store cleanup failed."]
+    _assert_sensitive_text_absent(caplog.text)
+    assert PRIVATE_COLLECTION not in caplog.text
+
+
+@pytest.mark.parametrize("boundary", ["open", "write", "flush", "fsync", "replace"])
+@pytest.mark.parametrize("recovery", ["old", "read_failure", "corrupt"])
+def test_publication_io_and_recovery_never_retain_sensitive_context(
+    tmp_path, monkeypatch, boundary, recovery,
+):
+    store = ChromaVectorStore(tmp_path / "publication")
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 0)
+    real_open = Path.open
+    real_inspect = store.inspect_active
+    interrupted = False
+
+    def fail(*args, **kwargs):
+        nonlocal interrupted
+        interrupted = True
+        raise OSError(SENSITIVE_TEXT)
+
+    class InterruptedStream:
+        def __enter__(self):
+            self.stream = real_open(
+                store._active_pointer_path(NAMESPACE).with_suffix(".candidate"), "wb"
+            )
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def write(self, data):
+            return fail() if boundary == "write" else self.stream.write(data)
+
+        def flush(self):
+            return fail() if boundary == "flush" else self.stream.flush()
+
+        def fileno(self):
+            return self.stream.fileno()
+
+    def interrupted_open(path, *args, **kwargs):
+        if path.suffix == ".candidate":
+            return fail() if boundary == "open" else InterruptedStream()
+        return real_open(path, *args, **kwargs)
+
+    def inspect(namespace):
+        if interrupted and recovery != "old":
+            error_type = VectorStoreReadError if recovery == "read_failure" else VectorStoreCorruptionError
+            raise error_type("Classified recovery failure.")
+        return real_inspect(namespace)
+
+    monkeypatch.setattr(store, "inspect_active", inspect)
+    if boundary in ("open", "write", "flush"):
+        monkeypatch.setattr(Path, "open", interrupted_open)
+    else:
+        monkeypatch.setattr(chroma_module.os, boundary, fail)
+    expected = VectorStoreCorruptionError if recovery == "corrupt" else VectorStorePublicationError
+    with pytest.raises(expected) as captured:
+        store.publish(candidate)
+    _assert_sanitized_exception(captured.value)
+    assert real_inspect(NAMESPACE).indexed is False
+
+
+@pytest.mark.parametrize("operation", ["inspect_active", "delete_repository_index"])
+def test_pointer_filesystem_failures_have_no_sensitive_context(
+    fault_store, monkeypatch, operation,
+):
+    store, snapshot = fault_store
+    pointer = store._active_pointer_path(NAMESPACE)
+    pointer.write_bytes(store._active_pointer_bytes(NAMESPACE, snapshot._token))
+
+    def fail(*args, **kwargs):
+        raise OSError(SENSITIVE_TEXT)
+
+    boundary = "read_bytes" if operation == "inspect_active" else "unlink"
+    expected = VectorStoreReadError if operation == "inspect_active" else VectorStoreWriteError
+    monkeypatch.setattr(Path, boundary, fail)
+    with pytest.raises(expected) as captured:
+        getattr(store, operation)(NAMESPACE)
+    _assert_sanitized_exception(captured.value)
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("operation", ["constructor", "begin_candidate", "inspect_active", "cleanup"])
+def test_process_control_exceptions_are_not_mapped(
+    tmp_path, fault_store, monkeypatch, failure_type, operation,
+):
+    failure = failure_type("process control")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    store, snapshot = fault_store
+    if operation == "constructor":
+        monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fail)
+        call = lambda: ChromaVectorStore(tmp_path / "interrupt")
+    else:
+        store._active_pointer_path(NAMESPACE).write_bytes(
+            store._active_pointer_bytes(NAMESPACE, snapshot._token)
+        )
+        monkeypatch.setattr(store, "_client", SimpleNamespace(
+            create_collection=fail, get_collection=fail, delete_collection=fail,
+        ))
+        call = {
+            "begin_candidate": lambda: store.begin_candidate(
+                NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 0
+            ),
+            "inspect_active": lambda: store.inspect_active(NAMESPACE),
+            "cleanup": lambda: store._delete_reserved_collection(PRIVATE_COLLECTION),
+        }[operation]
+    with pytest.raises(failure_type) as captured:
+        call()
+    assert captured.value is failure
 
 
 class _OfflineProvider:
