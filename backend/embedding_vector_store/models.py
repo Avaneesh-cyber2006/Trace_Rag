@@ -1,6 +1,6 @@
 """Immutable public contracts for embedding vector-store operations."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 import re
@@ -54,7 +54,7 @@ class EmbeddingModelIdentity:
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingVector:
-    values: tuple[float, ...]
+    values: tuple[float, ...] = field(repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.values, tuple):
@@ -64,7 +64,7 @@ class EmbeddingVector:
 @dataclass(frozen=True, slots=True)
 class EmbeddingDocument:
     chunk_id: str
-    text: str
+    text: str = field(repr=False)
 
     def __post_init__(self) -> None:
         if not _is_lowercase_sha256(self.chunk_id) or not _is_nonempty_string(self.text):
@@ -81,8 +81,8 @@ class VectorRecord:
     symbol_kind: str | None
     qualified_name: str | None
     parent_qualified_name: str | None
-    content: str
-    embedding: EmbeddingVector
+    content: str = field(repr=False)
+    embedding: EmbeddingVector = field(repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -159,7 +159,7 @@ class VectorSearchResult:
     symbol_kind: str | None
     qualified_name: str | None
     parent_qualified_name: str | None
-    content: str
+    content: str = field(repr=False)
     score: float
 
     def __post_init__(self) -> None:

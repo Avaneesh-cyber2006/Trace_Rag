@@ -120,8 +120,8 @@ class StoredRecord:
     symbol_kind: str | None
     qualified_name: str | None
     parent_qualified_name: str | None
-    content: str
-    embedding: EmbeddingVector
+    content: str = field(repr=False)
+    embedding: EmbeddingVector = field(repr=False)
     embedding_identity: EmbeddingModelIdentity
     document_version: str
     schema_version: str
@@ -159,7 +159,7 @@ class StoreSearchResult:
     symbol_kind: str | None
     qualified_name: str | None
     parent_qualified_name: str | None
-    content: str
+    content: str = field(repr=False)
     score: float
 
     def __post_init__(self) -> None:
