@@ -582,8 +582,10 @@ def test_chroma_public_operations_sanitize_each_backend_boundary(
         "ids": [CHUNK_ID], "documents": [SOURCE],
         "embeddings": [list(VECTOR_VALUES)], "metadatas": [encoded["metadata"]],
     }
+    candidate_count = 0 if operation in ("add_reused", "add_embedded") else 1
     collection = SimpleNamespace(
-        metadata=store._encode_control_metadata(snapshot), count=lambda: 1,
+        metadata=store._encode_control_metadata(snapshot),
+        count=lambda: candidate_count,
         get=lambda **kwargs: {"ids": []} if kwargs.get("include") == [] else page,
         add=lambda **kwargs: None,
         query=lambda **kwargs: {
