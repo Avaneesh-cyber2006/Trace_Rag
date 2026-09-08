@@ -1,6 +1,7 @@
 """Linear synchronization diff classification contracts."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 from threading import Event, Lock
 
@@ -181,6 +182,10 @@ class _RecordingStore:
         failure = self.failures.get(stage)
         if failure is not None:
             raise failure
+
+    @contextmanager
+    def acquire_active(self, repository_namespace: str):
+        yield self.inspect_active(repository_namespace)
 
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState:
         self.events.append(("inspect_active", repository_namespace))

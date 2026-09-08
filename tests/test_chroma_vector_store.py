@@ -17,6 +17,10 @@ from threading import Event
 import pytest
 
 from backend.embedding_vector_store.exceptions import (
+    EmbeddingInvalidResponseError,
+    EmbeddingSpaceMismatch,
+    EmbeddingTransientError,
+    RepositoryIndexNotFound,
     VectorStoreConfigurationError,
     VectorStoreCorruptionError,
     VectorStorePublicationError,
@@ -39,6 +43,9 @@ from backend.embedding_vector_store.stores.chroma import (
     ChromaVectorStore,
 )
 import backend.embedding_vector_store.stores.chroma as chroma_module
+from backend.embedding_vector_store.search import SemanticSearcher
+from backend.embedding_vector_store.retry import RetryPolicy
+import backend.embedding_vector_store.search as search_module
 
 
 NAMESPACE = "tracerag-repository-v1:github:example/資料庫"
@@ -725,6 +732,140 @@ def test_concurrent_reader_keeps_its_snapshot_until_search_finishes(
     )
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (None, None),
+        ("snapshot", VectorStoreCorruptionError),
+        ("identity", EmbeddingSpaceMismatch),
+        ("provider", RuntimeError),
+        ("retry", EmbeddingTransientError),
+        ("vector", EmbeddingInvalidResponseError),
+        ("store", VectorStoreReadError),
+        ("normalization", VectorStoreCorruptionError),
+    ],
+)
+def test_concurrent_query_retains_snapshot_from_identity_through_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure, expected_error
+) -> None:
+    store = _store(tmp_path)
+    old_record = _vector_record(
+        "c" * 64, sha256(b"old content").hexdigest(), "old content", (1.0, 0.0, 0.0)
+    )
+    old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
+    new_record = _vector_record(
+        "e" * 64, sha256(b"new content").hexdigest(), "new content", (1.0, 0.0, 0.0)
+    )
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, old_snapshot.document_version, 1)
+    store.add_embedded(candidate, (new_record,))
+    entered, release = Event(), Event()
+
+    def pause():
+        entered.set()
+        assert release.wait(10), "test did not release query"
+
+    class Provider:
+        max_batch_size = 1
+        attempts = 0
+
+        @property
+        def identity(self):
+            if failure == "identity":
+                pause()
+                return replace(IDENTITY, model="other")
+            return IDENTITY
+
+        def embed_documents(self, documents):
+            raise AssertionError("query must not embed documents")
+
+        def embed_query(self, text):
+            self.attempts += 1
+            if failure not in ("store", "normalization"):
+                pause()
+            if failure == "provider":
+                raise RuntimeError("provider failed")
+            if failure == "retry":
+                raise EmbeddingTransientError("retry")
+            if failure == "vector":
+                return EmbeddingVector((1.0,))
+            return EmbeddingVector((1.0, 0.0, 0.0))
+
+    if failure == "snapshot":
+        original_snapshot = store._snapshot_for_collection
+
+        def failed_snapshot(namespace, collection_name):
+            if collection_name == old_snapshot._token and not entered.is_set():
+                pause()
+                raise VectorStoreCorruptionError("invalid snapshot")
+            return original_snapshot(namespace, collection_name)
+
+        monkeypatch.setattr(store, "_snapshot_for_collection", failed_snapshot)
+    if failure == "store":
+        def failed_search(*args):
+            pause()
+            raise VectorStoreReadError("read failed")
+        monkeypatch.setattr(store, "search", failed_search)
+    if failure == "normalization":
+        original_normalization = search_module.validate_and_normalize_search_results
+
+        def failed_normalization(*args):
+            pause()
+            return original_normalization((object(),), NAMESPACE, 1)
+        monkeypatch.setattr(search_module, "validate_and_normalize_search_results", failed_normalization)
+    provider = Provider()
+    searcher = SemanticSearcher(
+        provider, store, retry_policy=RetryPolicy(max_attempts=2, sleeper=lambda _: None)
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(searcher.search, NAMESPACE, "query", 1)
+        try:
+            if not entered.wait(15):
+                # Surface an early reader failure rather than hiding it behind
+                # a barrier timeout (backend validation happens before embed).
+                reader.result(timeout=5)
+                pytest.fail("query did not reach the controlled handoff")
+            store.publish(candidate)
+            assert old_snapshot._token in {
+                item.name for item in store._client.list_collections()
+            }
+        finally:
+            release.set()
+        if expected_error is None:
+            assert reader.result(timeout=10)[0].content == "old content"
+        else:
+            with pytest.raises(expected_error):
+                reader.result(timeout=10)
+    assert old_snapshot._token not in {
+        item.name for item in store._client.list_collections()
+    }
+    if failure == "retry":
+        assert provider.attempts == 2
+    if failure is None:
+        assert searcher.search(NAMESPACE, "query", 1)[0].content == "new content"
+
+
+def test_search_snapshot_context_releases_empty_and_never_indexed_states(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    class Provider:
+        identity = IDENTITY
+        max_batch_size = 1
+
+        def embed_documents(self, documents):
+            raise AssertionError("empty query must not embed documents")
+
+        def embed_query(self, text):
+            raise AssertionError("empty query must not call provider")
+
+    searcher = SemanticSearcher(Provider(), store)
+    with pytest.raises(RepositoryIndexNotFound):
+        searcher.search(NAMESPACE, "query", 1)
+    empty = _publish_records(store, NAMESPACE, ())
+    assert searcher.search(NAMESPACE, "query", 1) == ()
+    _publish_records(store, NAMESPACE, ())
+    assert empty._token not in {item.name for item in store._client.list_collections()}
+
+
 def test_reader_cannot_lease_snapshot_reserved_for_cleanup_and_can_retry_after_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -779,7 +920,7 @@ def test_writer_mutation_rejects_use_from_a_non_owning_process(
         store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
 
 
-@pytest.mark.parametrize("operation", ("inspect", "manifest", "search"))
+@pytest.mark.parametrize("operation", ("inspect", "acquire", "manifest", "search"))
 def test_public_reads_reject_use_from_a_non_owning_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
@@ -791,6 +932,9 @@ def test_public_reads_reject_use_from_a_non_owning_process(
     with pytest.raises(VectorStoreConfigurationError):
         if operation == "inspect":
             store.inspect_active(NAMESPACE)
+        elif operation == "acquire":
+            with store.acquire_active(NAMESPACE):
+                pytest.fail("non-owner acquired active snapshot")
         elif operation == "manifest":
             store.read_manifest(snapshot)
         else:
@@ -825,6 +969,7 @@ _SUBPROCESS_FORK_OWNERSHIP = """
 import json
 import os
 import sys
+from threading import Event, Thread
 
 from chromadb.api.client import SharedSystemClient
 
@@ -832,16 +977,51 @@ from backend.embedding_vector_store.exceptions import VectorStoreConfigurationEr
 from backend.embedding_vector_store.models import EmbeddingModelIdentity
 from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
 import backend.embedding_vector_store.stores.chroma as chroma_module
+import backend.embedding_vector_store.synchronization as synchronization
+from backend.code_chunker.models import CodeChunkInventory
 
 root = sys.argv[1]
 namespace = "fork-repository"
 identity = EmbeddingModelIdentity("test", "test", 3, "v1")
 store = ChromaVectorStore(root)
 snapshot = store.publish(store.begin_candidate(namespace, identity, "parent-v1", 0))
+inventory = CodeChunkInventory(".", namespace, 0, 0, 0, 0, 0, ())
+class Provider:
+    max_batch_size = 1
+    def __init__(self):
+        self.identity = identity
+    def embed_documents(self, documents):
+        raise AssertionError("empty sync must not embed")
+    def embed_query(self, text):
+        raise AssertionError("sync must not query")
+entered, release = Event(), Event()
+original_inspect = store.inspect_active
+def blocked_inspect(namespace):
+    entered.set()
+    assert release.wait(15)
+    return original_inspect(namespace)
+store.inspect_active = blocked_inspect
+thread = Thread(target=synchronization.SemanticIndexer(Provider(), store).synchronize, args=(inventory,))
+thread.start()
+assert entered.wait(10)
+# Fork with both an active namespace entry and a lock owned by a vanished thread.
+lock_held, unlock = Event(), Event()
+def hold_guard_lock():
+    with synchronization._WRITER_GUARDS_LOCK:
+        lock_held.set()
+        assert unlock.wait(15)
+lock_thread = Thread(target=hold_guard_lock)
+lock_thread.start()
+assert lock_held.wait(10)
 ready_read, ready_write = os.pipe()
 parent_alive_read, parent_alive_write = os.pipe()
 child_pid = os.fork()
 if child_pid:
+    unlock.set()
+    lock_thread.join(10)
+    release.set()
+    thread.join(10)
+    assert not thread.is_alive()
     os.close(ready_write)
     os.close(parent_alive_read)
     ready = b""
@@ -850,16 +1030,21 @@ if child_pid:
         assert chunk
         ready += chunk
     assert ready == b"12"
-    assert store.inspect_active(namespace).snapshot == snapshot
-    os.close(parent_alive_write)
+    assert store.inspect_active(namespace).snapshot.document_version == "tracerag-embedding-document-v1"
+    # Keep the lifetime pipe open until exit also releases process ownership.
     os._exit(0)
 
 os.close(ready_read)
 os.close(parent_alive_write)
+store.inspect_active = original_inspect
 outcome = {
     "registry_empty": chroma_module._PERSISTENCE_STATES == {},
     "client_cache_empty": SharedSystemClient._identifier_to_system == {},
+    "writer_guards_empty": synchronization._ACTIVE_WRITER_GUARDS == set(),
+    "writer_guard_lock_available": synchronization._WRITER_GUARDS_LOCK.acquire(blocking=False),
 }
+if outcome["writer_guard_lock_available"]:
+    synchronization._WRITER_GUARDS_LOCK.release()
 try:
     store.inspect_active(namespace)
 except VectorStoreConfigurationError:
@@ -877,10 +1062,11 @@ os.write(ready_write, b"2")
 os.close(ready_write)
 assert os.read(parent_alive_read, 1) == b""
 reopened = ChromaVectorStore(root)
-published = reopened.publish(
-    reopened.begin_candidate(namespace, identity, "child-v2", 0)
-)
-outcome["fresh_after_parent_exit"] = published.document_version
+child_provider = Provider()
+child_provider.identity = EmbeddingModelIdentity("test", "child", 3, "v2")
+result = synchronization.SemanticIndexer(child_provider, reopened).synchronize(inventory)
+assert reopened.inspect_active(namespace).snapshot.identity == child_provider.identity
+outcome["fresh_after_parent_exit"] = result.status.value
 os.write(1, (json.dumps(outcome) + "\\n").encode())
 os._exit(0)
 """
@@ -917,9 +1103,11 @@ def test_fork_discards_inherited_chroma_state_without_releasing_parent_ownership
     assert json.loads(result.stdout) == {
         "registry_empty": True,
         "client_cache_empty": True,
+        "writer_guards_empty": True,
+        "writer_guard_lock_available": True,
         "inherited_read": "rejected",
         "fresh_while_parent_alive": "rejected",
-        "fresh_after_parent_exit": "child-v2",
+        "fresh_after_parent_exit": "success",
     }
 
 

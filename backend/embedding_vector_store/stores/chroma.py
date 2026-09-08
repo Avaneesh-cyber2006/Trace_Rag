@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from hashlib import sha256
 import json
 import logging
@@ -13,7 +14,7 @@ import re
 import secrets
 import struct
 from threading import Lock
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import chromadb
 from chromadb.api.client import SharedSystemClient
@@ -454,6 +455,34 @@ class ChromaVectorStore:
             indexed=True,
             snapshot=self._snapshot_for_collection(repository_namespace, collection_name),
         )
+
+    @contextmanager
+    def acquire_active(self, repository_namespace: str) -> Iterator[RepositoryIndexState]:
+        """Resolve and pin one active generation for the entire caller operation."""
+        self._assert_owner_process()
+        # Cleanup reserves deletion under this same lock. Resolve the pointer
+        # and register the reader together, before opening/validating Chroma.
+        # Publication can replace the pointer meanwhile, but cannot retire this
+        # selected generation until the context and any nested searches exit.
+        with self._concurrency_state.lock:
+            collection_name = self._read_active_collection_name(repository_namespace)
+            if collection_name is not None:
+                if collection_name in self._concurrency_state.cleanup_reservations:
+                    _raise_corruption()
+                self._concurrency_state.readers[collection_name] = (
+                    self._concurrency_state.readers.get(collection_name, 0) + 1
+                )
+        try:
+            if collection_name is None:
+                yield RepositoryIndexState(indexed=False, snapshot=None)
+            else:
+                yield RepositoryIndexState(
+                    indexed=True,
+                    snapshot=self._snapshot_for_collection(repository_namespace, collection_name),
+                )
+        finally:
+            if collection_name is not None:
+                self._release_snapshot_reader(collection_name)
 
     def _read_collection(self, repository_namespace: str, collection_name: object):
         """Open one adapter-owned collection, separating outage from corruption."""

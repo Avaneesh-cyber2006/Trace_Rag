@@ -1,6 +1,7 @@
 """Internal values and lifecycle protocol for vector-store adapters."""
 
 from dataclasses import dataclass, field
+from contextlib import AbstractContextManager
 import math
 import re
 from typing import Protocol, runtime_checkable
@@ -185,6 +186,12 @@ class VectorStore(Protocol):
     """Manage immutable repository index snapshots through an adapter."""
 
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState: ...
+
+    def acquire_active(
+        self, repository_namespace: str
+    ) -> AbstractContextManager[RepositoryIndexState]:
+        """Pin the active generation before validation until the context exits."""
+        ...
 
     def read_manifest(
         self, snapshot: RepositoryIndexSnapshot

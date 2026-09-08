@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from threading import Lock
 from typing import Iterator
 
@@ -29,6 +30,17 @@ _INVALID_DEPENDENCY_MESSAGE = "Semantic indexer dependency configuration is inva
 _WRITER_BUSY_MESSAGE = "Repository index synchronization is already in progress."
 _WRITER_GUARDS_LOCK = Lock()
 _ACTIVE_WRITER_GUARDS: set[tuple[object, str]] = set()
+
+
+def _reset_inherited_writer_guards() -> None:
+    """Child processes must not inherit thread locks or active writer entries."""
+    global _WRITER_GUARDS_LOCK, _ACTIVE_WRITER_GUARDS
+    _WRITER_GUARDS_LOCK = Lock()
+    _ACTIVE_WRITER_GUARDS = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_inherited_writer_guards)
 
 
 @contextmanager

@@ -52,6 +52,7 @@ def _record() -> StoredRecord:
 def test_vector_store_exposes_the_canonical_lifecycle_signatures():
     expected = {
         "inspect_active": ["self", "repository_namespace"],
+        "acquire_active": ["self", "repository_namespace"],
         "read_manifest": ["self", "snapshot"],
         "begin_candidate": [
             "self",

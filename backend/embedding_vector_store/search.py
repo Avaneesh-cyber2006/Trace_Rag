@@ -96,22 +96,20 @@ class SemanticSearcher:
             self._max_query_chars,
             self._max_top_k,
         )
-        snapshot = _resolve_snapshot(
-            self._store.inspect_active(repository_namespace),
-            repository_namespace,
-        )
-        if snapshot.identity != self._provider.identity:
-            raise EmbeddingSpaceMismatch(_EMBEDDING_SPACE_MISMATCH_MESSAGE)
-        if snapshot.expected_chunk_count == 0:
-            return ()
-        query_vector = run_with_embedding_retries(
-            lambda: self._provider.embed_query(query_text),
-            self._retry_policy,
-        )
-        validate_embedding_vector(query_vector, snapshot.identity)
-        store_results = self._store.search(snapshot, query_vector, top_k)
-        return validate_and_normalize_search_results(
-            store_results,
-            repository_namespace,
-            top_k,
-        )
+        with self._store.acquire_active(repository_namespace) as state:
+            snapshot = _resolve_snapshot(state, repository_namespace)
+            if snapshot.identity != self._provider.identity:
+                raise EmbeddingSpaceMismatch(_EMBEDDING_SPACE_MISMATCH_MESSAGE)
+            if snapshot.expected_chunk_count == 0:
+                return ()
+            query_vector = run_with_embedding_retries(
+                lambda: self._provider.embed_query(query_text),
+                self._retry_policy,
+            )
+            validate_embedding_vector(query_vector, snapshot.identity)
+            store_results = self._store.search(snapshot, query_vector, top_k)
+            return validate_and_normalize_search_results(
+                store_results,
+                repository_namespace,
+                top_k,
+            )

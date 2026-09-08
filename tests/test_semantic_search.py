@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import fields
 from hashlib import sha256
 import re
@@ -99,6 +100,10 @@ class RecordingStore:
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState:
         self._record("inspect_active", repository_namespace)
         return self.state
+
+    @contextmanager
+    def acquire_active(self, repository_namespace: str):
+        yield self.inspect_active(repository_namespace)
 
     def read_manifest(self, snapshot: object) -> tuple[object, ...]:
         self._record("read_manifest", snapshot)
