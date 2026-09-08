@@ -29,6 +29,7 @@ from backend.code_chunker.models import (
 from backend.code_parser.models import ParseStatus, ParsedLanguage, SourceLocation, SymbolKind
 from backend.embedding_vector_store.documents import EMBEDDING_DOCUMENT_VERSION
 from backend.embedding_vector_store.exceptions import (
+    EmbeddingProviderError,
     EmbeddingTransientError,
     EmbeddingVectorStoreConfigurationError,
     VectorStoreConfigurationError,
@@ -151,7 +152,7 @@ def _stored_record(values: tuple[float, ...] = VECTOR_VALUES) -> StoredRecord:
 
 
 class _GeminiModels:
-    def __init__(self, failure: Exception | None = None) -> None:
+    def __init__(self, failure: BaseException | None = None) -> None:
         self.failure = failure
 
     def embed_content(self, **_: object) -> object:
@@ -163,11 +164,24 @@ class _GeminiModels:
 
 
 class _GeminiClient:
-    def __init__(self, failure: Exception | None = None) -> None:
+    def __init__(self, failure: BaseException | None = None) -> None:
         self.models = _GeminiModels(failure)
 
     def __repr__(self) -> str:
         return SENSITIVE_TEXT
+
+
+class _GeminiDiscoveryFailureClient:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    @property
+    def models(self) -> object:
+        raise self.failure
+
+
+class _GeminiProcessControlFailure(BaseException):
+    pass
 
 
 class _LeakySleeper:
@@ -261,6 +275,81 @@ def test_raw_provider_failure_is_absent_from_exception_chain_and_traceback() -> 
         provider.embed_query("offline query")
 
     _assert_sanitized_exception(captured.value)
+
+
+def test_unknown_gemini_request_failure_maps_to_fixed_sanitized_provider_error() -> None:
+    provider = _gemini_provider(_GeminiClient(RuntimeError(SENSITIVE_TEXT)))
+
+    with pytest.raises(EmbeddingProviderError) as captured:
+        provider.embed_query("offline query")
+
+    assert type(captured.value) is EmbeddingProviderError
+    assert str(captured.value) == "Gemini embedding request failed."
+    _assert_sanitized_exception(captured.value)
+
+
+@pytest.mark.parametrize("boundary", ["construction", "client discovery"])
+def test_unknown_gemini_setup_failure_maps_to_fixed_sanitized_configuration_error(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    failure = RuntimeError(SENSITIVE_TEXT)
+
+    if boundary == "construction":
+        def fail_construction(**_: object) -> object:
+            raise failure
+
+        monkeypatch.setattr(gemini_module.genai, "Client", fail_construction)
+        operation = lambda: GeminiEmbeddingProvider(
+            api_key=SECRET,
+            model=GEMINI_MODEL,
+            dimensions=GEMINI_DIMENSIONS,
+            compatibility_version=GEMINI_COMPATIBILITY,
+            max_batch_size=1,
+        )
+    else:
+        operation = lambda: _gemini_provider(_GeminiDiscoveryFailureClient(failure))
+
+    with pytest.raises(EmbeddingVectorStoreConfigurationError) as captured:
+        operation()
+
+    assert str(captured.value) == "Gemini embedding provider configuration is invalid."
+    _assert_sanitized_exception(captured.value)
+
+
+@pytest.mark.parametrize(
+    "failure_type", [KeyboardInterrupt, SystemExit, _GeminiProcessControlFailure]
+)
+@pytest.mark.parametrize("boundary", ["construction", "client discovery", "request"])
+def test_gemini_process_control_failures_are_not_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    boundary: str,
+) -> None:
+    failure = failure_type("process control")
+
+    if boundary == "construction":
+        def fail_construction(**_: object) -> object:
+            raise failure
+
+        monkeypatch.setattr(gemini_module.genai, "Client", fail_construction)
+        operation = lambda: GeminiEmbeddingProvider(
+            api_key=SECRET,
+            model=GEMINI_MODEL,
+            dimensions=GEMINI_DIMENSIONS,
+            compatibility_version=GEMINI_COMPATIBILITY,
+            max_batch_size=1,
+        )
+    elif boundary == "client discovery":
+        operation = lambda: _gemini_provider(_GeminiDiscoveryFailureClient(failure))
+    else:
+        operation = lambda: _gemini_provider(_GeminiClient(failure)).embed_query(
+            "offline query"
+        )
+
+    with pytest.raises(failure_type) as captured:
+        operation()
+
+    assert captured.value is failure
 
 
 def test_source_and_vectors_are_available_as_values_but_hidden_from_repr() -> None:

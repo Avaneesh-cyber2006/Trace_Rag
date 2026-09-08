@@ -75,18 +75,22 @@ class GeminiEmbeddingProvider:
             constructed_client: object | None = None
             try:
                 constructed_client = genai.Client(api_key=api_key, vertexai=False)
-            except ValueError:
+            except Exception:
                 pass
             if constructed_client is None:
                 raise EmbeddingVectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
             client = constructed_client
 
+        embed_content: object | None = None
+        configuration_failure: EmbeddingVectorStoreConfigurationError | None = None
         try:
             embed_content = client.models.embed_content  # type: ignore[attr-defined]
-        except (AttributeError, TypeError):
-            raise EmbeddingVectorStoreConfigurationError(
+        except Exception:
+            configuration_failure = EmbeddingVectorStoreConfigurationError(
                 _CONFIGURATION_MESSAGE
-            ) from None
+            )
+        if configuration_failure is not None:
+            raise configuration_failure
         if not callable(embed_content):
             raise EmbeddingVectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
 
@@ -185,6 +189,8 @@ class GeminiEmbeddingProvider:
             )
         except ValueError:
             mapped_failure = EmbeddingInvalidRequestError(_INVALID_REQUEST_MESSAGE)
+        except Exception:
+            mapped_failure = EmbeddingProviderError(_PROVIDER_MESSAGE)
 
         if mapped_failure is not None:
             raise mapped_failure
