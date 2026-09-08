@@ -288,6 +288,25 @@ def test_unknown_gemini_request_failure_maps_to_fixed_sanitized_provider_error()
     _assert_sanitized_exception(captured.value)
 
 
+def test_unknown_gemini_request_configuration_failure_maps_to_fixed_sanitized_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_request_configuration(**_: object) -> object:
+        raise RuntimeError(SENSITIVE_TEXT)
+
+    monkeypatch.setattr(
+        gemini_module.types, "EmbedContentConfig", fail_request_configuration
+    )
+    provider = _gemini_provider(_GeminiClient())
+
+    with pytest.raises(EmbeddingProviderError) as captured:
+        provider.embed_query("offline query")
+
+    assert type(captured.value) is EmbeddingProviderError
+    assert str(captured.value) == "Gemini embedding request failed."
+    _assert_sanitized_exception(captured.value)
+
+
 @pytest.mark.parametrize("boundary", ["construction", "client discovery"])
 def test_unknown_gemini_setup_failure_maps_to_fixed_sanitized_configuration_error(
     monkeypatch: pytest.MonkeyPatch, boundary: str
@@ -319,7 +338,9 @@ def test_unknown_gemini_setup_failure_maps_to_fixed_sanitized_configuration_erro
 @pytest.mark.parametrize(
     "failure_type", [KeyboardInterrupt, SystemExit, _GeminiProcessControlFailure]
 )
-@pytest.mark.parametrize("boundary", ["construction", "client discovery", "request"])
+@pytest.mark.parametrize(
+    "boundary", ["construction", "client discovery", "request configuration", "request"]
+)
 def test_gemini_process_control_failures_are_not_mapped(
     monkeypatch: pytest.MonkeyPatch,
     failure_type: type[BaseException],
@@ -341,6 +362,16 @@ def test_gemini_process_control_failures_are_not_mapped(
         )
     elif boundary == "client discovery":
         operation = lambda: _gemini_provider(_GeminiDiscoveryFailureClient(failure))
+    elif boundary == "request configuration":
+        def fail_request_configuration(**_: object) -> object:
+            raise failure
+
+        monkeypatch.setattr(
+            gemini_module.types, "EmbedContentConfig", fail_request_configuration
+        )
+        operation = lambda: _gemini_provider(_GeminiClient()).embed_query(
+            "offline query"
+        )
     else:
         operation = lambda: _gemini_provider(_GeminiClient(failure)).embed_query(
             "offline query"

@@ -156,7 +156,7 @@ class GeminiEmbeddingProvider:
         document_request: bool,
     ) -> tuple[EmbeddingVector, ...]:
         request_config: object | None = None
-        configuration_failure: EmbeddingInvalidRequestError | None = None
+        configuration_failure: EmbeddingProviderError | None = None
         try:
             request_config = types.EmbedContentConfig(
                 task_type=task_type,
@@ -166,6 +166,8 @@ class GeminiEmbeddingProvider:
             configuration_failure = EmbeddingInvalidRequestError(
                 _INVALID_REQUEST_MESSAGE
             )
+        except Exception:
+            configuration_failure = EmbeddingProviderError(_PROVIDER_MESSAGE)
         if configuration_failure is not None:
             raise configuration_failure
 
