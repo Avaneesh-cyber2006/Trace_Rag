@@ -149,13 +149,27 @@ class SemanticIndexer:
                 len(current),
             )
             try:
-                self._store.add_reused(candidate, diff.unchanged)
-                embedded = _embed_chunk_inputs(
-                    diff.new + diff.updated,
-                    self._provider,
-                    self._retry_policy,
-                )
-                self._store.add_embedded(candidate, embedded)
+                capacity = self._provider.max_batch_size
+                if type(capacity) is not int or capacity <= 0:
+                    raise EmbeddingVectorStoreConfigurationError(
+                        "Embedding provider batch capacity is invalid."
+                    )
+                for start in range(0, max(1, len(diff.unchanged)), capacity):
+                    self._store.add_reused(
+                        candidate, diff.unchanged[start : start + capacity]
+                    )
+                changed = diff.new + diff.updated
+                embedded_count = 0
+                for start in range(0, max(1, len(changed)), capacity):
+                    embedded = _embed_chunk_inputs(
+                        changed[start : start + capacity],
+                        self._provider,
+                        self._retry_policy,
+                    )
+                    self._store.add_embedded(candidate, embedded)
+                    embedded_count += len(embedded)
+                    # Drop core's vector references before building the next batch.
+                    del embedded
                 self._store.validate_candidate(candidate)
                 self._store.publish(candidate)
             except Exception:
@@ -170,7 +184,7 @@ class SemanticIndexer:
                 status=IndexSyncStatus.SUCCESS,
                 total_chunks=len(current),
                 reused_chunks=len(diff.unchanged),
-                embedded_chunks=len(embedded),
+                embedded_chunks=embedded_count,
                 inserted_chunks=len(diff.new),
                 updated_chunks=len(diff.updated),
                 deleted_chunks=len(diff.deleted),
