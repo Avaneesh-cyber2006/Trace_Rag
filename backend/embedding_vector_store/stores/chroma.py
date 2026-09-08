@@ -16,6 +16,7 @@ from threading import Lock
 from typing import Iterable
 
 import chromadb
+from chromadb.api.client import SharedSystemClient
 from chromadb.config import Settings
 from chromadb.errors import ChromaError, NotFoundError
 
@@ -99,6 +100,7 @@ class _PersistenceConcurrencyState:
         self.lock = Lock()
         self.readers: dict[str, int] = {}
         self.pending_cleanup: set[str] = set()
+        self.cleanup_reservations: set[str] = set()
         self.owner_process_id = os.getpid()
         self.ownership_file = (root / ".tr5-owner.lock").open("a+b")
         try:
@@ -139,12 +141,22 @@ def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
 
 
 def _release_inherited_ownership() -> None:
-    """A forked child must not prolong the parent's OS ownership lease."""
-    global _PERSISTENCE_STATES_LOCK
+    """Discard process-bound state without disturbing the parent's lease."""
+    global _PERSISTENCE_STATES, _PERSISTENCE_STATES_LOCK
+    inherited_states = tuple(_PERSISTENCE_STATES.values())
+    _PERSISTENCE_STATES = {}
     _PERSISTENCE_STATES_LOCK = Lock()
-    for state in _PERSISTENCE_STATES.values():
+    for state in inherited_states:
         # Close only; explicit flock unlock would release the parent's lock too.
-        state.ownership_file.close()
+        try:
+            state.ownership_file.close()
+        except OSError:
+            pass
+    # Chroma's process-global systems and their refcount lock are equally
+    # unsafe to reuse after a multithreaded process forks. Do not close/stop
+    # them here: inherited teardown could run locked code or mutate storage.
+    SharedSystemClient.clear_system_cache()
+    SharedSystemClient._refcount_lock = Lock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -289,11 +301,24 @@ class ChromaVectorStore:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
         return os.path.normcase(str(self._persistence_root))
 
-    def _acquire_snapshot_reader(self, collection_name: str) -> None:
+    def _acquire_snapshot_reader(self, collection_name: str) -> bool:
         with self._concurrency_state.lock:
+            if collection_name in self._concurrency_state.cleanup_reservations:
+                return False
             self._concurrency_state.readers[collection_name] = (
                 self._concurrency_state.readers.get(collection_name, 0) + 1
             )
+            return True
+
+    def _delete_reserved_collection(self, collection_name: str) -> None:
+        """Run a reserved best-effort delete without holding the state lock."""
+        try:
+            self._client.delete_collection(collection_name)
+        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
+            _LOGGER.warning("Vector store cleanup failed.")
+        finally:
+            with self._concurrency_state.lock:
+                self._concurrency_state.cleanup_reservations.discard(collection_name)
 
     def _release_snapshot_reader(self, collection_name: str) -> None:
         delete_pending = False
@@ -305,12 +330,14 @@ class ChromaVectorStore:
                 self._concurrency_state.readers.pop(collection_name, None)
                 if collection_name in self._concurrency_state.pending_cleanup:
                     self._concurrency_state.pending_cleanup.remove(collection_name)
-                    delete_pending = True
+                    if (
+                        collection_name
+                        not in self._concurrency_state.cleanup_reservations
+                    ):
+                        self._concurrency_state.cleanup_reservations.add(collection_name)
+                        delete_pending = True
         if delete_pending:
-            try:
-                self._client.delete_collection(collection_name)
-            except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
-                _LOGGER.warning("Vector store cleanup failed.")
+            self._delete_reserved_collection(collection_name)
 
     @staticmethod
     def _namespace_digest(repository_namespace: str) -> str:
@@ -419,6 +446,7 @@ class ChromaVectorStore:
 
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState:
         """Resolve only the explicitly published snapshot for one repository."""
+        self._assert_owner_process()
         collection_name = self._read_active_collection_name(repository_namespace)
         if collection_name is None:
             return RepositoryIndexState(indexed=False, snapshot=None)
@@ -491,6 +519,7 @@ class ChromaVectorStore:
         self, snapshot: RepositoryIndexSnapshot
     ) -> tuple[StoredRecord, ...]:
         """Read one explicit snapshot without consulting the active pointer."""
+        self._assert_owner_process()
         if not isinstance(snapshot, RepositoryIndexSnapshot):
             raise VectorStoreReadError(_READ_MESSAGE)
         collection = self._read_collection(
@@ -524,11 +553,13 @@ class ChromaVectorStore:
         top_k: int,
     ) -> tuple[StoreSearchResult, ...]:
         """Search while retaining the immutable snapshot against publication cleanup."""
+        self._assert_owner_process()
         if not isinstance(snapshot, RepositoryIndexSnapshot) or not isinstance(
             snapshot._token, str
         ):
             return self._search_snapshot(snapshot, query, top_k)
-        self._acquire_snapshot_reader(snapshot._token)
+        if not self._acquire_snapshot_reader(snapshot._token):
+            raise VectorStoreReadError(_READ_MESSAGE)
         try:
             return self._search_snapshot(snapshot, query, top_k)
         finally:
@@ -1111,14 +1142,17 @@ class ChromaVectorStore:
         """Best-effort retirement after durable pointer publication succeeds."""
         if old_collection is None or old_collection == new_collection:
             return
+        delete_reserved = False
         with self._concurrency_state.lock:
             if self._concurrency_state.readers.get(old_collection, 0) > 0:
                 self._concurrency_state.pending_cleanup.add(old_collection)
                 return
-        try:
-            self._client.delete_collection(old_collection)
-        except (ChromaError, OSError, RuntimeError, TypeError, ValueError):
-            _LOGGER.warning("Vector store cleanup failed.")
+            if old_collection not in self._concurrency_state.cleanup_reservations:
+                self._concurrency_state.pending_cleanup.discard(old_collection)
+                self._concurrency_state.cleanup_reservations.add(old_collection)
+                delete_reserved = True
+        if delete_reserved:
+            self._delete_reserved_collection(old_collection)
 
     def _repository_collection_names(
         self, repository_namespace: str

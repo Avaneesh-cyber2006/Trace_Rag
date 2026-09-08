@@ -725,6 +725,49 @@ def test_concurrent_reader_keeps_its_snapshot_until_search_finishes(
     )
 
 
+def test_reader_cannot_lease_snapshot_reserved_for_cleanup_and_can_retry_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    old_record = _vector_record("c" * 64, "d" * 64, "old content", (1.0, 0.0, 0.0))
+    old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
+    delete_entered = Event()
+    release_delete = Event()
+
+    def fail_blocked_delete(collection_name: str) -> None:
+        assert collection_name == old_snapshot._token
+        delete_entered.set()
+        if not release_delete.wait(5):
+            raise AssertionError("test did not release collection cleanup")
+        raise RuntimeError("injected cleanup failure")
+
+    monkeypatch.setattr(store._client, "delete_collection", fail_blocked_delete)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cleanup = executor.submit(
+            store._cleanup_obsolete_collection,
+            old_snapshot._token,
+            "replacement-collection",
+        )
+        try:
+            assert delete_entered.wait(5)
+            stale_reader = executor.submit(
+                store.search,
+                old_snapshot,
+                EmbeddingVector((1.0, 0.0, 0.0)),
+                1,
+            )
+            with pytest.raises(VectorStoreReadError):
+                stale_reader.result(timeout=5)
+        finally:
+            release_delete.set()
+        cleanup.result(timeout=5)
+
+    assert store.search(
+        old_snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1
+    )[0].content == "old content"
+
+
 def test_writer_mutation_rejects_use_from_a_non_owning_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -734,6 +777,24 @@ def test_writer_mutation_rejects_use_from_a_non_owning_process(
 
     with pytest.raises(VectorStoreConfigurationError):
         store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+
+
+@pytest.mark.parametrize("operation", ("inspect", "manifest", "search"))
+def test_public_reads_reject_use_from_a_non_owning_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    store = _store(tmp_path)
+    snapshot = _publish_records(store, NAMESPACE, ())
+    owner_process = os.getpid()
+    monkeypatch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
+
+    with pytest.raises(VectorStoreConfigurationError):
+        if operation == "inspect":
+            store.inspect_active(NAMESPACE)
+        elif operation == "manifest":
+            store.read_manifest(snapshot)
+        else:
+            store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
 
 
 _SUBPROCESS_WRITER = """
@@ -760,6 +821,71 @@ else:
 """
 
 
+_SUBPROCESS_FORK_OWNERSHIP = """
+import json
+import os
+import sys
+
+from chromadb.api.client import SharedSystemClient
+
+from backend.embedding_vector_store.exceptions import VectorStoreConfigurationError
+from backend.embedding_vector_store.models import EmbeddingModelIdentity
+from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
+import backend.embedding_vector_store.stores.chroma as chroma_module
+
+root = sys.argv[1]
+namespace = "fork-repository"
+identity = EmbeddingModelIdentity("test", "test", 3, "v1")
+store = ChromaVectorStore(root)
+snapshot = store.publish(store.begin_candidate(namespace, identity, "parent-v1", 0))
+ready_read, ready_write = os.pipe()
+parent_alive_read, parent_alive_write = os.pipe()
+child_pid = os.fork()
+if child_pid:
+    os.close(ready_write)
+    os.close(parent_alive_read)
+    ready = b""
+    while len(ready) < 2:
+        chunk = os.read(ready_read, 2 - len(ready))
+        assert chunk
+        ready += chunk
+    assert ready == b"12"
+    assert store.inspect_active(namespace).snapshot == snapshot
+    os.close(parent_alive_write)
+    os._exit(0)
+
+os.close(ready_read)
+os.close(parent_alive_write)
+outcome = {
+    "registry_empty": chroma_module._PERSISTENCE_STATES == {},
+    "client_cache_empty": SharedSystemClient._identifier_to_system == {},
+}
+try:
+    store.inspect_active(namespace)
+except VectorStoreConfigurationError:
+    outcome["inherited_read"] = "rejected"
+else:
+    outcome["inherited_read"] = "accepted"
+os.write(ready_write, b"1")
+try:
+    ChromaVectorStore(root)
+except VectorStoreConfigurationError:
+    outcome["fresh_while_parent_alive"] = "rejected"
+else:
+    outcome["fresh_while_parent_alive"] = "accepted"
+os.write(ready_write, b"2")
+os.close(ready_write)
+assert os.read(parent_alive_read, 1) == b""
+reopened = ChromaVectorStore(root)
+published = reopened.publish(
+    reopened.begin_candidate(namespace, identity, "child-v2", 0)
+)
+outcome["fresh_after_parent_exit"] = published.document_version
+os.write(1, (json.dumps(outcome) + "\\n").encode())
+os._exit(0)
+"""
+
+
 def _run_subprocess_writer(root: Path, exit_mode: str = "normal") -> dict[str, str]:
     result = subprocess.run(
         [sys.executable, "-c", _SUBPROCESS_WRITER, str(root), exit_mode],
@@ -769,6 +895,32 @@ def _run_subprocess_writer(root: Path, exit_mode: str = "normal") -> dict[str, s
         timeout=30,
     )
     return json.loads(result.stdout)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_discards_inherited_chroma_state_without_releasing_parent_ownership(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _SUBPROCESS_FORK_OWNERSHIP,
+            str(tmp_path / "fork-vector-data"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert json.loads(result.stdout) == {
+        "registry_empty": True,
+        "client_cache_empty": True,
+        "inherited_read": "rejected",
+        "fresh_while_parent_alive": "rejected",
+        "fresh_after_parent_exit": "child-v2",
+    }
 
 
 def test_concurrent_subprocess_writer_rejected_for_owned_persistence_root(
