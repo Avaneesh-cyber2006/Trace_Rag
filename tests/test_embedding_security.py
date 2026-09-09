@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 from contextlib import contextmanager
 from dataclasses import asdict
+from hashlib import sha256
 import importlib
 import json
 import os
@@ -74,7 +75,7 @@ VECTOR_TEXT = tuple(str(value) for value in VECTOR_VALUES)
 IDENTITY = EmbeddingModelIdentity("security-provider", "security-model", 3, "security-v1")
 NAMESPACE = "security-repository"
 CHUNK_ID = "a" * 64
-CONTENT_HASH = "b" * 64
+CONTENT_HASH = sha256(SOURCE.encode("utf-8")).hexdigest()
 
 GEMINI_MODEL = "gemini-embedding-001"
 GEMINI_DIMENSIONS = 3_072

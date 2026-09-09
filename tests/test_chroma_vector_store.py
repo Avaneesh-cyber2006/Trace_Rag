@@ -58,17 +58,18 @@ def _store(tmp_path: Path) -> ChromaVectorStore:
 
 
 def _record(**changes: object) -> StoredRecord:
+    content = "def 計算():\r\n    return 'λ  ' \n"
     record = StoredRecord(
         NAMESPACE,
         "a" * 64,
-        "b" * 64,
+        sha256(content.encode("utf-8")).hexdigest(),
         "src/資料/δelta.py",
         "python",
         "symbol",
         "function",
         "資料.計算",
         "資料",
-        "def 計算():\r\n    return 'λ  ' \n",
+        content,
         VECTOR,
         IDENTITY,
         "tracerag-embedding-document-v1",
@@ -102,11 +103,11 @@ def _candidate(**changes: object) -> CandidateIndex:
 
 
 def _vector_record(
-    chunk_id: str, content_hash: str, content: str, values: tuple[float, ...]
+    chunk_id: str, content: str, values: tuple[float, ...]
 ) -> VectorRecord:
     return VectorRecord(
         chunk_id,
-        content_hash,
+        sha256(content.encode("utf-8")).hexdigest(),
         "src/資料/δelta.py",
         "python",
         "symbol",
@@ -122,13 +123,11 @@ def _candidate_records() -> tuple[VectorRecord, VectorRecord]:
     return (
         _vector_record(
             "c" * 64,
-            "d" * 64,
             "def 計算():\r\n    return 'λ  ' \n",
             (1.0, 0.0, 0.0),
         ),
         _vector_record(
             "e" * 64,
-            "f" * 64,
             "class 資料:\n    値 = 'two'\n",
             (0.0, 1.0, 0.0),
         ),
@@ -770,9 +769,9 @@ def test_concurrent_reader_keeps_its_snapshot_until_search_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    old_record = _vector_record("c" * 64, "d" * 64, "old content", (1.0, 0.0, 0.0))
+    old_record = _vector_record("c" * 64, "old content", (1.0, 0.0, 0.0))
     old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
-    new_record = _vector_record("e" * 64, "f" * 64, "new content", (1.0, 0.0, 0.0))
+    new_record = _vector_record("e" * 64, "new content", (1.0, 0.0, 0.0))
     new_candidate = store.begin_candidate(
         NAMESPACE, IDENTITY, "tracerag-embedding-document-v1", 1
     )
@@ -836,11 +835,11 @@ def test_concurrent_query_retains_snapshot_from_identity_through_normalization(
 ) -> None:
     store = _store(tmp_path)
     old_record = _vector_record(
-        "c" * 64, sha256(b"old content").hexdigest(), "old content", (1.0, 0.0, 0.0)
+        "c" * 64, "old content", (1.0, 0.0, 0.0)
     )
     old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
     new_record = _vector_record(
-        "e" * 64, sha256(b"new content").hexdigest(), "new content", (1.0, 0.0, 0.0)
+        "e" * 64, "new content", (1.0, 0.0, 0.0)
     )
     candidate = store.begin_candidate(NAMESPACE, IDENTITY, old_snapshot.document_version, 1)
     store.add_embedded(candidate, (new_record,))
@@ -956,7 +955,7 @@ def test_reader_cannot_lease_snapshot_reserved_for_cleanup_and_can_retry_after_f
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    old_record = _vector_record("c" * 64, "d" * 64, "old content", (1.0, 0.0, 0.0))
+    old_record = _vector_record("c" * 64, "old content", (1.0, 0.0, 0.0))
     old_snapshot = _publish_records(store, NAMESPACE, (old_record,))
     delete_entered = Event()
     release_delete = Event()
@@ -1064,6 +1063,7 @@ from backend.embedding_vector_store.models import EmbeddingModelIdentity
 from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
 import backend.embedding_vector_store.stores.chroma as chroma_module
 import backend.embedding_vector_store.synchronization as synchronization
+import backend.embedding_vector_store._concurrency as concurrency
 from backend.code_chunker.models import CodeChunkInventory
 
 root = sys.argv[1]
@@ -1093,7 +1093,7 @@ assert entered.wait(10)
 # Fork with both an active namespace entry and a lock owned by a vanished thread.
 lock_held, unlock = Event(), Event()
 def hold_guard_lock():
-    with synchronization._WRITER_GUARDS_LOCK:
+    with concurrency._WRITER_GUARDS_LOCK:
         lock_held.set()
         assert unlock.wait(15)
 lock_thread = Thread(target=hold_guard_lock)
@@ -1126,11 +1126,11 @@ store.inspect_active = original_inspect
 outcome = {
     "registry_empty": chroma_module._PERSISTENCE_STATES == {},
     "client_cache_empty": SharedSystemClient._identifier_to_system == {},
-    "writer_guards_empty": synchronization._ACTIVE_WRITER_GUARDS == set(),
-    "writer_guard_lock_available": synchronization._WRITER_GUARDS_LOCK.acquire(blocking=False),
+    "writer_guards_empty": concurrency._ACTIVE_WRITER_GUARDS == set(),
+    "writer_guard_lock_available": concurrency._WRITER_GUARDS_LOCK.acquire(blocking=False),
 }
 if outcome["writer_guard_lock_available"]:
-    synchronization._WRITER_GUARDS_LOCK.release()
+    concurrency._WRITER_GUARDS_LOCK.release()
 try:
     store.inspect_active(namespace)
 except VectorStoreConfigurationError:
@@ -1379,7 +1379,7 @@ def test_add_reused_prevalidates_all_records_before_candidate_mutation(
     malformed = StoredRecord(
         NAMESPACE,
         "a" * 64,
-        "b" * 64,
+        sha256(b"content").hexdigest(),
         "src/main.py",
         "python",
         "symbol",
@@ -1395,7 +1395,7 @@ def test_add_reused_prevalidates_all_records_before_candidate_mutation(
     valid = StoredRecord(
         NAMESPACE,
         _candidate_records()[1].chunk_id,
-        _candidate_records()[1].content_hash,
+        sha256(b"content").hexdigest(),
         "src/main.py",
         "python",
         "symbol",
@@ -1743,7 +1743,7 @@ def test_external_vector_candidate_reopens_with_exact_evidence_and_no_auto_embed
         (
             _candidate(),
             (
-                _vector_record("1" * 64, "2" * 64, "wrong dimensions", (1.0, 0.0)),
+                _vector_record("1" * 64, "wrong dimensions", (1.0, 0.0)),
                 _candidate_records()[1],
             ),
         ),
@@ -1817,7 +1817,7 @@ def test_huge_integer_candidate_embedding_fails_closed_as_write_error(
 
     candidate = _candidate()
     store._create_candidate_collection(candidate)
-    huge = _vector_record("1" * 64, "2" * 64, "huge", (10**10_000, 0.0, 0.0))
+    huge = _vector_record("1" * 64, "huge", (10**10_000, 0.0, 0.0))
     with pytest.raises(VectorStoreWriteError):
         store._write_embedded_candidate(candidate, (huge, _candidate_records()[1]))
 
@@ -1828,8 +1828,8 @@ def test_non_unit_external_vectors_reopen_as_chroma_authoritative_values(
     store = _store(tmp_path)
     candidate = _candidate()
     records = (
-        _vector_record("1" * 64, "2" * 64, "first", (0.1, -0.2, 0.3)),
-        _vector_record("3" * 64, "4" * 64, "second", (0.4, 0.5, -0.6)),
+        _vector_record("1" * 64, "first", (0.1, -0.2, 0.3)),
+        _vector_record("3" * 64, "second", (0.4, 0.5, -0.6)),
     )
     store._create_candidate_collection(candidate)
     store._write_embedded_candidate(candidate, records)
@@ -1853,7 +1853,7 @@ def test_finite_values_that_overflow_binary32_fail_before_candidate_mutation(
     store = _store(tmp_path)
     candidate = _candidate()
     store._create_candidate_collection(candidate)
-    overflowing = _vector_record("1" * 64, "2" * 64, "overflow", (3.5e38, 0.0, 0.0))
+    overflowing = _vector_record("1" * 64, "overflow", (3.5e38, 0.0, 0.0))
 
     with pytest.raises(VectorStoreWriteError):
         store._write_embedded_candidate(candidate, (overflowing, _candidate_records()[1]))
@@ -1878,7 +1878,7 @@ def test_projected_external_vectors_survive_fresh_child_process_reopen(
     store = _store(tmp_path)
     candidate = _candidate()
     records = (
-        _vector_record("1" * 64, "2" * 64, "first", values),
+        _vector_record("1" * 64, "first", values),
         _candidate_records()[1],
     )
     store._create_candidate_collection(candidate)
@@ -1918,7 +1918,7 @@ def test_nonfinite_provider_vectors_fail_before_candidate_mutation(
     store = _store(tmp_path)
     candidate = _candidate()
     store._create_candidate_collection(candidate)
-    invalid_record = _vector_record("1" * 64, "2" * 64, "invalid", (invalid, 0.0, 0.0))
+    invalid_record = _vector_record("1" * 64, "invalid", (invalid, 0.0, 0.0))
 
     with pytest.raises(VectorStoreWriteError):
         store._write_embedded_candidate(candidate, (invalid_record, _candidate_records()[1]))
@@ -1973,10 +1973,10 @@ def test_search_converts_cosine_landmarks_and_decodes_exact_evidence(
         4,
     )
     records = (
-        _vector_record("1" * 64, "2" * 64, "identical\r\n", (1.0, 0.0, 0.0)),
-        _vector_record("3" * 64, "4" * 64, "intermediate λ\n", (1.0, 1.0, 0.0)),
-        _vector_record("5" * 64, "6" * 64, "orthogonal\n", (0.0, 1.0, 0.0)),
-        _vector_record("7" * 64, "8" * 64, "opposite\n", (-1.0, 0.0, 0.0)),
+        _vector_record("1" * 64, "identical\r\n", (1.0, 0.0, 0.0)),
+        _vector_record("3" * 64, "intermediate λ\n", (1.0, 1.0, 0.0)),
+        _vector_record("5" * 64, "orthogonal\n", (0.0, 1.0, 0.0)),
+        _vector_record("7" * 64, "opposite\n", (-1.0, 0.0, 0.0)),
     )
     store.add_embedded(candidate, records)
     snapshot = store.publish(candidate)
@@ -1996,7 +1996,7 @@ def test_search_converts_cosine_landmarks_and_decodes_exact_evidence(
     assert by_id["1" * 64] == StoreSearchResult(
         repository_namespace=NAMESPACE,
         chunk_id="1" * 64,
-        content_hash="2" * 64,
+        content_hash=sha256(b"identical\r\n").hexdigest(),
         relative_path="src/資料/δelta.py",
         language="python",
         chunk_kind="symbol",
@@ -2028,8 +2028,8 @@ def test_search_uses_chroma_authoritative_persisted_binary32_vector(
         2,
     )
     records = (
-        _vector_record("1" * 64, "2" * 64, "ordinary", (0.1, -0.2, 0.3)),
-        _vector_record("3" * 64, "4" * 64, "other", (-0.7, -1.1, 0.9)),
+        _vector_record("1" * 64, "ordinary", (0.1, -0.2, 0.3)),
+        _vector_record("3" * 64, "other", (-0.7, -1.1, 0.9)),
     )
     store.add_embedded(candidate, records)
     snapshot = store.publish(candidate)

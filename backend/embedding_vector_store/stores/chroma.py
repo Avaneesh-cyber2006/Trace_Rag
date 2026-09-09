@@ -21,6 +21,7 @@ from chromadb.api.client import SharedSystemClient
 from chromadb.config import Settings
 from chromadb.errors import ChromaError, NotFoundError
 
+from .._concurrency import _repository_writer_guard
 from ..exceptions import (
     EmbeddingVectorStoreConfigurationError,
     VectorStoreConfigurationError,
@@ -80,6 +81,7 @@ _CONFIGURATION_MESSAGE = "Vector store configuration is invalid."
 _WRITE_MESSAGE = "Vector store record is invalid."
 _PUBLICATION_MESSAGE = "Vector store publication failed."
 _READ_MESSAGE = "Vector store data could not be read."
+_BUSY_MESSAGE = "Repository index is in use."
 _MANIFEST_PAGE_SIZE = 100
 _COSINE_DISTANCE_ENDPOINT_TOLERANCE = 1e-6
 _POINTER_KEYS = frozenset({"payload", "sha256"})
@@ -866,6 +868,15 @@ class ChromaVectorStore:
             or not _is_nonempty_string(document)
         ):
             _raise_corruption()
+        mapped_failure = None
+        try:
+            content_hash = sha256(document.encode("utf-8")).hexdigest()
+        except UnicodeError:
+            mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+        if mapped_failure is not None:
+            raise mapped_failure
+        if metadata["content_hash"] != content_hash:
+            _raise_corruption()
         for key in _RECORD_OPTIONAL_KEYS:
             if key in metadata and not _is_nonempty_string(metadata[key]):
                 _raise_corruption()
@@ -1291,9 +1302,9 @@ class ChromaVectorStore:
             self._delete_reserved_collection(old_collection)
 
     def _repository_collection_names(
-        self, repository_namespace: str
+        self, repository_namespace: str, active_collection: str | None
     ) -> tuple[str, ...]:
-        """Discover and fully validate adapter collections for one exact namespace."""
+        """Validate ownership and present evidence, including abandoned candidates."""
         prefix = f"tr5-{self._namespace_digest(repository_namespace)}-"
         mapped_failure = None
         try:
@@ -1324,40 +1335,86 @@ class ChromaVectorStore:
             raise mapped_failure
 
         for collection_name in sorted(names):
-            self._snapshot_for_collection(repository_namespace, collection_name)
+            collection = self._read_collection(repository_namespace, collection_name)
+            snapshot = self._decode_snapshot_metadata(
+                repository_namespace,
+                self._read_collection_metadata(collection),
+                collection_name,
+            )
+            count = self._read_collection_count(collection)
+            if (
+                not _is_nonnegative_integer(count)
+                or count > snapshot.expected_chunk_count
+                or (
+                    collection_name == active_collection
+                    and count != snapshot.expected_chunk_count
+                )
+            ):
+                _raise_corruption()
+            # Unpublished collections may have stopped between batches. Their
+            # complete namespace evidence still has to validate for every row.
+            self._read_manifest_from_collection(
+                repository_namespace, snapshot.identity, snapshot.document_version,
+                snapshot.schema_version, count, collection,
+            )
         return tuple(sorted(names))
 
     def delete_repository_index(self, repository_namespace: str) -> None:
-        """Delete only the fully validated index for one exact namespace."""
+        """Delete a quiescent exact namespace, or fail with a typed busy outcome."""
         self._assert_owner_process()
         if not _is_nonempty_string(repository_namespace):
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
 
-        active_collection = self._read_active_collection_name(repository_namespace)
-        collection_names = self._repository_collection_names(repository_namespace)
-        if active_collection is not None and active_collection not in collection_names:
-            _raise_corruption()
+        with _repository_writer_guard(self, repository_namespace):
+            active_collection = self._read_active_collection_name(repository_namespace)
+            collection_names = self._repository_collection_names(
+                repository_namespace, active_collection
+            )
+            if active_collection is not None and active_collection not in collection_names:
+                _raise_corruption()
 
-        pointer_path = self._active_pointer_path(repository_namespace)
-        if active_collection is not None:
+            # Pointer removal and exclusive collection reservations share the
+            # reader-registration lock. A reader that wins this race makes the
+            # deletion busy; one that follows sees the index as absent. Backend
+            # deletion remains outside the lock, and stale handles cannot lease
+            # any reserved generation while its physical deletion is running.
             mapped_failure = None
-            try:
-                pointer_path.unlink()
-            except OSError:
-                mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+            with self._concurrency_state.lock:
+                if any(
+                    self._concurrency_state.readers.get(name, 0) > 0
+                    or name in self._concurrency_state.cleanup_reservations
+                    for name in collection_names
+                ):
+                    raise VectorStoreConfigurationError(_BUSY_MESSAGE)
+                if active_collection is not None:
+                    try:
+                        self._active_pointer_path(repository_namespace).unlink()
+                    except OSError:
+                        mapped_failure = VectorStoreWriteError(_WRITE_MESSAGE)
+                if mapped_failure is None:
+                    self._concurrency_state.cleanup_reservations.update(collection_names)
+                    self._concurrency_state.pending_cleanup.difference_update(
+                        collection_names
+                    )
             if mapped_failure is not None:
                 raise mapped_failure
 
-        failed = False
-        for collection_name in collection_names:
+            failed = False
             try:
-                self._client.delete_collection(collection_name)
-            except VectorStoreError:
-                raise
-            except Exception:
-                failed = True
-        if failed:
-            raise VectorStoreWriteError(_WRITE_MESSAGE)
+                for collection_name in collection_names:
+                    try:
+                        self._client.delete_collection(collection_name)
+                    except VectorStoreError:
+                        raise
+                    except Exception:
+                        failed = True
+                if failed:
+                    raise VectorStoreWriteError(_WRITE_MESSAGE)
+            finally:
+                with self._concurrency_state.lock:
+                    self._concurrency_state.cleanup_reservations.difference_update(
+                        collection_names
+                    )
 
     def publish(self, candidate: CandidateIndex) -> RepositoryIndexSnapshot:
         """Publish a complete candidate through one durable pointer replacement."""

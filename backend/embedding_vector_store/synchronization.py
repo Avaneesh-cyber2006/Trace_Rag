@@ -1,13 +1,10 @@
 """Provider-independent synchronization helpers for semantic indexes."""
 
-from contextlib import contextmanager
 from dataclasses import dataclass
-import os
-from threading import Lock
-from typing import Iterator
 
 from backend.code_chunker.models import CodeChunkInventory
 
+from ._concurrency import _repository_writer_guard
 from .documents import EMBEDDING_DOCUMENT_VERSION, build_embedding_document
 from .exceptions import EmbeddingVectorStoreConfigurationError
 from .models import (
@@ -27,45 +24,6 @@ from .validation import (
 
 
 _INVALID_DEPENDENCY_MESSAGE = "Semantic indexer dependency configuration is invalid."
-_WRITER_BUSY_MESSAGE = "Repository index synchronization is already in progress."
-_WRITER_GUARDS_LOCK = Lock()
-_ACTIVE_WRITER_GUARDS: set[tuple[object, str]] = set()
-
-
-def _reset_inherited_writer_guards() -> None:
-    """Child processes must not inherit thread locks or active writer entries."""
-    global _WRITER_GUARDS_LOCK, _ACTIVE_WRITER_GUARDS
-    _WRITER_GUARDS_LOCK = Lock()
-    _ACTIVE_WRITER_GUARDS = set()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_inherited_writer_guards)
-
-
-@contextmanager
-def _repository_writer_guard(
-    store: VectorStore, repository_namespace: str
-) -> Iterator[None]:
-    """Acquire one nonblocking in-process writer lease for an exact namespace."""
-    key_factory = getattr(store, "_writer_guard_key", None)
-    scope = key_factory(repository_namespace) if callable(key_factory) else id(store)
-    try:
-        key = (scope, repository_namespace)
-        hash(key)
-    except (TypeError, ValueError) as error:
-        raise EmbeddingVectorStoreConfigurationError(
-            _INVALID_DEPENDENCY_MESSAGE
-        ) from error
-    with _WRITER_GUARDS_LOCK:
-        if key in _ACTIVE_WRITER_GUARDS:
-            raise EmbeddingVectorStoreConfigurationError(_WRITER_BUSY_MESSAGE)
-        _ACTIVE_WRITER_GUARDS.add(key)
-    try:
-        yield
-    finally:
-        with _WRITER_GUARDS_LOCK:
-            _ACTIVE_WRITER_GUARDS.discard(key)
 
 
 @dataclass(frozen=True, slots=True)
