@@ -1,6 +1,7 @@
 import ast
 import sys
 from importlib.metadata import version
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -76,3 +77,94 @@ def test_code_chunker_uses_only_standard_library_and_approved_backend_boundaries
             and node.func.id in {"eval", "exec", "compile", "__import__"}
             for node in ast.walk(tree)
         ), path
+
+
+def _embedding_import_targets(tree: ast.AST, package_name: str) -> set[str]:
+    targets = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                module = resolve_name("." * node.level + module, package_name)
+            targets.add(module)
+            targets.update(module + "." + alias.name for alias in node.names)
+    return targets
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    (
+        ("import google.genai as sdk", "google.genai"),
+        ("from google import genai as sdk", "google.genai"),
+        ("from google.genai import types", "google.genai.types"),
+        ("from chromadb.config import Settings", "chromadb.config.Settings"),
+        ("from .providers import gemini", "backend.embedding_vector_store.providers.gemini"),
+        ("from .stores.chroma import ChromaVectorStore", "backend.embedding_vector_store.stores.chroma"),
+    ),
+)
+def test_embedding_dependency_import_detection_handles_aliases_and_relative_edges(source, target):
+    assert target in _embedding_import_targets(ast.parse(source), "backend.embedding_vector_store")
+
+
+def test_embedding_dependency_boundary_keeps_sdk_imports_at_edges_and_core_neutral():
+    root = Path(__file__).parents[1]
+    package = root / "backend" / "embedding_vector_store"
+    facade_paths = {"__init__.py", "providers/__init__.py", "stores/__init__.py"}
+    upstream = {"backend.code_chunker.models", "backend.code_parser.models"}
+    for path in sorted(package.rglob("*.py")):
+        relative = path.relative_to(package).as_posix()
+        package_name = ".".join(path.relative_to(root).parts[:-1])
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        targets = _embedding_import_targets(tree, package_name)
+        for target in targets:
+            top = target.split(".", 1)[0]
+            if top in {"google", "httpx", "pydantic"}:
+                assert relative == "providers/gemini.py", (relative, target)
+            elif top == "chromadb":
+                assert relative == "stores/chroma.py", (relative, target)
+            elif target.startswith("backend.embedding_vector_store"):
+                if relative not in facade_paths:
+                    assert target not in {
+                        "backend.embedding_vector_store",
+                        "backend.embedding_vector_store.providers",
+                        "backend.embedding_vector_store.stores",
+                    }, (relative, target)
+                    assert not any(
+                        target == boundary or target.startswith(boundary + ".")
+                        for boundary in (
+                            "backend.embedding_vector_store.providers.gemini",
+                            "backend.embedding_vector_store.stores.chroma",
+                        )
+                    ), (relative, target)
+            elif top == "backend":
+                assert any(target == module or target.startswith(module + ".") for module in upstream), (relative, target)
+            else:
+                assert top in sys.stdlib_module_names and top != "importlib", (relative, target)
+        assert not any(
+            isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+            for node in ast.walk(tree)
+        ), path
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"eval", "exec", "compile", "__import__"}
+            for node in ast.walk(tree)
+        ), path
+
+
+def test_embedding_readme_documents_required_operational_contracts():
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    required = (
+        "Module 5", "TRACERAG_GEMINI_API_KEY", "persistence_root",
+        "google-genai==2.22.0", "chromadb==1.5.9", "gemini-embedding-001",
+        "gemini-embedding-001-retrieval-3072-v1", "3072", "RETRIEVAL_DOCUMENT",
+        "RETRIEVAL_QUERY", "1,536 UTF-8 bytes", "max_batch_size=1",
+        "tracerag-embedding-document-v1", "UNCHANGED", "RepositoryIndexNotFound",
+        "EmbeddingSpaceMismatch", "empty index", "active pointer", "os.replace",
+        "score = 1 - (distance / 2)", "1e-6", "binary32", "single-process",
+        "multi-process", "TRACERAG_RUN_GEMINI_LIVE", "-m gemini_live",
+        "not integration and not gemini_live", "Modules 6–10",
+    )
+    assert not [fact for fact in required if fact not in readme]

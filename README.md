@@ -219,3 +219,100 @@ Callable and constant symbols are primary chunks. Leaf types may be whole chunks
 `chunk_id` hashes versioned repository-namespaced structural provenance, so equivalent clones have stable identities while different repositories remain distinct. `content_hash` independently hashes the exact chunk bytes. Equal content hashes do not remove or merge provenance records. Fragment indices, locations, file order, chunk order, issues, and inventory counters are deterministic.
 
 Repository source remains untrusted static data. Module 4 never executes or imports repository code, constructs a second parser, reads around the hardened reader, runs Git/shell/package/build/test commands, accesses the network, evaluates syntax, or loads repository configuration or plugins. It does not implement tokenization, embeddings, indexing, retrieval, RAG, graph resolution, API/frontend behavior, or any Module 5+ concern.
+
+## Module 5 — Embedding & Vector Store
+
+Module 5 consumes a Module 4 `CodeChunkInventory`, publishes a persistent semantic index for its exact repository namespace, and returns low-level semantic neighbors with exact source evidence. It validates the inventory without rereading the repository. Core indexing and search use the `EmbeddingProvider` and `VectorStore` protocols; Gemini and Chroma are replaceable adapters.
+
+### Construction and verified configuration
+
+The [dependency capability gate](docs/superpowers/verification/module-5-dependency-capability-gate.md) verified Python 3.12.13 on Windows and these exact direct pins, installed with the existing requirements:
+
+```text
+google-genai==2.22.0
+chromadb==1.5.9
+```
+
+The selected embedding space is provider `gemini`, model `gemini-embedding-001`, 3072 dimensions, and compatibility version `gemini-embedding-001-retrieval-3072-v1`. Documents use `RETRIEVAL_DOCUMENT`; queries use `RETRIEVAL_QUERY`. The adapter validates this explicit configuration eagerly. Supply exactly one of `api_key` or a trusted, preconfigured `client`; client construction makes no embedding request.
+
+Continuing with the Module 4 `chunks` inventory above, the application supplies credentials and a persistence directory outside the analyzed repository:
+
+```python
+import os
+from pathlib import Path
+
+from backend.embedding_vector_store import (
+    ChromaVectorStore,
+    GeminiEmbeddingProvider,
+    SemanticIndexer,
+    SemanticSearcher,
+)
+
+# These variables are injected by the application's external configuration.
+provider = GeminiEmbeddingProvider(
+    api_key=os.environ["TRACERAG_GEMINI_API_KEY"],
+    model="gemini-embedding-001",
+    dimensions=3072,
+    compatibility_version="gemini-embedding-001-retrieval-3072-v1",
+    max_batch_size=1,
+)
+persistence_root = Path(os.environ["TRACERAG_VECTOR_STORE_ROOT"])
+store = ChromaVectorStore(persistence_root=persistence_root)
+result = SemanticIndexer(provider, store).synchronize(chunks)
+matches = SemanticSearcher(provider, store).search(
+    repository_namespace=chunks.repository_namespace,
+    query_text="Where are repository paths validated?",
+    top_k=5,
+)
+```
+
+`TRACERAG_VECTOR_STORE_ROOT` is an application example convention; the store receives the path explicitly and does not read environment variables. There is no default persistence directory. Keep it on a local filesystem outside the analyzed repository; the application owns that placement policy. Reopening the same root after the owning process exits discovers the explicitly published index. Chroma receives external embeddings with `embedding_function=None` and anonymized telemetry disabled.
+
+The verified Gemini batch capacity is one document per request. Both a complete rendered document and an unchanged query are limited to **1,536 UTF-8 bytes**, a conservative preflight bound below the model's 2,048-token ceiling. Oversized documents raise `EmbeddingDocumentTooLarge`; oversized queries raise `EmbeddingInvalidRequestError`. Nothing is silently truncated, summarized, or automatically rechunked. Module 4's default 4,096-byte target and 8,192-byte maximum do not guarantee that a chunk fits this smaller limit, especially after document metadata is added; callers must prepare a suitable inventory or handle the typed size failure.
+
+`SemanticSearcher` defaults to `max_query_chars=16_384` and `max_top_k=100`, configurable positive integers. Queries must contain non-whitespace text and are passed unchanged. `top_k` must be an integer other than `bool`, between 1 and the configured maximum. The Gemini byte limit applies in addition to the core character limit. Indexing and search accept an optional `RetryPolicy` from `backend.embedding_vector_store.retry`: defaults are 3 attempts, 0.25-second initial delay, multiplier 2, and a 2-second delay cap with an injectable sleeper. Only typed rate-limit and transient provider failures are retried; permanent provider errors and store operations are not blindly retried.
+
+### Documents, reuse, and publication
+
+The deterministic document version is `tracerag-embedding-document-v1`. Its text consists of the version plus LF, compact Unicode JSON with exactly `chunk_kind`, `language`, `parent_qualified_name`, `qualified_name`, `relative_path`, and `symbol_kind` in that order, then `\n---TRACERAG-SOURCE---\n` and exact `CodeChunk.content`. Optional values are JSON `null`; the source suffix preserves original newlines, whitespace, and Unicode. Absolute paths, namespace, hashes, IDs, and provider configuration are excluded from this embedding input.
+
+Vector reuse requires equal chunk ID, content hash, document version, and complete `EmbeddingModelIdentity`. New or updated chunks alone are embedded; deleted chunks disappear from the next complete index. A changed identity or document version disables all reuse. A compatible no-op returns `IndexSyncStatus.UNCHANGED` with zero provider calls, vector writes, candidate creations, or publications. Every chunk is counted as reused and all mutation counters are zero.
+
+A first empty inventory publishes a valid empty index with `SUCCESS`, and replacing a nonempty index with an empty inventory deletes the previous logical records without embedding. Repeating a compatible empty index returns `UNCHANGED`. Search of a compatible empty index returns `()` without a query embedding; a never-indexed namespace raises `RepositoryIndexNotFound`. An incompatible provider identity raises `EmbeddingSpaceMismatch` before query embedding, including for an active empty index.
+
+Synchronization builds and validates a complete private candidate. The checksummed durable active pointer is replaced with same-filesystem `os.replace` after flushing and syncing its temporary file; that replacement is the publication commit point. Failures before publication preserve the prior searchable index and raise typed errors. An uncertain publication outcome is resolved by rereading the pointer; success requires proof that the complete candidate committed. There is no partial success. Cleanup failure after commit leaves the new index authoritative. Restart never infers authority from timestamps or collection ordering, and corrupt or incompatible storage fails closed without automatic repair or migration.
+
+Chroma documents store exact chunk content and metadata preserves provenance. Its embedding field is the sole persisted vector authority: validated provider values receive checked finite IEEE-754 binary32 projection before insertion, without clipping or normalization. Exact Python-float round-trip is not guaranteed. There is no vector mirror in metadata, control files, or another per-chunk manifest. The storage representation belongs to `tracerag-chroma-schema-v1` and does not change the provider compatibility identity.
+
+### Search and process ownership
+
+Search resolves one immutable active snapshot and remains read-only through concurrent publication. Results are a tuple of at most `top_k` unique `VectorSearchResult` values, all from the complete requested namespace, containing exact stored source. Invalid records fail the operation rather than being silently filtered. Ordering is `(-score, relative_path.casefold(), relative_path, chunk_id)`.
+
+Chroma uses cosine distance `distance = 1 - cosine_similarity` over persisted vectors. The public transformation is `score = 1 - (distance / 2)`: identical, orthogonal, and opposite vectors score 1.0, 0.5, and 0.0 respectively. Scores are finite in `[0, 1]`, with higher meaning closer; they are not probabilities. Finite distance error within absolute `1e-6` of an endpoint is treated as 0 or 2; values farther outside `[0, 2]` are corruption. V1 has no universal score cutoff.
+
+V1 supports single-process ownership of each local persistence root; multi-process reads/writes sharing that root are unsupported and competing process ownership is rejected with `VectorStoreConfigurationError`. In-process adapters share the root's client and guards. One writer per exact namespace is admitted from inspection through publication resolution; a concurrent same-namespace synchronization raises `EmbeddingVectorStoreConfigurationError`. Different namespaces have independent guards. Readers retain their old snapshot during candidate construction/publication, and cleanup waits for those readers. This provides no distributed locking or network-filesystem guarantee.
+
+### Public API, security, and tests
+
+`backend.embedding_vector_store` explicitly exports the seven public values (`EmbeddingModelIdentity`, `EmbeddingVector`, `EmbeddingDocument`, `VectorRecord`, `IndexSyncStatus`, `IndexSyncResult`, `VectorSearchResult`), the typed exception hierarchy rooted at `EmbeddingVectorStoreError`, the two protocols, both adapters, `SemanticIndexer`, and `SemanticSearcher`. Provider/store subpackages export only their protocol and adapter. Internal snapshots, candidates, stored records, raw store-search results, collection/generation details, SDK clients, and retry machinery are not top-level public exports. Only `providers/gemini.py` imports the Gemini SDK; only `stores/chroma.py` imports Chroma.
+
+Credentials are explicit external application input through `TRACERAG_GEMINI_API_KEY` in this example; Module 5 does not discover SDK credentials or load repository `.env` files or other repository configuration. Repository contents remain untrusted static data and never select a client, model, path, plugin, or executable. Module 5 does not run repository code, shell commands, builds, tests, or package managers. Embedding intentionally sends rendered source to the configured provider and persists exact source locally; the caller controls which inventories are submitted. Normal diagnostics and public errors omit secrets, authorization headers, source text, embedding documents, vectors, and raw provider/store responses. Exact evidence remains available in result `content` as required by the API.
+
+The default test selection is offline and excludes both networked integration markers, even if live environment guards are set:
+
+```bash
+python -m pytest -q
+python -m pytest -q -m "not integration and not gemini_live"
+```
+
+The optional real Gemini check requires externally supplied `TRACERAG_GEMINI_API_KEY`, `TRACERAG_RUN_GEMINI_LIVE=1`, and explicit selection:
+
+```bash
+python -m pytest tests/integration/test_gemini_embeddings_live.py -q -rs -m gemini_live
+```
+
+It skips if either guard is absent, sends one small synthetic document and one query, and does not persist returned vectors or print secrets/responses. Its private logging check temporarily changes process-global logging, so run it alone. No real Gemini request is required for normal verification.
+
+### Modules 6–10 non-goals
+
+Module 5 does not implement dependency/call graphs or graph persistence (Module 6); Git-history and temporal evidence (Module 7); runtime, log, error, or stack-trace ingestion (Module 8); BM25, lexical/hybrid retrieval, graph expansion, relevance thresholds, fusion, or reranking (Module 9); or LLM context assembly, answering, causal reasoning, citation presentation, API, or frontend behavior (Module 10).

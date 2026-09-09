@@ -3,6 +3,7 @@
 from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from enum import Enum
 import math
+from importlib import import_module
 
 import pytest
 
@@ -312,3 +313,56 @@ def test_no_public_model_contains_storage_or_operational_fields():
 )
 def test_public_exception_hierarchy_preserves_typed_distinctions(child, parent):
     assert child.__bases__ == (parent,)
+
+
+_PUBLIC_EXPORTS = {
+    "models": (
+        "EmbeddingDocument", "EmbeddingModelIdentity", "EmbeddingVector",
+        "IndexSyncResult", "IndexSyncStatus", "VectorRecord", "VectorSearchResult",
+    ),
+    "exceptions": (
+        "EmbeddingVectorStoreError", "EmbeddingVectorStoreConfigurationError",
+        "InvalidCodeChunkInventory", "EmbeddingDocumentError", "EmbeddingDocumentTooLarge",
+        "EmbeddingProviderError", "EmbeddingAuthenticationError", "EmbeddingRateLimitError",
+        "EmbeddingTransientError", "EmbeddingInvalidRequestError", "EmbeddingInvalidResponseError",
+        "VectorStoreError", "VectorStoreConfigurationError", "VectorStoreReadError",
+        "VectorStoreWriteError", "VectorStorePublicationError", "VectorStoreCorruptionError",
+        "SemanticSearchError", "InvalidSearchRequest", "RepositoryIndexNotFound",
+        "EmbeddingSpaceMismatch",
+    ),
+    "providers.base": ("EmbeddingProvider",),
+    "providers.gemini": ("GeminiEmbeddingProvider",),
+    "stores.base": ("VectorStore",),
+    "stores.chroma": ("ChromaVectorStore",),
+    "synchronization": ("SemanticIndexer",),
+    "search": ("SemanticSearcher",),
+}
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_names"),
+    (
+        ("", tuple(name for names in _PUBLIC_EXPORTS.values() for name in names)),
+        (".providers", ("EmbeddingProvider", "GeminiEmbeddingProvider")),
+        (".stores", ("VectorStore", "ChromaVectorStore")),
+    ),
+)
+def test_embedding_public_exports_are_exact_and_resolve_to_public_contracts(
+    suffix, expected_names,
+):
+    package = import_module("backend.embedding_vector_store" + suffix)
+    exports = getattr(package, "__all__", ())
+    assert len(exports) == len(set(exports))
+    assert set(exports) == set(expected_names)
+    for module_name, names in _PUBLIC_EXPORTS.items():
+        for name in set(names) & set(expected_names):
+            defining_module = import_module("backend.embedding_vector_store." + module_name)
+            assert getattr(package, name) is getattr(defining_module, name)
+    # These implementation values must not become supported package attributes,
+    # even accidentally through a broad import while editing the public facade.
+    for name in (
+        "RepositoryIndexState", "RepositoryIndexSnapshot", "CandidateIndex",
+        "StoredRecord", "StoreSearchResult", "SyncDiff", "ChunkInput",
+        "RetryPolicy", "genai", "chromadb", "Settings", "SharedSystemClient",
+    ):
+        assert not hasattr(package, name)
