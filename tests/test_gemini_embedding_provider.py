@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import json
 import math
+from threading import Barrier
+import traceback
 from types import SimpleNamespace
 from typing import Any
 
@@ -402,6 +406,193 @@ def test_real_sdk_response_decode_and_validation_failures_are_invalid_responses(
 
     assert "raw-body" not in str(captured.value)
     assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize("value", [True, False, "0.125"], ids=["true", "false", "numeric-string"])
+@pytest.mark.parametrize("document_request", [False, True], ids=["query", "document"])
+def test_real_sdk_rejects_embedding_values_that_would_be_coerced(
+    value: object, document_request: bool, caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(
+        200,
+        json={"embeddings": [{"values": [value] * _DIMENSIONS}],
+              "sensitive": "raw-body-secret"},
+    ))
+    provider = _provider(client)
+
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError) as captured:
+            if document_request:
+                provider.embed_documents((_DOCUMENT,))
+            else:
+                provider.embed_query("query")
+        # The caller's original SDK client must retain its normal parsing behavior.
+        direct = client.models.embed_content(model=_MODEL, contents=["query"])
+        assert direct.embeddings[0].values == [float(value)] * _DIMENSIONS
+    finally:
+        client.close()
+
+    assert "raw-body" not in str(captured.value)
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+    assert "raw-body-secret" not in "".join(traceback.format_exception(captured.value))
+    assert "raw-body-secret" not in caplog.text
+    assert "raw-body-secret" not in repr(provider)
+
+
+@pytest.mark.parametrize("missing", [False, True], ids=["changed", "absent"])
+def test_real_sdk_private_request_seam_changes_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, missing: bool,
+) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(200, json={}))
+    with monkeypatch.context() as patch:
+        if missing:
+            patch.delattr(client.models, "_api_client")
+        else:
+            patch.setattr(client.models, "_api_client", SimpleNamespace(request=None))
+        try:
+            with pytest.raises(EmbeddingVectorStoreConfigurationError) as captured:
+                _provider(client)
+        finally:
+            client.close()
+
+    assert str(captured.value) == "Gemini embedding provider configuration is invalid."
+    assert captured.value.__context__ is None
+
+
+def test_real_sdk_preserves_valid_numeric_embedding_values() -> None:
+    values = [0, 1, -2, 0.125] * (_DIMENSIONS // 4)
+    client = _real_sdk_client_with_response(httpx.Response(
+        200, json={"embeddings": [{"values": values}]},
+    ))
+
+    try:
+        provider = _provider(client)
+        assert provider.embed_query("query").values == tuple(values)
+        assert provider.embed_documents((_DOCUMENT,))[0].values == tuple(values)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "{}", "null", "[]", '{"embeddings": null}', '{"embeddings": []}',
+        '{"embeddings": [null]}', '{"embeddings": [{}]}',
+        '{"embeddings": [{"values": null}]}',
+        '{"embeddings": [{"values": []}]}',
+        json.dumps({"embeddings": [{"values": [0.0] * _DIMENSIONS}] * 2}),
+        json.dumps({"embeddings": [{"values": [0.0] * (_DIMENSIONS - 1)}]}),
+        *('{"embeddings": [{"values": [' + ','.join([value] * _DIMENSIONS)
+          + ']}]}' for value in ("NaN", "Infinity", "-Infinity", "1e400")),
+    ],
+    ids=["missing", "null-root", "array-root", "null-embeddings", "empty-embeddings",
+         "null-embedding", "missing-values", "null-values", "empty-values",
+         "excess-embeddings", "wrong-dimension", "nan", "inf", "negative-inf", "overflow"],
+)
+def test_real_sdk_malformed_embedding_shape_is_invalid_response(body: str) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(200, text=body))
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError):
+            _provider(client).embed_query("query")
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("body", ["[" * 10000 + "]" * 10000,
+                                  '{"embeddings": [{"values": [' + "1" * 5000 + ']}]}'],
+                         ids=["nesting-limit", "integer-limit"])
+def test_real_sdk_json_resource_limit_is_invalid_response(body: str) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(200, text=body))
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError) as captured:
+            _provider(client).embed_query("query")
+    finally:
+        client.close()
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize("body", [None, b"{}", {}], ids=["absent", "bytes", "dict"])
+def test_real_sdk_changed_response_body_type_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, body: object,
+) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(200, json={}))
+    monkeypatch.setattr(client.models._api_client, "request",
+                        lambda *args, **kwargs: SimpleNamespace(body=body))
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError):
+            _provider(client).embed_query("query")
+    finally:
+        client.close()
+
+
+def test_real_sdk_request_seam_bypass_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(200, json={}))
+    monkeypatch.setattr(type(client.models), "embed_content",
+                        lambda *args, **kwargs: _response([1.0] * _DIMENSIONS))
+    try:
+        with pytest.raises(EmbeddingInvalidResponseError):
+            _provider(client).embed_query("query")
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(("status", "expected"), [
+    (401, EmbeddingAuthenticationError), (403, EmbeddingAuthenticationError),
+    (408, EmbeddingTransientError), (429, EmbeddingRateLimitError),
+    (400, EmbeddingInvalidRequestError), (413, EmbeddingInvalidRequestError),
+    (500, EmbeddingTransientError), (503, EmbeddingTransientError),
+    (501, EmbeddingProviderError),
+])
+def test_real_sdk_http_failure_precedes_raw_embedding_validation(
+    status: int, expected: type[Exception],
+) -> None:
+    client = _real_sdk_client_with_response(httpx.Response(
+        status, json={"error": {"code": status, "message": "raw-body-secret"}},
+    ))
+    try:
+        with pytest.raises(expected) as captured:
+            _provider(client).embed_query("query")
+    finally:
+        client.close()
+    assert "raw-body-secret" not in str(captured.value)
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+
+
+def test_real_sdk_concurrent_calls_do_not_share_validation_or_mutate_client() -> None:
+    barrier = Barrier(3, timeout=10)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        # All calls overlap while inside the shared transport.
+        barrier.wait()
+        payload = json.loads(request.content)
+        query = payload["requests"][0]["content"]["parts"][0]["text"]
+        value = 0.125 if query == "valid" else True
+        return httpx.Response(200, json={"embeddings": [{"values": [value] * _DIMENSIONS}]})
+
+    client = genai.Client(api_key="offline-key", vertexai=False,
+                         http_options=types.HttpOptions(
+                             httpx_client=httpx.Client(transport=httpx.MockTransport(respond))))
+    provider = _provider(client)
+    original_models = client.models
+    original_api = original_models._api_client
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            valid = executor.submit(provider.embed_query, "valid")
+            invalid = executor.submit(provider.embed_query, "invalid")
+            direct = executor.submit(client.models.embed_content, model=_MODEL, contents=["direct"])
+            assert valid.result(timeout=15).values == (0.125,) * _DIMENSIONS
+            with pytest.raises(EmbeddingInvalidResponseError):
+                invalid.result(timeout=15)
+            assert direct.result(timeout=15).embeddings[0].values == [1.0] * _DIMENSIONS
+        assert client.models is original_models
+        assert client.models._api_client is original_api
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize(

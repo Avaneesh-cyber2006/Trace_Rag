@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from json import JSONDecodeError
+from copy import copy
+from json import JSONDecodeError, loads
 import math
 
 from google import genai
 from google.genai import errors, types
+from google.genai.models import Models
 import httpx
 from pydantic import ValidationError
 
@@ -41,6 +43,44 @@ _INVALID_REQUEST_MESSAGE = "Gemini embedding request is invalid."
 _TOO_LARGE_MESSAGE = "Gemini embedding input is too large."
 _INVALID_RESPONSE_MESSAGE = "Gemini embedding response is invalid."
 _PROVIDER_MESSAGE = "Gemini embedding request failed."
+
+
+class _ValidatingApiClient:
+    """Check raw numeric primitives at the pinned SDK's request boundary.
+
+    google-genai 2.22.0 drops the raw body from EmbedContentResponse and
+    coerces bool/string values to floats. Only an isolated Models copy uses
+    this proxy; the caller's client, models, and transport stay untouched.
+    """
+
+    def __init__(self, api_client: object) -> None:
+        self._api_client = api_client
+        self.validated = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._api_client, name)
+
+    def request(self, *args: object, **kwargs: object) -> object:
+        response = self._api_client.request(*args, **kwargs)  # type: ignore[attr-defined]
+        body = getattr(response, "body", None)
+        if not isinstance(body, str):
+            raise EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
+        try:
+            payload = loads(body)
+        except (ValueError, RecursionError):
+            # Decoder limits concern the response, not SDK request validation.
+            raise EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE) from None
+        embeddings = payload.get("embeddings") if isinstance(payload, dict) else None
+        if not isinstance(embeddings, list):
+            raise EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
+        for embedding in embeddings:
+            values = embedding.get("values") if isinstance(embedding, dict) else None
+            if not isinstance(values, list) or any(
+                type(value) not in (int, float) for value in values
+            ):
+                raise EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
+        self.validated = True
+        return response
 
 
 class GeminiEmbeddingProvider:
@@ -84,7 +124,10 @@ class GeminiEmbeddingProvider:
         embed_content: object | None = None
         configuration_failure: EmbeddingVectorStoreConfigurationError | None = None
         try:
-            embed_content = client.models.embed_content  # type: ignore[attr-defined]
+            model_api = client.models  # type: ignore[attr-defined]
+            embed_content = model_api.embed_content
+            if isinstance(model_api, Models) and not callable(model_api._api_client.request):
+                raise ValueError(_CONFIGURATION_MESSAGE)
         except Exception:
             configuration_failure = EmbeddingVectorStoreConfigurationError(
                 _CONFIGURATION_MESSAGE
@@ -174,11 +217,21 @@ class GeminiEmbeddingProvider:
         response: object | None = None
         mapped_failure: EmbeddingVectorStoreError | None = None
         try:
-            response = self._client.models.embed_content(  # type: ignore[attr-defined]
+            model_api = self._client.models  # type: ignore[attr-defined]
+            raw_validator: _ValidatingApiClient | None = None
+            if isinstance(model_api, Models):
+                model_api = copy(model_api)
+                raw_validator = _ValidatingApiClient(model_api._api_client)
+                model_api._api_client = raw_validator
+            response = model_api.embed_content(
                 model=self._identity.model,
                 contents=contents,
                 config=request_config,
             )
+            if raw_validator is not None and not raw_validator.validated:
+                raise EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
+        except EmbeddingInvalidResponseError:
+            mapped_failure = EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
         except errors.UnknownApiResponseError:
             mapped_failure = EmbeddingInvalidResponseError(_INVALID_RESPONSE_MESSAGE)
         except (JSONDecodeError, ValidationError):
