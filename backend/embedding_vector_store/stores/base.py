@@ -190,7 +190,12 @@ class VectorStore(Protocol):
     def acquire_active(
         self, repository_namespace: str
     ) -> AbstractContextManager[RepositoryIndexState]:
-        """Pin the active generation before validation until the context exits."""
+        """Pin the active generation before validation until the context exits.
+
+        Validate adapter-owned storage schema compatibility before yielding,
+        including for empty snapshots. Raise VectorStoreCorruptionError for
+        unsupported or corrupt stored schemas; core treats schema names as opaque.
+        """
         ...
 
     def read_manifest(

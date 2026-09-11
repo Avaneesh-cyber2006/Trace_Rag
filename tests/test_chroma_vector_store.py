@@ -1754,6 +1754,22 @@ def test_control_metadata_rejects_unknown_schema_malformed_and_unsupported_value
         store._decode_snapshot_metadata(NAMESPACE, metadata, object())
 
 
+@pytest.mark.parametrize("empty", [True, False], ids=["empty", "nonempty"])
+def test_acquire_active_rejects_tampered_storage_schema_before_yielding(
+    tmp_path: Path, empty: bool
+) -> None:
+    store = _store(tmp_path)
+    snapshot = _publish_records(store, NAMESPACE, () if empty else _candidate_records())
+    collection = store._read_collection(NAMESPACE, snapshot._token)
+    metadata = dict(collection.metadata)
+    metadata["schema_version"] = "unsupported-schema-v2"
+    collection.modify(metadata=metadata)
+
+    with pytest.raises(VectorStoreCorruptionError):
+        with store.acquire_active(NAMESPACE):
+            pytest.fail("adapter yielded an unsupported schema")
+
+
 @pytest.mark.parametrize(
     ("target", "value"),
     (

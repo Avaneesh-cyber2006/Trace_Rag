@@ -163,7 +163,7 @@ def _snapshot(
         repository_namespace="repo",
         identity=identity or _identity(),
         document_version=EMBEDDING_DOCUMENT_VERSION,
-        schema_version="tracerag-chroma-schema-v1",
+        schema_version="schema-v1",
         expected_chunk_count=expected_chunk_count,
         _token=token or object(),
     )
@@ -389,7 +389,9 @@ def test_identity_mismatch_precedes_query_embedding_and_store_search() -> None:
     [
         ("repository_namespace", "other-repo"),
         ("document_version", "other-document-version"),
-        ("schema_version", "other-schema-version"),
+        ("schema_version", ""),
+        ("schema_version", None),
+        ("schema_version", 1),
         ("expected_chunk_count", True),
         ("expected_chunk_count", -1),
     ],

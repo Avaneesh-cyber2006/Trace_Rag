@@ -22,7 +22,6 @@ _INVALID_SEARCH_CONFIGURATION_MESSAGE = "Semantic search configuration is invali
 _INDEX_NOT_FOUND_MESSAGE = "Repository semantic index is not found."
 _EMBEDDING_SPACE_MISMATCH_MESSAGE = "Semantic index embedding space is incompatible."
 _STORE_CORRUPTION_MESSAGE = "Vector store data is incompatible or corrupt."
-_STORAGE_SCHEMA_VERSION = "tracerag-chroma-schema-v1"
 
 
 def _resolve_snapshot(
@@ -40,7 +39,8 @@ def _resolve_snapshot(
         or snapshot.repository_namespace != repository_namespace
         or not isinstance(snapshot.identity, EmbeddingModelIdentity)
         or snapshot.document_version != EMBEDDING_DOCUMENT_VERSION
-        or snapshot.schema_version != _STORAGE_SCHEMA_VERSION
+        or not isinstance(snapshot.schema_version, str)
+        or not snapshot.schema_version
         or type(snapshot.expected_chunk_count) is not int
         or snapshot.expected_chunk_count < 0
     ):

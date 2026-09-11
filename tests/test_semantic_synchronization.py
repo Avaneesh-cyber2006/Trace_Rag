@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
+from hashlib import sha256
 from threading import Event, Lock
 
 from backend.code_chunker.models import (
@@ -37,6 +38,7 @@ from backend.embedding_vector_store.models import (
     VectorRecord,
 )
 from backend.embedding_vector_store.retry import RetryPolicy
+from backend.embedding_vector_store.search import SemanticSearcher
 from backend.embedding_vector_store.stores.base import (
     CandidateIndex,
     RepositoryIndexSnapshot,
@@ -575,6 +577,69 @@ def _changed_compatible_inventory(
 
 def _empty_inventory() -> CodeChunkInventory:
     return CodeChunkInventory(".", "repo", 0, 0, 0, 0, 0, ())
+
+
+@pytest.mark.parametrize("empty", [True, False], ids=["empty", "nonempty"])
+def test_index_to_search_accepts_adapter_owned_schema(empty: bool) -> None:
+    class SearchableProvider(_RecordingProvider):
+        def embed_query(self, query_text: str) -> EmbeddingVector:
+            events.append(("embed_query", query_text))
+            return VECTOR
+
+    class SearchableStore(_RecordingStore):
+        def search(
+            self, snapshot: RepositoryIndexSnapshot, query: EmbeddingVector, top_k: int
+        ) -> tuple[StoreSearchResult, ...]:
+            assert snapshot is self.active_snapshot
+            assert query is VECTOR
+            events.append("search")
+            records = next(iter(self.candidate_records.values()))
+            return tuple(
+                StoreSearchResult(
+                    snapshot.repository_namespace,
+                    record.chunk_id,
+                    record.content_hash,
+                    record.relative_path,
+                    record.language,
+                    record.chunk_kind,
+                    record.symbol_kind,
+                    record.qualified_name,
+                    record.parent_qualified_name,
+                    record.content,
+                    1.0,
+                )
+                for record in records[:top_k]
+            )
+
+    events: list[object] = []
+    inventory = _empty_inventory()
+    if not empty:
+        inventory, _, _ = _changed_compatible_inventory()
+        file = inventory.files[0]
+        chunks = tuple(
+            replace(chunk, content_hash=sha256(chunk.content.encode("utf-8")).hexdigest())
+            for chunk in file.chunks
+        )
+        inventory = replace(inventory, files=(replace(file, chunks=chunks),))
+    provider = SearchableProvider(10, events=events)
+    store = SearchableStore((), events)
+    store.active_snapshot = None
+
+    sync_result = synchronization_module.SemanticIndexer(provider, store).synchronize(inventory)
+    assert sync_result.status is IndexSyncStatus.SUCCESS
+    assert store.active_snapshot.schema_version == "schema-v1"
+    events.clear()
+
+    results = SemanticSearcher(provider, store).search("repo", "query", 3)
+
+    if empty:
+        assert results == ()
+        assert provider.calls == []
+        assert events == [("inspect_active", "repo")]
+    else:
+        assert tuple(result.content for result in results) == ("unchanged", "updated", "new")
+        assert tuple(result.chunk_id for result in results) == ("a" * 64, "c" * 64, "e" * 64)
+        assert events == [("inspect_active", "repo"), ("embed_query", "query"), "search"]
 
 
 def test_semantic_indexer_orchestration_builds_and_publishes_complete_candidate(
