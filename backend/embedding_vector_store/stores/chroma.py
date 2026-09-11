@@ -1264,21 +1264,29 @@ class ChromaVectorStore:
     def _resolve_publication_outcome(
         self, candidate: CandidateIndex, old_collection: str | None
     ) -> RepositoryIndexSnapshot:
-        """Accept only an explicitly committed, complete candidate pointer."""
+        """Resolve the durable pointer for the already validated candidate."""
         mapped_failure = None
         try:
-            state = self.inspect_active(candidate.repository_namespace)
+            current_collection = self._read_active_collection_name(
+                candidate.repository_namespace
+            )
         except VectorStoreCorruptionError:
             raise
         except VectorStoreReadError:
             mapped_failure = VectorStorePublicationError(_PUBLICATION_MESSAGE)
         if mapped_failure is not None:
             raise mapped_failure
-        if state.snapshot is not None and state.snapshot._token == self._candidate_collection_name(
-            candidate
-        ):
-            return state.snapshot
-        current_collection = state.snapshot._token if state.snapshot is not None else None
+        if current_collection == self._candidate_collection_name(candidate):
+            # Candidate evidence was completely revalidated before replacement.
+            # A later backend outage cannot undo a pointer-proven commit.
+            return RepositoryIndexSnapshot(
+                repository_namespace=candidate.repository_namespace,
+                identity=candidate.identity,
+                document_version=candidate.document_version,
+                schema_version=candidate.schema_version,
+                expected_chunk_count=candidate.expected_chunk_count,
+                _token=current_collection,
+            )
         if current_collection == old_collection:
             raise VectorStorePublicationError(_PUBLICATION_MESSAGE)
         _raise_corruption()

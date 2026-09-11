@@ -682,7 +682,7 @@ def test_publication_io_and_recovery_never_retain_sensitive_context(
     store = ChromaVectorStore(tmp_path / "publication")
     candidate = store.begin_candidate(NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 0)
     real_open = Path.open
-    real_inspect = store.inspect_active
+    real_read_pointer = store._read_active_collection_name
     interrupted = False
 
     def fail(*args, **kwargs):
@@ -714,13 +714,13 @@ def test_publication_io_and_recovery_never_retain_sensitive_context(
             return fail() if boundary == "open" else InterruptedStream()
         return real_open(path, *args, **kwargs)
 
-    def inspect(namespace):
+    def read_pointer(namespace):
         if interrupted and recovery != "old":
             error_type = VectorStoreReadError if recovery == "read_failure" else VectorStoreCorruptionError
             raise error_type("Classified recovery failure.")
-        return real_inspect(namespace)
+        return real_read_pointer(namespace)
 
-    monkeypatch.setattr(store, "inspect_active", inspect)
+    monkeypatch.setattr(store, "_read_active_collection_name", read_pointer)
     if boundary in ("open", "write", "flush"):
         monkeypatch.setattr(Path, "open", interrupted_open)
     else:
@@ -729,7 +729,7 @@ def test_publication_io_and_recovery_never_retain_sensitive_context(
     with pytest.raises(expected) as captured:
         store.publish(candidate)
     _assert_sanitized_exception(captured.value)
-    assert real_inspect(NAMESPACE).indexed is False
+    assert real_read_pointer(NAMESPACE) is None
 
 
 @pytest.mark.parametrize("operation", ["inspect_active", "delete_repository_index"])

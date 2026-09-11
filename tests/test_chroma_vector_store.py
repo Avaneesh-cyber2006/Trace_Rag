@@ -699,13 +699,137 @@ def test_boundary_interruption_returns_new_snapshot_only_after_pointer_proves_co
     assert reopened.snapshot.document_version == "new-document-version"
 
 
+@pytest.mark.parametrize("replace_raises", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_committed_publication_survives_backend_read_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, replace_raises: bool, cleanup_fails: bool,
+) -> None:
+    store = _store(tmp_path)
+    old = _publish_records(store, NAMESPACE, (_candidate_records()[0],))
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 2)
+    store.add_embedded(candidate, _candidate_records())
+    store.validate_candidate(candidate)
+    real_replace = os.replace
+    real_get = store._client.get_collection
+    committed = False
+
+    def commit_then_lose_backend(source: str | Path, destination: str | Path) -> None:
+        nonlocal committed
+        real_replace(source, destination)
+        committed = True
+        if replace_raises:
+            raise OSError("private replacement failure")
+
+    def read_during_outage(*args: object, **kwargs: object):
+        if committed:
+            raise RuntimeError("private backend outage")
+        return real_get(*args, **kwargs)
+
+    def fail_cleanup(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("private cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", commit_then_lose_backend)
+        patch.setattr(store._client, "get_collection", read_during_outage)
+        if cleanup_fails:
+            patch.setattr(store._client, "delete_collection", fail_cleanup)
+        published = store.publish(candidate)
+        pointer = json.loads(store._active_pointer_path(NAMESPACE).read_bytes())
+        assert pointer["payload"]["active_collection"] == published._token
+
+    assert published.repository_namespace == NAMESPACE
+    assert published.identity == IDENTITY
+    assert published.document_version == "new-document-version"
+    assert published.schema_version == STORAGE_SCHEMA_VERSION
+    assert published.expected_chunk_count == 2
+    reopened = _store(tmp_path).inspect_active(NAMESPACE).snapshot
+    assert reopened == published
+    assert reopened._token == published._token
+    assert published._token != old._token
+    assert tuple(record.content for record in store.read_manifest(published)) == (
+        "def 計算():\r\n    return 'λ  ' \n", "class 資料:\n    値 = 'two'\n",
+    )
+    assert {collection.name for collection in store._client.list_collections()} == (
+        {old._token, published._token} if cleanup_fails else {published._token}
+    )
+    assert caplog.messages == (["Vector store cleanup failed."] if cleanup_fails else [])
+
+
+@pytest.mark.parametrize("replace_raises", [False, True])
+@pytest.mark.parametrize("pointer_state", ["unreadable", "checksum", "third", "missing"])
+def test_publication_requires_readable_unambiguous_pointer_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    replace_raises: bool, pointer_state: str,
+) -> None:
+    store = _store(tmp_path)
+    old = _publish_records(store, NAMESPACE, (_candidate_records()[0],))
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "new-document-version", 2)
+    store.add_embedded(candidate, _candidate_records())
+    third = store.begin_candidate(NAMESPACE, IDENTITY, "third-document-version", 0)
+    pointer_path = store._active_pointer_path(NAMESPACE)
+    real_replace = os.replace
+    real_read = Path.read_bytes
+    committed = False
+
+    def replace_with_uncertain_pointer(source: str | Path, destination: str | Path) -> None:
+        nonlocal committed
+        real_replace(source, destination)
+        committed = True
+        if pointer_state == "checksum":
+            envelope = json.loads(real_read(pointer_path))
+            envelope["sha256"] = "0" * 64
+            pointer_path.write_bytes(store._canonical_json(envelope))
+        elif pointer_state == "third":
+            pointer_path.write_bytes(store._active_pointer_bytes(
+                NAMESPACE, store._candidate_collection_name(third),
+            ))
+        elif pointer_state == "missing":
+            pointer_path.unlink()
+        if replace_raises:
+            raise OSError("private replacement failure")
+
+    def read_during_outage(path: Path) -> bytes:
+        if committed and pointer_state == "unreadable" and path == pointer_path:
+            raise OSError("private pointer outage")
+        return real_read(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", replace_with_uncertain_pointer)
+        patch.setattr(Path, "read_bytes", read_during_outage)
+        expected = (VectorStorePublicationError if pointer_state == "unreadable"
+                    else VectorStoreCorruptionError)
+        with pytest.raises(expected) as captured:
+            store.publish(candidate)
+        assert captured.value.__context__ is None
+        assert captured.value.__cause__ is None
+        assert "private" not in str(captured.value)
+
+    # An unproven outcome must retain both generations; no rollback may replace
+    # the durable pointer or claim that the old generation remains active.
+    assert {collection.name for collection in store._client.list_collections()} == {
+        old._token, store._candidate_collection_name(candidate),
+        store._candidate_collection_name(third),
+    }
+    if pointer_state == "unreadable":
+        assert store.inspect_active(NAMESPACE).snapshot.document_version == "new-document-version"
+    elif pointer_state == "third":
+        assert store.inspect_active(NAMESPACE).snapshot.document_version == "third-document-version"
+    elif pointer_state == "missing":
+        assert not pointer_path.exists()
+    else:
+        with pytest.raises(VectorStoreCorruptionError):
+            store.inspect_active(NAMESPACE)
+
+
 def test_restart_ignores_abandoned_candidate_after_precommit_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
-    old = store.begin_candidate(NAMESPACE, IDENTITY, "old-document-version", 0)
-    store.publish(old)
-    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "abandoned-document-version", 0)
+    old = _publish_records(store, NAMESPACE, (_candidate_records()[0],))
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, "abandoned-document-version", 2)
+    store.add_embedded(candidate, _candidate_records())
+    old_pointer = store._active_pointer_path(NAMESPACE).read_bytes()
 
     def interrupt_before_commit(source: str | Path, destination: str | Path) -> None:
         raise OSError("injected interruption before commit")
@@ -717,7 +841,11 @@ def test_restart_ignores_abandoned_candidate_after_precommit_interruption(
 
     reopened = _store(tmp_path).inspect_active(NAMESPACE)
     assert reopened.snapshot is not None
-    assert reopened.snapshot.document_version == "old-document-version"
+    assert reopened.snapshot._token == old._token
+    assert store._active_pointer_path(NAMESPACE).read_bytes() == old_pointer
+    assert tuple(record.content for record in store.read_manifest(old)) == (
+        "def 計算():\r\n    return 'λ  ' \n",
+    )
 
 
 def test_cleanup_failure_after_commit_keeps_new_active_snapshot_authoritative(
