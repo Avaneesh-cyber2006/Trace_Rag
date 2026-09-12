@@ -108,7 +108,7 @@ class _PersistenceConcurrencyState:
         self.pending_cleanup: set[str] = set()
         self.cleanup_reservations: set[str] = set()
         self.owner_process_id = os.getpid()
-        self.adapter_count = 0
+        self.adapter_leases: set[object] = set()
         self.ownership_file = (root / ".tr5-owner.lock").open("a+b")
         try:
             if os.name == "nt":
@@ -130,13 +130,20 @@ class _PersistenceConcurrencyState:
             self.ownership_file.close()
             raise
 
+    @property
+    def adapter_count(self) -> int:
+        return len(self.adapter_leases)
+
 
 # GC can finalize an older adapter during another root's client construction.
 _PERSISTENCE_STATES_LOCK = RLock()
 _PERSISTENCE_STATES: dict[str, _PersistenceConcurrencyState] = {}
 
 
-def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
+def _persistence_concurrency_state(
+    root: Path,
+    adapter_lease: object,
+) -> _PersistenceConcurrencyState:
     key = os.path.normcase(str(root))
     with _PERSISTENCE_STATES_LOCK:
         state = _PERSISTENCE_STATES.get(key)
@@ -145,20 +152,23 @@ def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
             _PERSISTENCE_STATES[key] = state
         elif state.owner_process_id != os.getpid() or state.adapter_count == 0:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
-        state.adapter_count += 1
+        state.adapter_leases.add(adapter_lease)
         return state
 
 
 def _release_persistence_concurrency_state(
-    key: str, state: _PersistenceConcurrencyState,
+    key: str, state: _PersistenceConcurrencyState, adapter_lease: object,
 ) -> None:
     # Forked finalizers must not enter inherited locks or stop a parent client.
     if state.owner_process_id != os.getpid():
         return
     with _PERSISTENCE_STATES_LOCK:
-        if _PERSISTENCE_STATES.get(key) is not state or state.adapter_count == 0:
+        if (
+            _PERSISTENCE_STATES.get(key) is not state
+            or adapter_lease not in state.adapter_leases
+        ):
             return
-        state.adapter_count -= 1
+        state.adapter_leases.remove(adapter_lease)
         if state.adapter_count:
             return
         try:
@@ -333,7 +343,8 @@ class ChromaVectorStore:
             if root.exists() and not root.is_dir():
                 raise OSError("persistence root is not a directory")
             root.mkdir(parents=True, exist_ok=True)
-            concurrency_state = _persistence_concurrency_state(root)
+            adapter_lease = object()
+            concurrency_state = _persistence_concurrency_state(root, adapter_lease)
             try:
                 self._persistence_root = root
                 self._client = concurrency_state.client
@@ -343,13 +354,13 @@ class ChromaVectorStore:
                 # therefore waits for their reader/writer cleanup to finish.
                 finalizer = weakref.finalize(
                     self, _release_persistence_concurrency_state,
-                    os.path.normcase(str(root)), concurrency_state,
+                    os.path.normcase(str(root)), concurrency_state, adapter_lease,
                 )
                 # Interpreter shutdown may still have live daemon operations.
                 finalizer.atexit = False
             except BaseException:
                 _release_persistence_concurrency_state(
-                    os.path.normcase(str(root)), concurrency_state,
+                    os.path.normcase(str(root)), concurrency_state, adapter_lease,
                 )
                 raise
         except VectorStoreError:

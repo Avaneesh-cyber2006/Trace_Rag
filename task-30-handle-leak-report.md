@@ -187,3 +187,97 @@ Results: all exit 0; compileall emitted no output, pip reported
   cycles, shared adapters, active calls, constructor failure, fork safety,
   close ordering/failure, reopen, and handle stress. The README addition is a
   direct contract description rather than unrelated documentation churn.
+
+## Independent-review fix: interrupted finalizer registration
+
+Independent review of commit `499fd48` found one Important constructor window.
+If `weakref.finalize` registered the callback and a `BaseException` interrupted
+the constructor before finalizer setup completed, the exception handler released
+the shared state explicitly and the registered callback later released it again.
+With another live same-root adapter, that double decrement closed the surviving
+adapter's Chroma client and ownership lease.
+
+A deterministic real-Chroma regression wraps `weakref.finalize`, registers the
+real callback, then raises `KeyboardInterrupt`. It keeps a first same-root
+adapter alive and checks its adapter count, client, ownership lease, and public
+inspection behavior after the interrupted second adapter is collected.
+
+RED against `499fd48`:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest tests/test_chroma_vector_store.py::test_finalizer_registration_interruption_preserves_same_root_adapter -q -p no:cacheprovider --basetemp .pytest_tmp/t30-red-finalizer -rs
+```
+
+Result: exit 1; the assertion `state.adapter_count == 1` failed because the
+actual count was `0` after explicit cleanup and finalization both ran.
+
+The minimal fix assigns every adapter acquisition a unique lease token held in
+the shared persistence state. Explicit constructor cleanup and the finalizer use
+the same token. Whichever path releases it first removes the token; every later
+release is an idempotent no-op. `adapter_count` is derived from the live lease
+set, so the count cannot diverge from release ownership.
+
+Initial GREEN and directly adjacent cases:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest tests/test_chroma_vector_store.py -q -p no:cacheprovider --basetemp .pytest_tmp/t30x-green -k 'finalizer_registration_interruption or adapter_setup_failure or last_shared_adapter' -rs
+```
+
+Result: exit 0; `3 passed, 175 deselected in 7.60s`.
+
+Focused lifecycle suite:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest tests/test_chroma_vector_store.py -q -p no:cacheprovider --basetemp .pytest_tmp/t30x-life -k 'non_owning_process or fork_discards or concurrent_subprocess_writer or ownership_released or unused_persistence_roots or last_shared_adapter or active_snapshot_context or active_writer_retains or adapter_setup_failure or finalizer_registration_interruption or finalization_during_client_construction or teardown_rejects or failed_client_teardown' -rs
+```
+
+Result: exit 0; `18 passed, 1 skipped, 159 deselected in 22.50s`. The
+POSIX-only fork case was skipped on Windows.
+
+Complete Chroma suite:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest tests/test_chroma_vector_store.py -q -p no:cacheprovider --basetemp .pytest_tmp/t30x-chroma -rs
+```
+
+Result: exit 0; `177 passed, 1 skipped in 42.42s`.
+
+Relevant vector-store contract, concurrency, search, and security selection:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest tests/test_vector_store_contract.py tests/test_semantic_synchronization.py tests/test_semantic_search.py tests/test_embedding_security.py -q -p no:cacheprovider --basetemp .pytest_tmp/task30-adjacent-lifecycle -k 'concurrent or snapshot or owner or process or chroma or credential or leak or security' -rs
+```
+
+Result: exit 0; `524 passed, 171 deselected in 3.95s`.
+
+The 550 populated-root helper was rerun after the review fix:
+
+```powershell
+$env:PYTHONPATH = (Get-Location).Path
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' .pytest_tmp/task30_handle_stress.py .pytest_tmp/task30-stress-550-resume
+```
+
+Result: exit 0; `stress-ok roots=550 start_handles=276 end_handles=283
+pid=49012` after every root and final reopen left both registries empty.
+
+Fresh full offline suite:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pytest -q -m 'not gemini_live and not integration' -p no:cacheprovider --basetemp .pytest_tmp/t30xfull1 -rs
+```
+
+Result: exit 0; `1797 passed, 4 skipped, 2 deselected, 1 warning in 152.08s`.
+Skips were the POSIX fork test and three Windows symlink-privilege cases. The
+warning was the known Chroma embedding-function configuration deprecation.
+No HNSW flake occurred and no retry or suppression was added.
+
+Post-review static checks:
+
+```powershell
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m compileall -q backend tests
+& 'C:\Users\avane\Desktop\Studies\Projects\Trace_Rag\.venv\Scripts\python.exe' -m pip check
+git diff --check
+```
+
+Results: all exit 0; compileall emitted no output, pip reported
+`No broken requirements found.`, and diff check reported no whitespace errors.

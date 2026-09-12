@@ -1505,8 +1505,8 @@ def test_adapter_setup_failure_releases_acquired_ownership(
     states = []
     acquire = chroma_module._persistence_concurrency_state
 
-    def capture_state(root):
-        state = acquire(root)
+    def capture_state(root, adapter_lease):
+        state = acquire(root, adapter_lease)
         states.append(state)
         return state
 
@@ -1523,6 +1523,35 @@ def test_adapter_setup_failure_releases_acquired_ownership(
 
     assert states[0].ownership_file.closed
     assert _run_subprocess_writer(root) == {"outcome": "published"}
+
+
+def test_finalizer_registration_interruption_preserves_same_root_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    survivor = _store(tmp_path)
+    root = survivor._persistence_root
+    state = survivor._concurrency_state
+    registered_finalizers = []
+    register_finalizer = weakref.finalize
+
+    def register_then_interrupt(*args, **kwargs):
+        registered_finalizers.append(register_finalizer(*args, **kwargs))
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as registration_patch:
+        registration_patch.setattr(
+            chroma_module.weakref, "finalize", register_then_interrupt
+        )
+        with pytest.raises(KeyboardInterrupt):
+            ChromaVectorStore(root)
+
+    gc.collect()
+
+    assert registered_finalizers and not registered_finalizers[0].alive
+    assert state.adapter_count == 1
+    assert not state.ownership_file.closed
+    assert not survivor._client._closed
+    assert not survivor.inspect_active(NAMESPACE).indexed
 
 
 def test_finalization_during_client_construction_does_not_deadlock(tmp_path: Path) -> None:
