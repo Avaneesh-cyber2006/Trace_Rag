@@ -13,8 +13,9 @@ from pathlib import Path
 import re
 import secrets
 import struct
-from threading import Lock
+from threading import Lock, RLock
 from typing import Iterable, Iterator
+import weakref
 
 import chromadb
 from chromadb.api.client import SharedSystemClient
@@ -92,12 +93,13 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class _PersistenceConcurrencyState:
-    """Process-lifetime ownership and reader state for one local root.
+    """Shared ownership and reader state for live adapters of one local root.
 
-    Chroma caches its persistent clients for the process lifetime, so ownership
-    must outlive individual adapter objects too. The OS releases the file lock
-    on normal exit or termination. Never unlink its path: that would allow a
-    second process to lock a different inode for the same persistence root.
+    The last adapter closes Chroma before releasing OS ownership. The OS releases
+    still-live roots at process exit. Never unlink the lock path: another process
+    could lock a different inode for this root.
+    A zero adapter count in the registry means teardown is in progress or failed;
+    the root stays unavailable until successful teardown or process exit.
     """
 
     def __init__(self, root: Path) -> None:
@@ -106,6 +108,7 @@ class _PersistenceConcurrencyState:
         self.pending_cleanup: set[str] = set()
         self.cleanup_reservations: set[str] = set()
         self.owner_process_id = os.getpid()
+        self.adapter_count = 0
         self.ownership_file = (root / ".tr5-owner.lock").open("a+b")
         try:
             if os.name == "nt":
@@ -128,7 +131,8 @@ class _PersistenceConcurrencyState:
             raise
 
 
-_PERSISTENCE_STATES_LOCK = Lock()
+# GC can finalize an older adapter during another root's client construction.
+_PERSISTENCE_STATES_LOCK = RLock()
 _PERSISTENCE_STATES: dict[str, _PersistenceConcurrencyState] = {}
 
 
@@ -139,9 +143,36 @@ def _persistence_concurrency_state(root: Path) -> _PersistenceConcurrencyState:
         if state is None:
             state = _PersistenceConcurrencyState(root)
             _PERSISTENCE_STATES[key] = state
-        elif state.owner_process_id != os.getpid():
+        elif state.owner_process_id != os.getpid() or state.adapter_count == 0:
             raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        state.adapter_count += 1
         return state
+
+
+def _release_persistence_concurrency_state(
+    key: str, state: _PersistenceConcurrencyState,
+) -> None:
+    # Forked finalizers must not enter inherited locks or stop a parent client.
+    if state.owner_process_id != os.getpid():
+        return
+    with _PERSISTENCE_STATES_LOCK:
+        if _PERSISTENCE_STATES.get(key) is not state or state.adapter_count == 0:
+            return
+        state.adapter_count -= 1
+        if state.adapter_count:
+            return
+        try:
+            # Keep acquisition serialized until both the system and lease close.
+            # Client.close() honors Chroma's own shared-system reference counts.
+            state.client.close()
+            state.ownership_file.close()
+        except Exception:
+            # A partially stopped client must retain ownership, not admit a new
+            # process. Chroma marks close attempted before stopping, so retrying
+            # it could silently skip the incomplete teardown.
+            _LOGGER.warning("Vector store cleanup failed.")
+            return
+        _PERSISTENCE_STATES.pop(key)
 
 
 def _release_inherited_ownership() -> None:
@@ -149,7 +180,7 @@ def _release_inherited_ownership() -> None:
     global _PERSISTENCE_STATES, _PERSISTENCE_STATES_LOCK
     inherited_states = tuple(_PERSISTENCE_STATES.values())
     _PERSISTENCE_STATES = {}
-    _PERSISTENCE_STATES_LOCK = Lock()
+    _PERSISTENCE_STATES_LOCK = RLock()
     for state in inherited_states:
         # Close only; explicit flock unlock would release the parent's lock too.
         try:
@@ -303,16 +334,30 @@ class ChromaVectorStore:
                 raise OSError("persistence root is not a directory")
             root.mkdir(parents=True, exist_ok=True)
             concurrency_state = _persistence_concurrency_state(root)
+            try:
+                self._persistence_root = root
+                self._client = concurrency_state.client
+                self._owner_process_id = concurrency_state.owner_process_id
+                self._concurrency_state = concurrency_state
+                # Live methods and snapshot generators retain self. Finalization
+                # therefore waits for their reader/writer cleanup to finish.
+                finalizer = weakref.finalize(
+                    self, _release_persistence_concurrency_state,
+                    os.path.normcase(str(root)), concurrency_state,
+                )
+                # Interpreter shutdown may still have live daemon operations.
+                finalizer.atexit = False
+            except BaseException:
+                _release_persistence_concurrency_state(
+                    os.path.normcase(str(root)), concurrency_state,
+                )
+                raise
         except VectorStoreError:
             raise
         except Exception:
             mapped_failure = VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
         if mapped_failure is not None:
             raise mapped_failure
-        self._persistence_root = root
-        self._client = concurrency_state.client
-        self._owner_process_id = concurrency_state.owner_process_id
-        self._concurrency_state = concurrency_state
 
     def _assert_owner_process(self) -> None:
         if os.getpid() != self._owner_process_id:

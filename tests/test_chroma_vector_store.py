@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import gc
 from hashlib import sha256
 import inspect
 import json
@@ -13,6 +14,7 @@ import re
 import subprocess
 import sys
 from threading import Event
+import weakref
 
 import pytest
 
@@ -1126,11 +1128,17 @@ def test_writer_mutation_rejects_use_from_a_non_owning_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
+    state = store._concurrency_state
     owner_process = os.getpid()
-    monkeypatch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
+    with monkeypatch.context() as pid_patch:
+        pid_patch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
 
-    with pytest.raises(VectorStoreConfigurationError):
-        store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+        with pytest.raises(VectorStoreConfigurationError):
+            store.begin_candidate(NAMESPACE, IDENTITY, "document-v1", 0)
+
+    del store
+    gc.collect()
+    assert state.ownership_file.closed
 
 
 @pytest.mark.parametrize("operation", ("inspect", "acquire", "manifest", "search"))
@@ -1139,19 +1147,25 @@ def test_public_reads_reject_use_from_a_non_owning_process(
 ) -> None:
     store = _store(tmp_path)
     snapshot = _publish_records(store, NAMESPACE, ())
+    state = store._concurrency_state
     owner_process = os.getpid()
-    monkeypatch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
+    with monkeypatch.context() as pid_patch:
+        pid_patch.setattr(chroma_module.os, "getpid", lambda: owner_process + 1)
 
-    with pytest.raises(VectorStoreConfigurationError):
-        if operation == "inspect":
-            store.inspect_active(NAMESPACE)
-        elif operation == "acquire":
-            with store.acquire_active(NAMESPACE):
-                pytest.fail("non-owner acquired active snapshot")
-        elif operation == "manifest":
-            store.read_manifest(snapshot)
-        else:
-            store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
+        with pytest.raises(VectorStoreConfigurationError):
+            if operation == "inspect":
+                store.inspect_active(NAMESPACE)
+            elif operation == "acquire":
+                with store.acquire_active(NAMESPACE):
+                    pytest.fail("non-owner acquired active snapshot")
+            elif operation == "manifest":
+                store.read_manifest(snapshot)
+            else:
+                store.search(snapshot, EmbeddingVector((1.0, 0.0, 0.0)), 1)
+
+    del store
+    gc.collect()
+    assert state.ownership_file.closed
 
 
 _SUBPROCESS_WRITER = """
@@ -1179,9 +1193,11 @@ else:
 
 
 _SUBPROCESS_FORK_OWNERSHIP = """
+import gc
 import json
 import os
 import sys
+import weakref
 from threading import Event, Thread
 
 from chromadb.api.client import SharedSystemClient
@@ -1265,6 +1281,12 @@ except VectorStoreConfigurationError:
     outcome["inherited_read"] = "rejected"
 else:
     outcome["inherited_read"] = "accepted"
+inherited_client = store._client
+inherited_adapter = weakref.ref(store)
+del store, original_inspect, thread
+gc.collect()
+outcome["inherited_adapter_collected"] = inherited_adapter() is None
+outcome["inherited_client_not_closed"] = not inherited_client._closed
 os.write(ready_write, b"1")
 try:
     ChromaVectorStore(root)
@@ -1320,6 +1342,8 @@ def test_fork_discards_inherited_chroma_state_without_releasing_parent_ownership
         "writer_guards_empty": True,
         "writer_guard_lock_available": True,
         "inherited_read": "rejected",
+        "inherited_adapter_collected": True,
+        "inherited_client_not_closed": True,
         "fresh_while_parent_alive": "rejected",
         "fresh_after_parent_exit": "success",
     }
@@ -1372,6 +1396,217 @@ def test_writer_ownership_released_after_client_initialization_failure(
         ChromaVectorStore(root)
 
     assert _run_subprocess_writer(root) == {"outcome": "published"}
+
+
+def test_unused_persistence_roots_release_ownership_and_chroma_systems(
+    tmp_path: Path,
+) -> None:
+    for index in range(12):
+        root = tmp_path / str(index)
+        store = ChromaVectorStore(root)
+        state = store._concurrency_state
+        client = store._client
+        reference = weakref.ref(store)
+        # A cycle must not require __del__ or keep an otherwise unused root alive.
+        store._test_cycle = store
+
+        del store
+        gc.collect()
+
+        assert reference() is None
+        assert state.ownership_file.closed
+        assert os.path.normcase(str(root.resolve())) not in chroma_module._PERSISTENCE_STATES
+        assert client._identifier not in chroma_module.SharedSystemClient._identifier_to_system
+
+
+def test_last_shared_adapter_releases_ownership_and_can_reopen(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store._persistence_root
+    state = store._concurrency_state
+    other = ChromaVectorStore(root / ".")
+    assert other._concurrency_state is state
+    assert other._client is store._client
+    del store
+    gc.collect()
+
+    assert not state.ownership_file.closed
+    snapshot = _publish_records(other, NAMESPACE, _candidate_records())
+    assert _run_subprocess_writer(root)["outcome"] == "rejected"
+
+    del other
+    gc.collect()
+
+    assert state.ownership_file.closed
+    assert _run_subprocess_writer(root) == {"outcome": "published"}
+    reopened = ChromaVectorStore(root)
+    assert reopened._concurrency_state is not state
+    assert reopened.inspect_active(NAMESPACE).snapshot == snapshot
+    assert len(reopened.read_manifest(snapshot)) == 2
+
+
+def test_active_snapshot_context_retains_last_adapter_ownership(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    root = store._persistence_root
+    snapshot = _publish_records(store, NAMESPACE, _candidate_records())
+    state = store._concurrency_state
+    reference = weakref.ref(store)
+    reader = store.acquire_active(NAMESPACE)
+
+    with reader as active:
+        del store
+        gc.collect()
+        assert reference() is not None
+        assert not state.ownership_file.closed
+        assert state.readers == {snapshot._token: 1}
+        assert active.snapshot == snapshot
+        assert _run_subprocess_writer(root)["outcome"] == "rejected"
+
+    gc.collect()
+    assert reference() is None
+    assert not state.readers
+    assert state.ownership_file.closed
+
+
+def test_active_writer_retains_last_adapter_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    state = store._concurrency_state
+    reference = weakref.ref(store)
+    entered, release = Event(), Event()
+    create = store._client.create_collection
+
+    def blocked_create(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(store._client, "create_collection", blocked_create)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(store.begin_candidate, NAMESPACE, IDENTITY, "document-v1", 0)
+        try:
+            assert entered.wait(10)
+            del store
+            gc.collect()
+            assert reference() is not None
+            assert not state.ownership_file.closed
+        finally:
+            release.set()
+        assert future.result(timeout=10).expected_chunk_count == 0
+
+    gc.collect()
+    assert reference() is None
+    assert state.ownership_file.closed
+
+
+def test_adapter_setup_failure_releases_acquired_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = []
+    acquire = chroma_module._persistence_concurrency_state
+
+    def capture_state(root):
+        state = acquire(root)
+        states.append(state)
+        return state
+
+    class FailedAdapter(ChromaVectorStore):
+        def __setattr__(self, name, value):
+            if name == "_client":
+                raise RuntimeError("injected adapter setup failure")
+            super().__setattr__(name, value)
+
+    monkeypatch.setattr(chroma_module, "_persistence_concurrency_state", capture_state)
+    root = tmp_path / "failed-adapter"
+    with pytest.raises(VectorStoreConfigurationError):
+        FailedAdapter(root)
+
+    assert states[0].ownership_file.closed
+    assert _run_subprocess_writer(root) == {"outcome": "published"}
+
+
+def test_finalization_during_client_construction_does_not_deadlock(tmp_path: Path) -> None:
+    script = """
+import gc
+from pathlib import Path
+import sys
+from backend.embedding_vector_store.stores.chroma import ChromaVectorStore
+import backend.embedding_vector_store.stores.chroma as module
+
+gc.disable()
+store = ChromaVectorStore(Path(sys.argv[1]) / "old")
+state = store._concurrency_state
+store.cycle = store
+del store
+original = module.chromadb.PersistentClient
+def collect_during_construction(**kwargs):
+    gc.collect()
+    return original(**kwargs)
+module.chromadb.PersistentClient = collect_during_construction
+new = ChromaVectorStore(Path(sys.argv[1]) / "new")
+assert state.ownership_file.closed
+assert not new._concurrency_state.ownership_file.closed
+print("released")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    assert result.stdout.strip() == "released"
+
+
+def test_teardown_rejects_reentrant_acquisition_and_closes_before_unlocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    root = store._persistence_root
+    state = store._concurrency_state
+    close = store._client.close
+    observed = []
+
+    def close_with_reentrant_acquisition():
+        observed.append(not state.ownership_file.closed)
+        try:
+            ChromaVectorStore(root)
+        except VectorStoreConfigurationError:
+            observed.append("rejected")
+        close()
+
+    monkeypatch.setattr(store._client, "close", close_with_reentrant_acquisition)
+    del store
+    gc.collect()
+
+    assert observed == [True, "rejected"]
+    assert state.ownership_file.closed
+
+
+def test_failed_client_teardown_keeps_ownership_and_rejects_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _store(tmp_path)
+    root = store._persistence_root
+    state = store._concurrency_state
+    close = store._client.close
+
+    def fail_close():
+        raise RuntimeError("private teardown detail")
+
+    monkeypatch.setattr(store._client, "close", fail_close)
+    try:
+        del store
+        gc.collect()
+        assert not state.ownership_file.closed
+        assert _run_subprocess_writer(root)["outcome"] == "rejected"
+        with pytest.raises(VectorStoreConfigurationError):
+            ChromaVectorStore(root)
+        assert "Vector store cleanup failed." in caplog.text
+        assert "private teardown detail" not in caplog.text
+    finally:
+        # This injected failure intentionally retains ownership until process
+        # exit. Release the healthy real client so this test leaves no resources.
+        close()
+        state.ownership_file.close()
+        chroma_module._PERSISTENCE_STATES.pop(os.path.normcase(str(root)), None)
 
 
 def test_publication_failure_with_valid_third_pointer_is_ambiguous_corruption(
