@@ -34,8 +34,14 @@
 
 Inspected `backend/file_scanner/`, `backend/code_parser/`, `backend/code_chunker/`,
 `backend/embedding_vector_store/`, their relevant tests, `requirements.txt`,
-`pytest.ini`, and `README.md`. Starting main is the approved spec commit;
-origin/main remains `52e74a79d92ee947f6d246a18b959931c877cd0f`.
+`pytest.ini`, and `README.md`. The approved spec commit remains
+`59f38441e416d162ab3957ffb288ccdc36b39363`. The implementation-plan commit and
+intended Module 6 execution base is `a8d9d3411e4249750dfd7b719a8a141a68825197`.
+Execution must branch/worktree from that plan commit, not from origin/main or
+the earlier spec-only commit. Task 18 must record the actual execution base
+from Git rather than blindly assuming this hash. These distinctions do not
+change spec authority. origin/main remains
+`52e74a79d92ee947f6d246a18b959931c877cd0f`.
 
 - Scanner public models/exports live in `backend/file_scanner/models.py` and
   `__init__.py`. `FileScanner.scan(path, *, repository_namespace=None)` is the
@@ -137,7 +143,7 @@ Test ownership:
 - `tests/test_code_graph_integration.py` (17).
 
 Documentation modifications during execution: append Module 6 usage to
-`README.md` in Task 17; create `docs/verification/module-6-code-graph-builder.md`
+`README.md` in Task 17; create `docs/superpowers/verification/module-6-code-graph-builder.md`
 with actual evidence in Task 18. Do not rewrite this spec or add another plan.
 
 ## Task order and RED/GREEN discipline
@@ -1386,16 +1392,16 @@ marker expression. Do not alter Modules 1–5 usage or their requirements text.
 ### Task 18: Comprehensive offline acceptance and evidence commit
 
 **Files:**
-- Create: `docs/verification/module-6-code-graph-builder.md`.
+- Create: `docs/superpowers/verification/module-6-code-graph-builder.md`.
 - Test: all twelve `tests/test_code_graph_*.py` files and existing regression paths in the commands below.
-- Modify: no production file in this acceptance task. Any failure returns to its owning task for a focused RED/GREEN fix and meaningful commit before acceptance resumes.
+- Modify: no production file in this acceptance task. New or deterministic failures stop acceptance and return to their owning task for a focused RED/GREEN fix and meaningful commit before acceptance resumes. Only the specifically characterized Chroma flake below follows its evidence-and-rerun ruling.
 
 **Interfaces:**
 - Consumes: completed public Module 6 and all prior tests.
 - Produces: fresh command results, scope/security audit, and a clean execution branch. This verification-only task does not invent a failing test or production stub.
 
-- [ ] Confirm Python 3.12+ and the execution checkout state with `python --version`, `git branch --show-current`, `git status --short --branch`, and `git log --oneline -20`. Record the execution base commit and all implementation commit IDs; no squash.
-- [ ] Run each command separately, preserve exit codes/counts, and stop on a failure:
+- [ ] Confirm Python 3.12+ and the execution checkout state with `python --version`, `git branch --show-current`, `git status --short --branch`, and `git log --oneline -20`. Record the actual execution base from Git and all implementation commit IDs; verify it against the intended plan-commit base above rather than blindly assuming a hash. No squash.
+- [ ] Run each command separately, preserve exit codes/counts, and stop on new or deterministic failures. The only exception is the narrowly defined Chroma ruling below:
 
 ```powershell
 python -m pytest tests -q -k code_graph -m "not integration and not gemini_live" -rs
@@ -1416,6 +1422,32 @@ Do not run optional live tests. Inspect skip/deselection reasons; new graph
 tests cannot be skipped. A missing package or grammar is an environment failure,
 not evidence that Module 6 passed; repair only through the authorized execution
 environment workflow, never by adding a Module 6 runtime dependency.
+
+**Known ChromaDB 1.5.9 persisted HNSW reader flake ruling:**
+This applies only when Module 5 regression or full-suite verification matches
+the already-characterized intermittent persisted-reader failure in the
+previously observed "Nothing found on disk" class. It is not a generic policy
+to retry failed tests. Any NEW deterministic Module 1–6 failure remains an
+immediate STOP condition; any other new failure stops acceptance for diagnosis.
+
+1. Record the exact failing test/node, original failure and command.
+2. Do NOT add production retries.
+3. Do NOT weaken, skip, xfail, or suppress the test.
+4. Do NOT modify Module 6 to work around Chroma.
+5. Rerun the exact affected test/node in a fresh Python process with a fresh
+   pytest basetemp, preserving the offline marker selection. Use a new unused
+   basetemp directory so pytest cannot reuse or delete prior run evidence.
+6. If the isolated node fails deterministically, STOP as a real blocker. Do not
+   repeatedly rerun until it passes; an unexplained isolated failure also stops
+   acceptance for diagnosis.
+7. If the isolated node passes AND the original failure matches the already-known
+   Chroma flake, rerun the affected regression/full suite cleanly in a fresh
+   Python process with a fresh pytest basetemp.
+8. Acceptance still requires a clean authoritative final run. A passing isolated
+   node alone does not satisfy acceptance.
+9. Record both the flaky run and clean evidence, including node IDs, commands,
+   basetemp paths and outcomes, in the Module 6 verification report.
+
 - [ ] In the graph focused result identify actual passing tests for IDs,
   permutations, collisions, graph invariants, immutable backing maps,
   PARTIAL/FAILED relevance, ownership, one-unresolved/zero-edge ambiguity,
@@ -1442,8 +1474,8 @@ Module 10 Gemini reasoning/UI appears in the changed code.
   scaling observations, and explicit scope/security results. Do not write
   predicted results or claim skipped gates passed. Record that graph integration
   reads source only in Modules 2/3 before the guard and makes zero network calls.
-- [ ] Run `git diff --check -- docs/verification/module-6-code-graph-builder.md`.
-- [ ] Stage only the evidence document, run `git diff --cached --check`, and
+- [ ] Run `git diff --check -- docs/superpowers/verification/module-6-code-graph-builder.md`.
+- [ ] Stage only `docs/superpowers/verification/module-6-code-graph-builder.md`, run `git diff --cached --check`, and
   commit `docs: record code graph verification evidence`.
 - [ ] Run `git status --short --branch`, `git show --stat --oneline HEAD`, and
   `git diff $graphBase HEAD --check`. Report clean state and verification evidence
