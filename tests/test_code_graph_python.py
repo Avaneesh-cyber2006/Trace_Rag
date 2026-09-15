@@ -315,3 +315,89 @@ def test_ambiguous_binding_scope_blocks_only_the_dependent_binding(cg):
             Resolution(None, ResolutionFailureReason.AMBIGUOUS),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("module", "target_path"),
+    [
+        pytest.param("class", "class.py", id="root-keyword"),
+        pytest.param("pkg.class", "pkg/class.py", id="nested-keyword"),
+    ],
+)
+def test_reserved_keyword_module_component_is_unsupported(
+    cg, module, target_path
+):
+    item = ImportInfo(module, (), False, (), cg.loc(1, 20))
+    source = cg.parsed("main.py", imports=(item,))
+    target = cg.parsed(target_path)
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, target)))
+
+    result = resolve_import(index, source, item)
+
+    assert result.resolution == Resolution(
+        None, ResolutionFailureReason.UNSUPPORTED
+    )
+
+
+@pytest.mark.parametrize(
+    ("imported_name", "alias", "local_name"),
+    [
+        pytest.param("class", None, "class", id="imported-keyword"),
+        pytest.param("run", "class", "class", id="alias-keyword"),
+        pytest.param("run", "bad.name", "bad.name", id="dotted-alias"),
+    ],
+)
+def test_invalid_binding_name_is_unsupported_without_losing_file_import(
+    cg, imported_name, alias, local_name
+):
+    item = ImportInfo(
+        "pkg.util",
+        (ImportBinding(imported_name, alias),),
+        False,
+        (),
+        cg.loc(1, 30),
+    )
+    source = cg.parsed("main.py", imports=(item,))
+    target = cg.parsed(
+        "pkg/util.py",
+        symbols=(cg.symbol(imported_name), cg.symbol("run", start=40, end=50)),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, target)))
+
+    result = resolve_import(index, source, item)
+
+    assert result.resolution == Resolution(index.file_ids["pkg/util.py"], None)
+    assert result.bindings == (
+        Binding(
+            local_name,
+            index.file_ids["main.py"],
+            "blocked",
+            Resolution(None, ResolutionFailureReason.UNSUPPORTED),
+        ),
+    )
+
+
+def test_soft_keywords_remain_valid_import_identifiers(cg):
+    item = ImportInfo(
+        "pkg.match",
+        (ImportBinding("match", "case"),),
+        False,
+        (),
+        cg.loc(1, 30),
+    )
+    source = cg.parsed("main.py", imports=(item,))
+    imported = cg.symbol("match")
+    target = cg.parsed("pkg/match.py", symbols=(imported,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, target)))
+
+    result = resolve_import(index, source, item)
+
+    assert result.resolution == Resolution(index.file_ids["pkg/match.py"], None)
+    assert result.bindings == (
+        Binding(
+            "case",
+            index.file_ids["main.py"],
+            "symbol",
+            Resolution(symbol_node_id("repo", "pkg/match.py", imported), None),
+        ),
+    )

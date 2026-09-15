@@ -1,5 +1,7 @@
 """Resolve Python import evidence against immutable graph indexes."""
 
+import keyword
+
 from backend.code_graph.indexes import GraphIndexes
 from backend.code_graph.models import ResolutionFailureReason
 from backend.code_graph.resolvers.base import (
@@ -12,12 +14,20 @@ from backend.code_graph.resolvers.base import (
 from backend.code_parser.models import ImportInfo, ParsedFile, ParseStatus
 
 
+def _is_identifier(value: str) -> bool:
+    return value.isidentifier() and not keyword.iskeyword(value)
+
+
+def _is_dotted_identifier(value: str) -> bool:
+    return all(_is_identifier(part) for part in value.split("."))
+
+
 def _module_candidates(
     index: GraphIndexes, file: ParsedFile, module: str
 ) -> tuple[tuple[str, ...], bool, bool]:
     level = len(module) - len(module.lstrip("."))
     tail_text = module[level:]
-    if tail_text and not all(part.isidentifier() for part in tail_text.split(".")):
+    if tail_text and not _is_dotted_identifier(tail_text):
         return (), False, True
 
     if not level:
@@ -37,7 +47,7 @@ def _member_resolution(
     module_resolution: Resolution,
     imported_name: str,
 ) -> Resolution:
-    if not imported_name.isidentifier():
+    if not _is_identifier(imported_name):
         return choose_resolution((), unsupported=True)
     if module_resolution.target_node_id is None:
         if module_resolution.reason is ResolutionFailureReason.AMBIGUOUS:
@@ -92,6 +102,27 @@ def resolve_import(
     indistinguishable = _is_indistinguishable_form(item)
     for imported in item.bindings:
         local_name = _binding_local_name(imported.imported_name, imported.alias)
+        may_be_direct = (
+            len(item.bindings) == 1
+            and imported.imported_name == item.module
+            and not item.module.startswith(".")
+        )
+        imported_name_valid = (
+            _is_dotted_identifier(imported.imported_name)
+            if may_be_direct
+            else _is_identifier(imported.imported_name)
+        )
+        alias_valid = imported.alias is None or _is_identifier(imported.alias)
+        if not imported_name_valid or not alias_valid:
+            bindings.append(
+                Binding(
+                    local_name,
+                    scope_node_id,
+                    "blocked",
+                    Resolution(None, ResolutionFailureReason.UNSUPPORTED),
+                )
+            )
+            continue
 
         if indistinguishable:
             symbol_interpretation = _member_resolution(
@@ -108,10 +139,8 @@ def resolve_import(
             continue
 
         is_direct_module = (
-            len(item.bindings) == 1
-            and imported.imported_name == item.module
+            may_be_direct
             and "." in imported.imported_name
-            and not imported.imported_name.startswith(".")
         )
         if is_direct_module:
             mode = "module"
