@@ -241,8 +241,8 @@ def _is_ancestor(
 
 def _overlaps(first: SourceLocation, second: SourceLocation) -> bool:
     return (
-        first.start_byte <= second.end_byte
-        and second.start_byte <= first.end_byte
+        first.start_byte < second.end_byte
+        and second.start_byte < first.end_byte
     )
 
 

@@ -603,6 +603,28 @@ def test_relevant_partial_parse_blocks_unproven_import_scope(cg):
     assert reason is ResolutionFailureReason.INCOMPLETE_PARSE
 
 
+def test_adjacent_parse_issue_does_not_block_import_scope(cg):
+    owner = cg.symbol("run", start=50, end=200)
+    item = ImportInfo("pkg", (), False, (), cg.loc(100, 110))
+    adjacent = ParseIssue(
+        ParseIssueKind.SYNTAX_ERROR,
+        "ends before import",
+        cg.loc(90, 100),
+    )
+    file = cg.parsed(
+        status=ParseStatus.PARTIAL,
+        symbols=(owner,),
+        imports=(item,),
+        issues=(adjacent,),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    scope_node_id, reason = import_scope(index, file, item)
+
+    assert scope_node_id == symbol_node_id("repo", "a.py", owner)
+    assert reason is None
+
+
 def test_import_scope_query_work_is_bounded_by_index_and_candidates(cg):
     outer = cg.symbol("Outer", kind=SymbolKind.CLASS, end=10_000)
     siblings = tuple(
@@ -758,6 +780,26 @@ def test_unproven_call_ownership_is_a_conservative_barrier(
     assert reference.blocked_reason is expected
 
 
+def test_adjacent_parse_issue_does_not_reclassify_top_level_call(cg):
+    call = CallSite(None, "target", CallKind.CALL, cg.loc(100, 110))
+    adjacent = ParseIssue(
+        ParseIssueKind.SYNTAX_ERROR,
+        "ends before call",
+        cg.loc(90, 100),
+    )
+    file = cg.parsed(
+        status=ParseStatus.PARTIAL,
+        calls=(call,),
+        issues=(adjacent,),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    reference = call_reference(index, file, call)
+
+    assert reference.source_node_id is None
+    assert reference.blocked_reason is ResolutionFailureReason.UNSUPPORTED
+
+
 def test_type_references_keep_declaring_source_location_and_exact_strings(cg):
     symbol = cg.symbol(
         "Child",
@@ -889,6 +931,40 @@ def test_ambiguous_outcome_materializes_only_unresolved_candidates(cg):
     assert isinstance(result, UnresolvedReference)
     assert result.reason is ResolutionFailureReason.AMBIGUOUS
     assert result.candidate_node_ids == candidates
+
+
+def test_ambiguous_call_rejects_existing_ineligible_candidates(cg):
+    source = cg.symbol("source", start=0, end=100)
+    not_callable = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, start=200, end=300
+    )
+    file = cg.parsed(symbols=(source, not_callable))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    source_id = symbol_node_id("repo", "a.py", source)
+    candidates = tuple(
+        sorted(
+            (
+                index.file_ids["a.py"],
+                symbol_node_id("repo", "a.py", not_callable),
+            )
+        )
+    )
+    reference = Reference(
+        ReferenceKind.CALL,
+        "a.py",
+        ParsedLanguage.PYTHON,
+        source_id,
+        cg.loc(20, 30),
+        "maybe",
+        CallKind.CALL,
+    )
+
+    with pytest.raises(CodeGraphResolutionError):
+        materialize(
+            index,
+            reference,
+            Resolution(None, ResolutionFailureReason.AMBIGUOUS, candidates),
+        )
 
 
 def test_inheritance_materialization_uses_declaration_location(cg):

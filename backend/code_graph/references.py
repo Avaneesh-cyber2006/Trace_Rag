@@ -14,14 +14,13 @@ from backend.code_graph.models import (
     ResolutionFailureReason,
     UnresolvedReference,
 )
-from backend.code_graph.resolvers.base import Resolution
+from backend.code_graph.resolvers.base import Resolution, _relevant_parse_loss
 from backend.code_parser.models import (
     CallKind,
     CallSite,
     ImportInfo,
     ParsedFile,
     ParsedLanguage,
-    ParseStatus,
     SourceLocation,
     SymbolKind,
 )
@@ -52,24 +51,6 @@ def _contains(outer: SourceLocation, inner: SourceLocation) -> bool:
     return (
         outer.start_byte <= inner.start_byte
         and inner.end_byte <= outer.end_byte
-    )
-
-
-def _overlaps(first: SourceLocation, second: SourceLocation) -> bool:
-    return (
-        first.start_byte <= second.end_byte
-        and second.start_byte <= first.end_byte
-    )
-
-
-def _relevant_parse_loss(file: ParsedFile, location: SourceLocation) -> bool:
-    if file.status is ParseStatus.FAILED:
-        return True
-    if file.status is not ParseStatus.PARTIAL:
-        return False
-    return any(
-        issue.location is None or _overlaps(issue.location, location)
-        for issue in file.issues
     )
 
 
@@ -270,8 +251,15 @@ def materialize(
             reference.location,
         )
 
-    if any(candidate not in index.nodes_by_id for candidate in candidates):
-        raise CodeGraphResolutionError("Resolver candidate is not an indexed node.")
+    if candidates and source is None:
+        raise CodeGraphResolutionError(
+            "Resolver candidates require a proven reference source."
+        )
+    for candidate in candidates:
+        target = index.nodes_by_id.get(candidate)
+        if target is None:
+            raise CodeGraphResolutionError("Resolver candidate is not an indexed node.")
+        _validate_edge_endpoints(reference, source, target)
     return UnresolvedReference(
         reference_id(
             index.repository_namespace,
