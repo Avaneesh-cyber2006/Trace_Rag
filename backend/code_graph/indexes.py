@@ -38,6 +38,25 @@ def _snapshot_plural(
 
 
 @dataclass(frozen=True, slots=True)
+class SymbolRangeNode:
+    """One immutable node in a max-end augmented interval tree."""
+
+    start: int
+    end: int
+    node_id: str
+    max_end: int
+    left: "SymbolRangeNode | None"
+    right: "SymbolRangeNode | None"
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolRangeIndex:
+    """Immutable interval tree for symbols in one file."""
+
+    root: SymbolRangeNode | None
+
+
+@dataclass(frozen=True, slots=True)
 class GraphIndexes:
     repository_namespace: str
     nodes: tuple[GraphNode, ...]
@@ -51,6 +70,7 @@ class GraphIndexes:
     children: Mapping[str, tuple[str, ...]]
     python_modules: Mapping[str, tuple[str, ...]]
     java_packages: Mapping[str, tuple[str, ...]]
+    symbol_ranges_by_file: Mapping[str, SymbolRangeIndex]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "nodes", tuple(self.nodes))
@@ -60,6 +80,7 @@ class GraphIndexes:
             "file_ids",
             "symbols_by_id",
             "parent_ids",
+            "symbol_ranges_by_file",
         ):
             object.__setattr__(self, field_name, _snapshot(getattr(self, field_name)))
         for field_name in (
@@ -92,6 +113,40 @@ def _sorted_buckets(
         key: tuple(sorted(values))
         for key, values in sorted(buckets.items(), key=lambda item: item[0])
     }
+
+
+def _build_symbol_range_indexes(
+    paths: Iterable[str], nodes: Iterable[GraphNode]
+) -> dict[str, SymbolRangeIndex]:
+    buckets: defaultdict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for node in nodes:
+        if node.node_kind is GraphNodeKind.SYMBOL and node.location is not None:
+            buckets[node.relative_path].append(
+                (node.location.start_byte, node.location.end_byte, node.node_id)
+            )
+
+    indexes: dict[str, SymbolRangeIndex] = {}
+    for path in sorted(paths):
+        entries = sorted(buckets[path])
+        indexes[path] = SymbolRangeIndex(_build_symbol_range_tree(entries))
+    return indexes
+
+
+def _build_symbol_range_tree(
+    entries: list[tuple[int, int, str]],
+) -> SymbolRangeNode | None:
+    if not entries:
+        return None
+    middle = len(entries) // 2
+    start, end, node_id = entries[middle]
+    left = _build_symbol_range_tree(entries[:middle])
+    right = _build_symbol_range_tree(entries[middle + 1 :])
+    max_end = max(
+        end,
+        left.max_end if left is not None else end,
+        right.max_end if right is not None else end,
+    )
+    return SymbolRangeNode(start, end, node_id, max_end, left, right)
 
 
 def build_graph_indexes(inputs: ValidatedInputs) -> GraphIndexes:
@@ -165,6 +220,7 @@ def build_graph_indexes(inputs: ValidatedInputs) -> GraphIndexes:
     )
     nodes_by_id = {node.node_id: node for node in nodes}
     parent_ids = _resolve_parent_ids(nodes_by_id, symbols_by_id)
+    symbol_ranges_by_file = _build_symbol_range_indexes(file_ids, nodes)
 
     children: dict[str, list[str]] = {node_id: [] for node_id in nodes_by_id}
     java_packages: defaultdict[str, set[str]] = defaultdict(set)
@@ -198,4 +254,5 @@ def build_graph_indexes(inputs: ValidatedInputs) -> GraphIndexes:
         _sorted_buckets(children),
         _sorted_buckets(python_modules),
         _sorted_buckets(java_packages),
+        symbol_ranges_by_file,
     )

@@ -1,20 +1,55 @@
-"""Node indexing and direct structural graph behavior."""
+"""Structural graph, resolution outcome, and reference behavior."""
 
-from dataclasses import replace
+import sys
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from backend.code_graph.resolvers import base as resolver_base
 from backend.code_graph.exceptions import (
     CodeGraphIdentityError,
+    CodeGraphResolutionError,
     CodeGraphValidationError,
 )
-from backend.code_graph.identities import file_node_id, symbol_node_id
+from backend.code_graph.identities import (
+    edge_id,
+    file_node_id,
+    reference_id,
+    symbol_node_id,
+)
 from backend.code_graph.indexes import build_graph_indexes
-from backend.code_graph.models import GraphEdgeKind, GraphNodeKind
+from backend.code_graph.models import (
+    GraphEdge,
+    GraphEdgeKind,
+    GraphNodeKind,
+    ReferenceKind,
+    ResolutionFailureReason,
+    UnresolvedReference,
+)
+from backend.code_graph.references import (
+    Reference,
+    call_reference,
+    import_reference,
+    materialize,
+    type_references,
+)
+from backend.code_graph.resolvers.base import (
+    Binding,
+    ImportEnvironment,
+    ImportResult,
+    Resolution,
+    choose_resolution,
+    import_scope,
+)
 from backend.code_graph.structure import structural_edges
 from backend.code_graph.validation import validate_inputs
 from backend.code_parser.models import (
+    CallKind,
+    CallSite,
+    ImportInfo,
     ParsedLanguage,
+    ParseIssue,
+    ParseIssueKind,
     ParseSkipReason,
     ParseStatus,
     SkippedParseFile,
@@ -412,3 +447,493 @@ def test_structural_edge_ids_and_endpoints_match_the_resolved_parent(cg):
     assert by_target[parent_id].edge_kind is GraphEdgeKind.DEFINES
     assert by_target[child_id].source_node_id == parent_id
     assert by_target[child_id].edge_kind is GraphEdgeKind.CONTAINS
+
+
+def test_ambiguity_has_no_target_and_sorted_candidates():
+    result = choose_resolution(("b" * 64, "a" * 64, "b" * 64))
+
+    assert result.target_node_id is None
+    assert result.reason is ResolutionFailureReason.AMBIGUOUS
+    assert result.candidate_node_ids == ("a" * 64, "b" * 64)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "candidates", "target", "reason"),
+    [
+        pytest.param(
+            {"unsupported": True, "incomplete": True, "external": True},
+            ("a",),
+            None,
+            ResolutionFailureReason.UNSUPPORTED,
+            id="unsupported-first",
+        ),
+        pytest.param(
+            {"incomplete": True, "external": True},
+            ("a",),
+            None,
+            ResolutionFailureReason.INCOMPLETE_PARSE,
+            id="incomplete-second",
+        ),
+        pytest.param({}, ("a",), "a", None, id="one-target"),
+        pytest.param(
+            {"external": True},
+            (),
+            None,
+            ResolutionFailureReason.EXTERNAL,
+            id="external-empty",
+        ),
+        pytest.param(
+            {}, (), None, ResolutionFailureReason.NOT_FOUND, id="not-found-empty"
+        ),
+    ],
+)
+def test_resolution_precedence_is_terminal(kwargs, candidates, target, reason):
+    result = choose_resolution(candidates, **kwargs)
+
+    assert result.target_node_id == target
+    assert result.reason is reason
+    assert result.candidate_node_ids == ()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param((None, None, ()), id="neither-target-nor-reason"),
+        pytest.param(
+            ("a", ResolutionFailureReason.NOT_FOUND, ()), id="target-and-reason"
+        ),
+        pytest.param(
+            (None, ResolutionFailureReason.NOT_FOUND, ("a",)),
+            id="candidates-with-non-ambiguity",
+        ),
+    ],
+)
+def test_invalid_resolution_shapes_are_rejected(outcome):
+    with pytest.raises(CodeGraphResolutionError):
+        Resolution(*outcome)
+
+
+def test_import_environment_snapshots_and_indexes_all_bindings(cg):
+    wildcard = ImportInfo("pkg", (), True, (), cg.loc(1, 8))
+    target = "a" * 64
+    first = Binding("run", "scope", "symbol", Resolution(target, None))
+    second = Binding(
+        "run",
+        "scope",
+        "blocked",
+        Resolution(None, ResolutionFailureReason.UNSUPPORTED),
+    )
+    bindings = [first, second]
+    result = ImportResult(Resolution(target, None), bindings)
+    entries = [(wildcard, result)]
+    backing = {"a.py": entries}
+
+    environment = ImportEnvironment(backing)
+    bindings.clear()
+    entries.clear()
+    backing.clear()
+
+    assert environment.by_file == {"a.py": ((wildcard, result),)}
+    assert environment.bindings_by_scope_name == {
+        ("scope", "run"): (first, second)
+    }
+    assert environment.wildcards_by_file == {"a.py": (wildcard,)}
+    with pytest.raises(TypeError):
+        environment.by_file["b.py"] = ()
+    with pytest.raises(TypeError):
+        environment.bindings_by_scope_name[("scope", "other")] = ()
+    with pytest.raises(FrozenInstanceError):
+        environment.by_file = {}
+
+
+def test_import_scope_uses_indexed_unique_innermost_structural_owner(cg):
+    owner = cg.symbol("Service", kind=SymbolKind.CLASS, start=0, end=300)
+    method = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="Service.run",
+        parent="Service",
+        start=40,
+        end=220,
+    )
+    nested_item = ImportInfo("pkg", (), False, (), cg.loc(80, 90))
+    top_level_item = ImportInfo("other", (), False, (), cg.loc(350, 360))
+    file = cg.parsed(
+        symbols=(owner, method), imports=(nested_item, top_level_item)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    nested_scope, nested_reason = import_scope(index, file, nested_item)
+    top_scope, top_reason = import_scope(index, file, top_level_item)
+
+    assert nested_scope == symbol_node_id("repo", "a.py", method)
+    assert nested_reason is None
+    assert top_scope == index.file_ids["a.py"]
+    assert top_reason is None
+    with pytest.raises(TypeError):
+        index.symbol_ranges_by_file["other.py"] = ()
+
+
+def test_overlapping_incomparable_import_scopes_are_blocked_at_file(cg):
+    first = cg.symbol("first", start=0, end=200)
+    second = cg.symbol("second", start=50, end=250)
+    item = ImportInfo("pkg", (), False, (), cg.loc(100, 110))
+    file = cg.parsed(symbols=(first, second), imports=(item,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    scope_node_id, reason = import_scope(index, file, item)
+
+    assert scope_node_id == index.file_ids["a.py"]
+    assert reason is ResolutionFailureReason.AMBIGUOUS
+
+
+def test_relevant_partial_parse_blocks_unproven_import_scope(cg):
+    item = ImportInfo("pkg", (), False, (), cg.loc(100, 110))
+    issue = ParseIssue(ParseIssueKind.MISSING_NODE, "missing", cg.loc(90, 120))
+    file = cg.parsed(
+        status=ParseStatus.PARTIAL,
+        imports=(item,),
+        issues=(issue,),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    scope_node_id, reason = import_scope(index, file, item)
+
+    assert scope_node_id == index.file_ids["a.py"]
+    assert reason is ResolutionFailureReason.INCOMPLETE_PARSE
+
+
+def test_import_scope_query_work_is_bounded_by_index_and_candidates(cg):
+    outer = cg.symbol("Outer", kind=SymbolKind.CLASS, end=10_000)
+    siblings = tuple(
+        cg.symbol(
+            f"s{number}",
+            qualified_name=f"Outer.s{number}",
+            parent="Outer",
+            start=10 + number * 10,
+            end=15 + number * 10,
+        )
+        for number in range(256)
+    )
+    item = ImportInfo("pkg", (), False, (), cg.loc(9_000, 9_010))
+    file = cg.parsed(symbols=(outer, *siblings), imports=(item,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    base_filename = resolver_base.__file__
+    line_operations = 0
+
+    def count_lines(frame, event, arg):
+        nonlocal line_operations
+        if event == "line" and frame.f_code.co_filename == base_filename:
+            line_operations += 1
+        return count_lines
+
+    previous_trace = sys.gettrace()
+    sys.settrace(count_lines)
+    try:
+        scope_node_id, reason = import_scope(index, file, item)
+    finally:
+        sys.settrace(previous_trace)
+
+    assert scope_node_id == symbol_node_id("repo", "a.py", outer)
+    assert reason is None
+    assert line_operations < 200
+
+
+def test_import_reference_uses_file_source_and_exact_module_text(cg):
+    item = ImportInfo(".Pkg.Mixed", (), False, (), cg.loc(3, 14))
+    file = cg.parsed("pkg/main.py", imports=(item,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    reference = import_reference(index, file, item)
+
+    assert reference == Reference(
+        ReferenceKind.IMPORT,
+        "pkg/main.py",
+        ParsedLanguage.PYTHON,
+        index.file_ids["pkg/main.py"],
+        item.location,
+        ".Pkg.Mixed",
+    )
+
+
+def test_call_owner_requires_exact_name_file_and_containing_range(cg):
+    first = cg.symbol("run", qualified_name="Service.run", start=0, end=90)
+    second = cg.symbol("run", qualified_name="Service.run", start=100, end=220)
+    call = CallSite(
+        "Service.run", "Target.call", CallKind.CALL, cg.loc(130, 142)
+    )
+    file = cg.parsed(symbols=(second, first), calls=(call,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    reference = call_reference(index, file, call)
+
+    assert reference.source_node_id == symbol_node_id("repo", "a.py", second)
+    assert reference.raw_target == "Target.call"
+    assert reference.call_kind is CallKind.CALL
+    assert reference.blocked_reason is None
+
+
+def test_overlapping_callable_owners_block_resolution_as_ambiguous(cg):
+    first = cg.symbol("run", qualified_name="Service.run", start=0, end=200)
+    second = cg.symbol("run", qualified_name="Service.run", start=50, end=250)
+    call = CallSite("Service.run", "target", CallKind.CALL, cg.loc(100, 110))
+    file = cg.parsed(symbols=(first, second), calls=(call,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    reference = call_reference(index, file, call)
+
+    assert reference.source_node_id is None
+    assert reference.blocked_reason is ResolutionFailureReason.AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    ("status", "symbols", "caller", "expected"),
+    [
+        pytest.param(
+            ParseStatus.SUCCESS,
+            (),
+            None,
+            ResolutionFailureReason.UNSUPPORTED,
+            id="top-level",
+        ),
+        pytest.param(
+            ParseStatus.SUCCESS,
+            (),
+            "missing",
+            ResolutionFailureReason.UNSUPPORTED,
+            id="missing-owner",
+        ),
+        pytest.param(
+            ParseStatus.SUCCESS,
+            ("non-callable",),
+            "Service",
+            ResolutionFailureReason.UNSUPPORTED,
+            id="non-callable-owner",
+        ),
+        pytest.param(
+            ParseStatus.PARTIAL,
+            (),
+            None,
+            ResolutionFailureReason.INCOMPLETE_PARSE,
+            id="partial-top-level",
+        ),
+        pytest.param(
+            ParseStatus.PARTIAL,
+            (),
+            "missing",
+            ResolutionFailureReason.INCOMPLETE_PARSE,
+            id="partial-missing-owner",
+        ),
+    ],
+)
+def test_unproven_call_ownership_is_a_conservative_barrier(
+    cg, status, symbols, caller, expected
+):
+    symbol_records = (
+        (cg.symbol("Service", kind=SymbolKind.CLASS, end=200),)
+        if symbols
+        else ()
+    )
+    call = CallSite(caller, "target", CallKind.CALL, cg.loc(20, 30))
+    issues = (
+        (
+            ParseIssue(
+                ParseIssueKind.SYNTAX_ERROR, "missing owner", cg.loc(10, 40)
+            ),
+        )
+        if status is ParseStatus.PARTIAL
+        else ()
+    )
+    file = cg.parsed(
+        status=status,
+        symbols=symbol_records,
+        calls=(call,),
+        issues=issues,
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    reference = call_reference(index, file, call)
+
+    assert reference.source_node_id is None
+    assert reference.blocked_reason is expected
+
+
+def test_type_references_keep_declaring_source_location_and_exact_strings(cg):
+    symbol = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        start=20,
+        end=180,
+        base_types=(" pkg.Base[T] ",),
+        implemented_types=("IThing",),
+    )
+    file = cg.parsed(symbols=(symbol,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    symbol_id = symbol_node_id("repo", "a.py", symbol)
+
+    references = type_references(index, file, symbol_id)
+
+    assert [(ref.reference_kind, ref.raw_target) for ref in references] == [
+        (ReferenceKind.INHERITS, " pkg.Base[T] "),
+        (ReferenceKind.IMPLEMENTS, "IThing"),
+    ]
+    assert all(ref.source_node_id == symbol_id for ref in references)
+    assert all(ref.location == symbol.location for ref in references)
+
+
+def test_materialize_returns_exact_edge_for_one_proven_target(cg):
+    source = cg.symbol("source", start=0, end=100)
+    target = cg.symbol("target", start=200, end=300)
+    file = cg.parsed(symbols=(source, target))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    source_id = symbol_node_id("repo", "a.py", source)
+    target_id = symbol_node_id("repo", "a.py", target)
+    location = cg.loc(30, 42)
+    reference = Reference(
+        ReferenceKind.CALL,
+        "a.py",
+        ParsedLanguage.PYTHON,
+        source_id,
+        location,
+        "target()",
+        CallKind.CALL,
+    )
+
+    result = materialize(index, reference, Resolution(target_id, None))
+
+    assert result == GraphEdge(
+        edge_id("repo", GraphEdgeKind.CALLS, source_id, target_id, location),
+        GraphEdgeKind.CALLS,
+        source_id,
+        target_id,
+        location,
+    )
+
+
+def test_materialize_uses_blocked_reason_before_successful_target(cg):
+    target_file = cg.parsed("target.py")
+    source_file = cg.parsed("source.py")
+    index = build_graph_indexes(
+        validate_inputs(*cg.pair(source_file, target_file))
+    )
+    location = cg.loc(4, 12)
+    reference = Reference(
+        ReferenceKind.CALL,
+        "source.py",
+        ParsedLanguage.PYTHON,
+        None,
+        location,
+        "dynamic()",
+        CallKind.CALL,
+        ResolutionFailureReason.UNSUPPORTED,
+    )
+
+    result = materialize(
+        index,
+        reference,
+        Resolution(index.file_ids["target.py"], None),
+    )
+
+    assert result == UnresolvedReference(
+        reference_id(
+            "repo",
+            "source.py",
+            ReferenceKind.CALL,
+            None,
+            location,
+            "dynamic()",
+        ),
+        ReferenceKind.CALL,
+        ResolutionFailureReason.UNSUPPORTED,
+        "repo",
+        "source.py",
+        ParsedLanguage.PYTHON,
+        None,
+        location,
+        "dynamic()",
+        (),
+    )
+
+
+def test_ambiguous_outcome_materializes_only_unresolved_candidates(cg):
+    source = cg.symbol("source", start=0, end=100)
+    first = cg.symbol("first", start=200, end=250)
+    second = cg.symbol("second", start=300, end=350)
+    file = cg.parsed(symbols=(source, first, second))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    source_id = symbol_node_id("repo", "a.py", source)
+    candidates = tuple(
+        sorted(
+            (
+                symbol_node_id("repo", "a.py", first),
+                symbol_node_id("repo", "a.py", second),
+            )
+        )
+    )
+    reference = Reference(
+        ReferenceKind.CALL,
+        "a.py",
+        ParsedLanguage.PYTHON,
+        source_id,
+        cg.loc(20, 30),
+        "maybe",
+        CallKind.CALL,
+    )
+
+    result = materialize(
+        index,
+        reference,
+        Resolution(None, ResolutionFailureReason.AMBIGUOUS, candidates),
+    )
+
+    assert isinstance(result, UnresolvedReference)
+    assert result.reason is ResolutionFailureReason.AMBIGUOUS
+    assert result.candidate_node_ids == candidates
+
+
+def test_inheritance_materialization_uses_declaration_location(cg):
+    base = cg.symbol("Base", kind=SymbolKind.CLASS, start=0, end=10)
+    child = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        start=20,
+        end=100,
+        base_types=("Base",),
+    )
+    file = cg.parsed(symbols=(base, child))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    base_id = symbol_node_id("repo", "a.py", base)
+    child_id = symbol_node_id("repo", "a.py", child)
+    reference = type_references(index, file, child_id)[0]
+
+    result = materialize(index, reference, Resolution(base_id, None))
+
+    assert isinstance(result, GraphEdge)
+    assert result.edge_kind is GraphEdgeKind.INHERITS
+    assert result.location == child.location
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        pytest.param("file", "f" * 64, id="unknown-target"),
+        pytest.param(None, "file", id="resolved-null-source"),
+    ],
+)
+def test_materialize_rejects_invalid_resolver_outcomes(cg, source, target):
+    file = cg.parsed()
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    source_id = index.file_ids["a.py"] if source == "file" else None
+    target_id = index.file_ids["a.py"] if target == "file" else target
+    reference = Reference(
+        ReferenceKind.CALL,
+        "a.py",
+        ParsedLanguage.PYTHON,
+        source_id,
+        cg.loc(1, 2),
+        "target",
+        CallKind.CALL,
+    )
+
+    with pytest.raises(CodeGraphResolutionError):
+        materialize(index, reference, Resolution(target_id, None))
