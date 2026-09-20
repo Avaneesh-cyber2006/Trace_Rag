@@ -812,8 +812,15 @@ member can resolve uniquely even when the wildcard import spans multiple files.
   pairs and no invented per-type location. Reject unsupported generic/annotated
   expressions as UNSUPPORTED instead of stripping text until a name matches.
 - [ ] Implement type matching using exact file/scope/import/qualified buckets
-  and terminal stronger outcomes. Test inherited type missing in a failed
-  relevant module -> INCOMPLETE_PARSE, plus unrelated partial file isolation.
+  and terminal stronger outcomes. Test an anchored PARTIAL package: trustworthy
+  qualified-symbol metadata establishes the package, and a reference potentially
+  affected by missing declarations in that package yields INCOMPLETE_PARSE only
+  when relevance follows from existing metadata. Test unrelated FAILED-file
+  isolation: a FAILED Java file without package-identifying metadata must not
+  automatically make an unrelated reference INCOMPLETE_PARSE. Retain unrelated
+  PARTIAL-file isolation. Do not infer packages from paths/filenames or fabricate
+  FAILED symbols/imports; preserve reason precedence. If the PARTIAL fixture
+  cannot establish relevance, report the limitation instead of forcing the result.
 - [ ] Run `python -m pytest tests/test_code_graph_java.py -q` for GREEN.
 - [ ] Run `python -m pytest tests/test_code_graph_python.py tests/test_code_parser.py -q`.
 - [ ] Run `git diff --check -- backend/code_graph/resolvers/java.py tests/test_code_graph_java.py`.
