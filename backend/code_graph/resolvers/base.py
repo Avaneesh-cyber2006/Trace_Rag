@@ -1,10 +1,10 @@
 """Immutable outcomes and indexes shared by language resolvers."""
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, TypeVar, cast
 
 from backend.code_graph.exceptions import CodeGraphResolutionError
 from backend.code_graph.indexes import GraphIndexes, SymbolRangeNode
@@ -15,6 +15,30 @@ from backend.code_parser.models import (
     ParseStatus,
     SourceLocation,
 )
+
+
+_MemoValue = TypeVar("_MemoValue")
+
+
+@dataclass(slots=True)
+class _WildcardMemo:
+    """Build-bound memo for deterministic wildcard member lookups."""
+
+    _index: GraphIndexes | None = None
+    _values: dict[tuple[object, ...], object] = field(default_factory=dict)
+
+    def get_or_compute(
+        self,
+        index: GraphIndexes,
+        key: tuple[object, ...],
+        factory: Callable[[], _MemoValue],
+    ) -> _MemoValue:
+        if self._index is not index:
+            self._index = index
+            self._values.clear()
+        if key not in self._values:
+            self._values[key] = factory()
+        return cast(_MemoValue, self._values[key])
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +131,9 @@ class ImportEnvironment:
         tuple[str, str], tuple[Binding, ...]
     ] = field(init=False)
     wildcards_by_file: Mapping[str, tuple[ImportInfo, ...]] = field(init=False)
+    _wildcard_memo: _WildcardMemo = field(
+        init=False, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.by_file, Mapping):
@@ -167,6 +194,15 @@ class ImportEnvironment:
             "wildcards_by_file",
             MappingProxyType(wildcards_by_file),
         )
+        object.__setattr__(self, "_wildcard_memo", _WildcardMemo())
+
+    def _memoized_wildcard(
+        self,
+        index: GraphIndexes,
+        key: tuple[object, ...],
+        factory: Callable[[], _MemoValue],
+    ) -> _MemoValue:
+        return self._wildcard_memo.get_or_compute(index, key, factory)
 
 
 def import_scope(
