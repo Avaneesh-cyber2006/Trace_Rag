@@ -802,6 +802,46 @@ def test_module_qualified_member_call_resolves(cg):
     )
 
 
+def test_imported_ambiguous_class_preserves_known_method_candidate(cg):
+    item = ImportInfo(
+        "pkg.models",
+        (ImportBinding("Service", "Alias"),),
+        False,
+        (),
+        cg.loc(1, 20),
+    )
+    caller = cg.symbol("main", start=100, end=300)
+    call = CallSite("main", "Alias.run", CallKind.CALL, cg.loc(150, 160))
+    source = cg.parsed("main.py", symbols=(caller,), imports=(item,), calls=(call,))
+    first_class = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, start=0, end=180
+    )
+    method = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="Service.run",
+        parent="Service",
+        start=20,
+        end=80,
+    )
+    second_class = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, start=200, end=380
+    )
+    imported = cg.parsed(
+        "pkg/models.py", symbols=(first_class, method, second_class)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, imported)))
+
+    result = _call_result(
+        index, _import_environment(index, source), source, call
+    )
+
+    candidate = symbol_node_id("repo", "pkg/models.py", method)
+    assert result == Resolution(
+        None, ResolutionFailureReason.AMBIGUOUS, (candidate,)
+    )
+
+
 def test_blocked_import_form_prevents_weaker_call_fallback(cg):
     item = ImportInfo(
         "x",

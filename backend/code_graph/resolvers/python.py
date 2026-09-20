@@ -370,7 +370,7 @@ def _strong_binding_failure(
                 }
             )
         )
-        if reason is ResolutionFailureReason.AMBIGUOUS and len(candidates) > 1:
+        if reason is ResolutionFailureReason.AMBIGUOUS and candidates:
             return Resolution(None, reason, candidates)
         return Resolution(None, reason)
     return None
