@@ -514,3 +514,109 @@ def test_wildcard_memo_does_not_leak_across_graph_indexes(cg):
 
     assert first_result.target_node_id == symbol_node_id("repo", "first.java", first_base)
     assert second_result.target_node_id == symbol_node_id("repo", "second.java", second_base)
+
+
+def test_explicit_import_precedes_same_package_qualified_fallback(cg):
+    item = ImportInfo("q.Base", (), False, (), cg.loc(1, 10))
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="p.Child", start=100, end=300
+    )
+    source = _java_file(cg, "Main.java", imports=(item,), symbols=(child,))
+    package_base = cg.symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    imported_base = cg.symbol("Base", kind=SymbolKind.CLASS, qualified_name="q.Base")
+    package_file = _java_file(cg, "package.java", symbols=(package_base,))
+    imported_file = _java_file(cg, "imported.java", symbols=(imported_base,))
+    index = build_graph_indexes(
+        validate_inputs(*cg.pair(source, package_file, imported_file))
+    )
+    reference = _reference(source, child, ReferenceKind.INHERITS, "Base")
+
+    assert resolve_reference(index, _environment(index, source), reference) == Resolution(
+        symbol_node_id("repo", "imported.java", imported_base), None
+    )
+
+
+def test_explicit_import_precedes_partial_same_package_fallback(cg):
+    item = ImportInfo("q.Base", (), False, (), cg.loc(1, 10))
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="p.Child", start=100, end=300
+    )
+    source = _java_file(cg, "Main.java", imports=(item,), symbols=(child,))
+    marker = cg.symbol("Marker", kind=SymbolKind.CLASS, qualified_name="p.Marker")
+    partial = _java_file(
+        cg,
+        "partial.java",
+        status=ParseStatus.PARTIAL,
+        symbols=(marker,),
+        issues=(ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "truncated", None),),
+    )
+    imported_base = cg.symbol("Base", kind=SymbolKind.CLASS, qualified_name="q.Base")
+    imported_file = _java_file(cg, "imported.java", symbols=(imported_base,))
+    index = build_graph_indexes(
+        validate_inputs(*cg.pair(source, partial, imported_file))
+    )
+    reference = _reference(source, child, ReferenceKind.INHERITS, "Base")
+
+    assert resolve_reference(index, _environment(index, source), reference) == Resolution(
+        symbol_node_id("repo", "imported.java", imported_base), None
+    )
+
+
+def test_nearest_enclosing_type_precedes_top_level_same_file_type(cg):
+    outer = cg.symbol(
+        "Outer", kind=SymbolKind.CLASS, qualified_name="p.Outer", start=0, end=500
+    )
+    enclosing_base = cg.symbol(
+        "Base", kind=SymbolKind.CLASS, qualified_name="p.Outer.Base",
+        parent="p.Outer", start=20, end=150,
+    )
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="p.Outer.Child",
+        parent="p.Outer", start=200, end=350,
+    )
+    top_level_base = cg.symbol(
+        "Base", kind=SymbolKind.CLASS, qualified_name="p.Base", start=600, end=750
+    )
+    file = _java_file(
+        cg, "Types.java", symbols=(outer, enclosing_base, child, top_level_base)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    reference = _reference(file, child, ReferenceKind.INHERITS, "Base")
+
+    assert resolve_reference(
+        index, ImportEnvironment({"Types.java": ()}), reference
+    ) == Resolution(symbol_node_id("repo", "Types.java", enclosing_base), None)
+
+
+@pytest.mark.parametrize(
+    ("module", "is_wildcard", "modifiers"),
+    [
+        ("p.Missing", False, ()),
+        ("p.Tools.run", False, ("static",)),
+        ("p.Tools", True, ("static",)),
+    ],
+)
+def test_anchored_partial_package_makes_missing_import_incomplete(
+    cg, module, is_wildcard, modifiers
+):
+    item = ImportInfo(module, (), is_wildcard, modifiers, cg.loc(1, 10))
+    source = _java_file(cg, "Main.java", imports=(item,))
+    marker = cg.symbol("Marker", kind=SymbolKind.CLASS, qualified_name="p.Marker")
+    partial = _java_file(
+        cg,
+        "opaque.java",
+        status=ParseStatus.PARTIAL,
+        symbols=(marker,),
+        issues=(ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "truncated", None),),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, partial)))
+
+    result = resolve_import(index, source, item)
+
+    assert result.resolution == Resolution(
+        None, ResolutionFailureReason.INCOMPLETE_PARSE
+    )
+    if result.bindings:
+        assert result.bindings[0].resolution == Resolution(
+            None, ResolutionFailureReason.INCOMPLETE_PARSE
+        )

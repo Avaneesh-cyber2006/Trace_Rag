@@ -136,10 +136,17 @@ def resolve_import(
         if is_static:
             type_ids = _qualified_types(index, item.module)
             file_ids = _file_ids_for_symbols(index, type_ids)
+            incomplete = not type_ids and _qualified_package_has_partial(
+                index, item.module
+            )
         else:
             file_ids = index.java_packages.get(item.module, ())
+            incomplete = False
         return ImportResult(
-            choose_resolution(file_ids, external=not file_ids), ()
+            choose_resolution(
+                file_ids, incomplete=incomplete, external=not file_ids
+            ),
+            (),
         )
 
     if is_static:
@@ -151,8 +158,13 @@ def resolve_import(
         owner_ids = _qualified_types(index, owner_name)
         owner_file_ids = _file_ids_for_symbols(index, owner_ids)
         member_ids = _static_members(index, owner_ids, member_name)
-        incomplete = bool(owner_ids) and not member_ids and _incomplete_files(
-            index, owner_file_ids
+        incomplete = (
+            bool(owner_ids)
+            and not member_ids
+            and _incomplete_files(index, owner_file_ids)
+        ) or (
+            not owner_ids
+            and _qualified_package_has_partial(index, owner_name)
         )
         member_resolution = (
             Resolution(
@@ -183,8 +195,13 @@ def resolve_import(
 
     type_ids = _qualified_types(index, item.module)
     file_ids = _file_ids_for_symbols(index, type_ids)
-    type_resolution = choose_resolution(type_ids, external=not type_ids)
-    file_resolution = choose_resolution(file_ids, external=not file_ids)
+    incomplete = not type_ids and _qualified_package_has_partial(index, item.module)
+    type_resolution = choose_resolution(
+        type_ids, incomplete=incomplete, external=not type_ids
+    )
+    file_resolution = choose_resolution(
+        file_ids, incomplete=incomplete, external=not file_ids
+    )
     local_name = item.module.rsplit(".", 1)[-1]
     binding = (
         _blocked_binding(local_name, scope_node_id, scope_reason)
@@ -202,6 +219,13 @@ def _package_has_partial_file(index: GraphIndexes, package: str) -> bool:
     )
 
 
+def _qualified_package_has_partial(
+    index: GraphIndexes, qualified_name: str
+) -> bool:
+    package, separator, _ = qualified_name.rpartition(".")
+    return bool(separator) and _package_has_partial_file(index, package)
+
+
 def _source_package(index: GraphIndexes, source_id: str) -> str:
     top_level = source_id
     while (parent_id := index.parent_ids.get(top_level)) is not None:
@@ -212,26 +236,36 @@ def _source_package(index: GraphIndexes, source_id: str) -> str:
     return qualified[: -len(suffix)] if qualified.endswith(suffix) else ""
 
 
-def _same_file_types(
+def _same_file_type_tiers(
     index: GraphIndexes, path: str, source_id: str, name: str
-) -> tuple[str, ...]:
-    visible_parents: set[str] = set()
-    parent_id = index.parent_ids.get(source_id)
-    while parent_id is not None:
-        visible_parents.add(parent_id)
-        parent_id = index.parent_ids.get(parent_id)
-    return tuple(
+) -> tuple[tuple[str, ...], ...]:
+    candidates = tuple(
         node_id
         for node_id in index.by_file_name.get((path, name), ())
         if (
             (node := index.nodes_by_id[node_id]).language is ParsedLanguage.JAVA
             and node.symbol_kind in _TYPE_KINDS
-            and (
-                index.parent_ids.get(node_id) is None
-                or index.parent_ids.get(node_id) in visible_parents
-            )
         )
     )
+    tiers: list[tuple[str, ...]] = []
+    parent_id = index.parent_ids.get(source_id)
+    while parent_id is not None:
+        tier = tuple(
+            node_id
+            for node_id in candidates
+            if index.parent_ids.get(node_id) == parent_id
+        )
+        if tier:
+            tiers.append(tier)
+        parent_id = index.parent_ids.get(parent_id)
+    top_level = tuple(
+        node_id
+        for node_id in candidates
+        if index.parent_ids.get(node_id) is None
+    )
+    if top_level:
+        tiers.append(top_level)
+    return tuple(tiers)
 
 
 def _filter_required_kind(
@@ -460,28 +494,20 @@ def resolve_reference(
             index, raw_target, required_kind, reference.source_node_id
         )
 
-    same_file = tuple(
-        candidate
-        for candidate in _same_file_types(
-            index,
-            reference.relative_path,
-            reference.source_node_id,
-            raw_target,
+    for same_file_tier in _same_file_type_tiers(
+        index,
+        reference.relative_path,
+        reference.source_node_id,
+        raw_target,
+    ):
+        candidates = tuple(
+            candidate
+            for candidate in same_file_tier
+            if candidate != reference.source_node_id
         )
-        if candidate != reference.source_node_id
-    )
-    outcome = _visible_type_outcome(index, same_file, required_kind)
-    if outcome is not None:
-        return outcome
-
-    package = _source_package(index, reference.source_node_id)
-    if package:
-        qualified = _qualified_types(index, f"{package}.{raw_target}")
-        outcome = _visible_type_outcome(index, qualified, required_kind)
+        outcome = _visible_type_outcome(index, candidates, required_kind)
         if outcome is not None:
             return outcome
-        if _package_has_partial_file(index, package):
-            return Resolution(None, ResolutionFailureReason.INCOMPLETE_PARSE)
 
     binding = _explicit_binding_resolution(
         index, environment, reference.relative_path, raw_target, required_kind
@@ -523,5 +549,14 @@ def resolve_reference(
             incomplete=incomplete,
             external=external and not candidates,
         )
+
+    package = _source_package(index, reference.source_node_id)
+    if package:
+        qualified = _qualified_types(index, f"{package}.{raw_target}")
+        outcome = _visible_type_outcome(index, qualified, required_kind)
+        if outcome is not None:
+            return outcome
+        if _package_has_partial_file(index, package):
+            return Resolution(None, ResolutionFailureReason.INCOMPLETE_PARSE)
 
     return Resolution(None, ResolutionFailureReason.NOT_FOUND)
