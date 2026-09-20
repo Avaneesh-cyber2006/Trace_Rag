@@ -627,6 +627,29 @@ def test_same_file_class_method_call_is_anchored_by_the_class(cg):
     assert result == Resolution(symbol_node_id("repo", "a.py", method), None)
 
 
+def test_unrelated_qualified_method_requires_a_proven_receiver_anchor(cg):
+    caller = cg.symbol("main", start=0, end=200)
+    call = CallSite("main", "Service.run", CallKind.CALL, cg.loc(50, 60))
+    source = cg.parsed("main.py", symbols=(caller,), calls=(call,))
+    owner = cg.symbol("Service", kind=SymbolKind.CLASS, start=0, end=300)
+    method = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="Service.run",
+        parent="Service",
+        start=20,
+        end=100,
+    )
+    unrelated = cg.parsed("other.py", symbols=(owner, method))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, unrelated)))
+
+    result = _call_result(
+        index, ImportEnvironment({"main.py": ()}), source, call
+    )
+
+    assert result == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
 def test_parameter_name_conflict_blocks_same_file_fallback(cg):
     caller = cg.symbol(
         "run",
@@ -698,6 +721,36 @@ def test_duplicate_same_file_targets_are_ambiguous_with_sorted_ids(cg):
     )
     assert result == Resolution(
         None, ResolutionFailureReason.AMBIGUOUS, candidate_ids
+    )
+
+
+def test_ambiguous_class_anchors_preserve_one_known_member_candidate(cg):
+    first_class = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, start=0, end=180
+    )
+    method = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="Service.run",
+        parent="Service",
+        start=20,
+        end=80,
+    )
+    second_class = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, start=200, end=380
+    )
+    caller = cg.symbol("main", start=500, end=700)
+    call = CallSite("main", "Service.run", CallKind.CALL, cg.loc(550, 560))
+    file = cg.parsed(
+        symbols=(first_class, method, second_class, caller), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    result = _call_result(index, ImportEnvironment({"a.py": ()}), file, call)
+
+    candidate = symbol_node_id("repo", "a.py", method)
+    assert result == Resolution(
+        None, ResolutionFailureReason.AMBIGUOUS, (candidate,)
     )
 
 
@@ -928,6 +981,33 @@ def test_same_file_declared_base_resolves_only_to_class(cg):
         base_types=("Base",),
     )
     file = cg.parsed(symbols=(base, child))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    result = _base_result(index, ImportEnvironment({"a.py": ()}), file, child)
+
+    assert result == Resolution(symbol_node_id("repo", "a.py", base), None)
+
+
+def test_nested_class_resolves_sibling_declared_base(cg):
+    outer = cg.symbol("Outer", kind=SymbolKind.CLASS, start=0, end=500)
+    base = cg.symbol(
+        "Base",
+        kind=SymbolKind.CLASS,
+        qualified_name="Outer.Base",
+        parent="Outer",
+        start=20,
+        end=150,
+    )
+    child = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        qualified_name="Outer.Child",
+        parent="Outer",
+        start=200,
+        end=350,
+        base_types=("Base",),
+    )
+    file = cg.parsed(symbols=(outer, base, child))
     index = build_graph_indexes(validate_inputs(*cg.pair(file)))
 
     result = _base_result(index, ImportEnvironment({"a.py": ()}), file, child)

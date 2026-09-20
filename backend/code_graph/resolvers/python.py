@@ -231,6 +231,17 @@ def _callable_scope_ids(index: GraphIndexes, source_id: str) -> tuple[str, ...]:
     return tuple(scopes)
 
 
+def _base_scope_ids(index: GraphIndexes, source_id: str) -> tuple[str, ...]:
+    scopes: list[str] = []
+    current = index.parent_ids.get(source_id)
+    while current is not None:
+        node = index.nodes_by_id[current]
+        if node.symbol_kind in (*_CALLABLE_KINDS, SymbolKind.CLASS):
+            scopes.append(current)
+        current = index.parent_ids.get(current)
+    return tuple(scopes)
+
+
 def _parameter_conflict(
     index: GraphIndexes, scopes: tuple[str, ...], name: str
 ) -> bool:
@@ -317,8 +328,12 @@ def _class_member_resolution(
         for class_id in class_ids
         for member_id in _children_named(index, class_id, member_name, kinds)
     )
-    if len(class_ids) > 1 and len(set(members)) <= 1:
-        return Resolution(None, ResolutionFailureReason.AMBIGUOUS)
+    if len(class_ids) > 1:
+        return Resolution(
+            None,
+            ResolutionFailureReason.AMBIGUOUS,
+            tuple(sorted(set(members))),
+        )
     if members:
         return choose_resolution(members)
     return _missing_member_resolution(index, class_ids)
@@ -663,21 +678,36 @@ def _resolve_dotted_call(
                 _CALLABLE_KINDS,
             )
 
-    exact = _eligible_ids(
-        index,
-        index.by_qualified_name.get(reference.raw_target, ()),
-        _CALLABLE_KINDS,
+    exact = tuple(
+        candidate
+        for candidate in _eligible_ids(
+            index,
+            index.by_qualified_name.get(reference.raw_target, ()),
+            _CALLABLE_KINDS,
+        )
+        if index.nodes_by_id[candidate].relative_path
+        == reference.relative_path
     )
     if reference.call_kind is CallKind.CALL and exact:
         return choose_resolution(exact)
 
     if reference.call_kind is CallKind.CONSTRUCTOR:
-        classes = _qualified_classes(index, reference.raw_target)
+        classes = tuple(
+            candidate
+            for candidate in _qualified_classes(index, reference.raw_target)
+            if index.nodes_by_id[candidate].relative_path
+            == reference.relative_path
+        )
         if classes:
             return _constructor_resolution(index, classes)
 
     class_name = ".".join(parts[:-1])
-    classes = _qualified_classes(index, class_name)
+    classes = tuple(
+        candidate
+        for candidate in _qualified_classes(index, class_name)
+        if index.nodes_by_id[candidate].relative_path
+        == reference.relative_path
+    )
     if classes and reference.call_kind is CallKind.CALL:
         return _class_member_resolution(
             index,
@@ -758,18 +788,18 @@ def _resolve_base(
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
 
     parts = tuple(reference.raw_target.split("."))
-    callable_scopes = _callable_scope_ids(
+    lexical_scopes = _base_scope_ids(
         index, reference.source_node_id
     )
     visible_scopes = (
-        *callable_scopes,
+        *lexical_scopes,
         index.file_ids[reference.relative_path],
     )
     if len(parts) == 1:
         classes = tuple(
             candidate
             for candidate in _same_file_classes(
-                index, reference, callable_scopes, parts[0]
+                index, reference, lexical_scopes, parts[0]
             )
             if candidate != reference.source_node_id
         )
@@ -787,7 +817,7 @@ def _resolve_base(
             return binding
         return Resolution(None, ResolutionFailureReason.NOT_FOUND)
 
-    if _parameter_conflict(index, callable_scopes, parts[0]):
+    if _parameter_conflict(index, lexical_scopes, parts[0]):
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
     if len(parts) == 2:
         binding = _resolve_bindings(
