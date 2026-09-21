@@ -26,10 +26,6 @@ _ECMASCRIPT_LANGUAGES = (
 _EXTENSIONS = (".js", ".jsx", ".ts", ".tsx")
 
 
-def _is_identifier(value: str) -> bool:
-    return bool(value) and value.replace("$", "_").isidentifier()
-
-
 def _relative_candidates(
     index: GraphIndexes, file: ParsedFile, module: str
 ) -> tuple[tuple[str, ...], bool]:
@@ -176,18 +172,24 @@ def _local_name(binding: ImportBinding) -> str:
     return binding.alias if binding.alias is not None else binding.imported_name
 
 
-def _binding_shape_supported(item: ImportInfo, binding: ImportBinding) -> bool:
-    if item.modifiers:
-        return False
-    if binding.imported_name == "*":
-        return (
-            item.is_wildcard
-            and binding.alias is not None
-            and _is_identifier(binding.alias)
+def _item_shape_supported(item: ImportInfo) -> bool:
+    namespace_count = sum(
+        binding.imported_name == "*" for binding in item.bindings
+    )
+    if item.is_wildcard:
+        return namespace_count == 1 and all(
+            binding.imported_name in ("default", "*")
+            for binding in item.bindings
         )
-    if not _is_identifier(binding.imported_name):
+    return namespace_count == 0
+
+
+def _binding_shape_supported(binding: ImportBinding) -> bool:
+    if binding.imported_name == "*":
+        return binding.alias is not None and bool(binding.alias)
+    if not binding.imported_name:
         return False
-    if binding.alias is not None and not _is_identifier(binding.alias):
+    if binding.alias is not None and not binding.alias:
         return False
     if binding.imported_name == "default" and binding.alias is None:
         return False
@@ -212,6 +214,7 @@ def resolve_import(
     scope_node_id, scope_reason = import_scope(index, file, item)
     module_resolution = _module_resolution(index, file, item.module)
     bindings: list[Binding] = []
+    item_shape_supported = not item.modifiers and _item_shape_supported(item)
 
     for imported in item.bindings:
         local_name = _local_name(imported)
@@ -219,7 +222,7 @@ def resolve_import(
             imported.imported_name == "*" and imported.alias is None
         ):
             continue
-        if not _binding_shape_supported(item, imported):
+        if not item_shape_supported or not _binding_shape_supported(imported):
             bindings.append(
                 Binding(
                     local_name,

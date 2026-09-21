@@ -379,6 +379,112 @@ def test_namespace_binding_is_scoped_to_the_unique_module(cg):
     )
 
 
+def test_wildcard_marker_without_namespace_binding_blocks_item_bindings(cg):
+    item = ImportInfo(
+        "./util.js",
+        (ImportBinding("run", None),),
+        True,
+        (),
+        cg.loc(1, 30),
+    )
+    source = cg.parsed(
+        "main.js", language=ParsedLanguage.JAVASCRIPT, imports=(item,)
+    )
+    exported = cg.symbol("run", modifiers=("export",))
+    target = cg.parsed(
+        "util.js", language=ParsedLanguage.JAVASCRIPT, symbols=(exported,)
+    )
+    index = _index(cg, source, target)
+
+    result = resolve_import(index, source, item)
+
+    assert result.resolution == Resolution(index.file_ids["util.js"], None)
+    assert result.bindings == (
+        Binding(
+            "run",
+            index.file_ids["main.js"],
+            "blocked",
+            Resolution(None, ResolutionFailureReason.UNSUPPORTED),
+        ),
+    )
+
+
+def test_default_and_namespace_import_is_a_valid_wildcard_shape(cg):
+    item = ImportInfo(
+        "./util.js",
+        (
+            ImportBinding("default", "primary"),
+            ImportBinding("*", "namespace"),
+        ),
+        True,
+        (),
+        cg.loc(1, 40),
+    )
+    source = cg.parsed(
+        "main.js", language=ParsedLanguage.JAVASCRIPT, imports=(item,)
+    )
+    default = cg.symbol("worker", modifiers=("export", "default"))
+    target = cg.parsed(
+        "util.js", language=ParsedLanguage.JAVASCRIPT, symbols=(default,)
+    )
+    index = _index(cg, source, target)
+
+    result = resolve_import(index, source, item)
+
+    assert result.bindings == (
+        Binding(
+            "primary",
+            index.file_ids["main.js"],
+            "symbol",
+            Resolution(symbol_node_id("repo", "util.js", default), None),
+        ),
+        Binding(
+            "namespace",
+            index.file_ids["main.js"],
+            "module",
+            Resolution(index.file_ids["util.js"], None),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("imported_name", "alias"),
+    [
+        pytest.param("run\u200c", "execute", id="imported-zwnj"),
+        pytest.param("run", "execute\u200c", id="alias-zwnj"),
+    ],
+)
+def test_ecmascript_identifier_part_is_preserved_exactly(
+    cg, imported_name, alias
+):
+    item = ImportInfo(
+        "./util.js",
+        (ImportBinding(imported_name, alias),),
+        False,
+        (),
+        cg.loc(1, 30),
+    )
+    source = cg.parsed(
+        "main.js", language=ParsedLanguage.JAVASCRIPT, imports=(item,)
+    )
+    exported = cg.symbol(imported_name, modifiers=("export",))
+    target = cg.parsed(
+        "util.js", language=ParsedLanguage.JAVASCRIPT, symbols=(exported,)
+    )
+    index = _index(cg, source, target)
+
+    result = resolve_import(index, source, item)
+
+    assert result.bindings == (
+        Binding(
+            alias,
+            index.file_ids["main.js"],
+            "symbol",
+            Resolution(symbol_node_id("repo", "util.js", exported), None),
+        ),
+    )
+
+
 def test_ambiguous_module_preserves_single_known_named_export_candidate(cg):
     item = ImportInfo(
         "./util",
