@@ -825,6 +825,103 @@ def test_ambiguous_type_preserves_single_known_static_candidate(cg):
     )
 
 
+def test_mixed_explicit_static_bindings_preserve_every_call_candidate(cg):
+    first_item = ImportInfo(
+        "p.Tools.work", (), False, ("static",), cg.loc(1, 9)
+    )
+    second_item = ImportInfo(
+        "q.Tools.work", (), False, ("static",), cg.loc(10, 18)
+    )
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="r.Main",
+        start=100, end=400,
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="r.Main.run",
+        parent="r.Main", start=120, end=200,
+    )
+    call = CallSite("r.Main.run", "work", CallKind.CALL, cg.loc(130, 140))
+    source = _java_file(
+        cg,
+        "Main.java",
+        symbols=(owner, caller),
+        imports=(first_item, second_item),
+        calls=(call,),
+    )
+    targets = []
+    files = []
+    for path, package in (
+        ("p-one.java", "p"),
+        ("p-two.java", "p"),
+        ("q.java", "q"),
+    ):
+        tools = cg.symbol(
+            "Tools", kind=SymbolKind.CLASS,
+            qualified_name=f"{package}.Tools", end=300,
+        )
+        target = cg.symbol(
+            "work", kind=SymbolKind.METHOD,
+            qualified_name=f"{package}.Tools.work", parent=f"{package}.Tools",
+            modifiers=("static",), start=20, end=80,
+        )
+        targets.append(target)
+        files.append(_java_file(cg, path, symbols=(tools, target)))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, *files)))
+
+    outcome = resolve_reference(
+        index, _environment(index, source), call_reference(index, source, call)
+    )
+
+    assert outcome == Resolution(
+        None,
+        ResolutionFailureReason.AMBIGUOUS,
+        tuple(sorted(
+            symbol_node_id("repo", file.relative_path, target)
+            for file, target in zip(files, targets)
+        )),
+    )
+
+
+def test_mixed_explicit_type_bindings_preserve_every_type_candidate(cg):
+    first_item = ImportInfo("p.Base", (), False, (), cg.loc(1, 9))
+    second_item = ImportInfo("q.Base", (), False, (), cg.loc(10, 18))
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="r.Child",
+        start=100, end=300,
+    )
+    source = _java_file(
+        cg,
+        "Main.java",
+        symbols=(child,),
+        imports=(first_item, second_item),
+    )
+    targets = []
+    files = []
+    for path, package in (
+        ("p-one.java", "p"),
+        ("p-two.java", "p"),
+        ("q.java", "q"),
+    ):
+        target = cg.symbol(
+            "Base", kind=SymbolKind.CLASS, qualified_name=f"{package}.Base"
+        )
+        targets.append(target)
+        files.append(_java_file(cg, path, symbols=(target,)))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, *files)))
+    reference = _reference(source, child, ReferenceKind.INHERITS, "Base")
+
+    outcome = resolve_reference(index, _environment(index, source), reference)
+
+    assert outcome == Resolution(
+        None,
+        ResolutionFailureReason.AMBIGUOUS,
+        tuple(sorted(
+            symbol_node_id("repo", file.relative_path, target)
+            for file, target in zip(files, targets)
+        )),
+    )
+
+
 def test_wildcard_member_lookup_is_memoized_per_environment(cg, monkeypatch):
     item = ImportInfo("p", (), True, (), cg.loc(1, 10))
     child = cg.symbol("Child", kind=SymbolKind.CLASS, qualified_name="q.Child")

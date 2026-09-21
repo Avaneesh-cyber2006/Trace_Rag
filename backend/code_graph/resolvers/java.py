@@ -340,11 +340,18 @@ def _strong_outcome(outcomes: tuple[Resolution, ...]) -> Resolution:
     ):
         matching = tuple(outcome for outcome in outcomes if outcome.reason is reason)
         if matching:
-            candidates = tuple(sorted({
+            known_ids = {
                 candidate
                 for outcome in matching
                 for candidate in outcome.candidate_node_ids
-            }))
+            }
+            if reason is ResolutionFailureReason.AMBIGUOUS:
+                known_ids.update(
+                    outcome.target_node_id
+                    for outcome in outcomes
+                    if outcome.target_node_id is not None
+                )
+            candidates = tuple(sorted(known_ids))
             return Resolution(None, reason, candidates) if candidates else Resolution(None, reason)
     targets = tuple(
         outcome.target_node_id
