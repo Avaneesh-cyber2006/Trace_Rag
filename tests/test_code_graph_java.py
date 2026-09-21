@@ -620,3 +620,64 @@ def test_anchored_partial_package_makes_missing_import_incomplete(
         assert result.bindings[0].resolution == Resolution(
             None, ResolutionFailureReason.INCOMPLETE_PARSE
         )
+
+
+def test_static_wildcard_reference_preserves_anchored_partial_owner(
+    cg, monkeypatch
+):
+    item = ImportInfo("p.Tools", (), True, ("static",), cg.loc(1, 10))
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="q.Child", start=100, end=300
+    )
+    source = _java_file(cg, "Main.java", imports=(item,), symbols=(child,))
+    marker = cg.symbol("Marker", kind=SymbolKind.CLASS, qualified_name="p.Marker")
+    partial = _java_file(
+        cg,
+        "opaque.java",
+        status=ParseStatus.PARTIAL,
+        symbols=(marker,),
+        issues=(ParseIssue(ParseIssueKind.EXTRACTION_ERROR, "truncated", None),),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, partial)))
+    environment = _environment(index, source)
+    reference = _reference(source, child, ReferenceKind.INHERITS, "Base")
+    original = java_resolver._wildcard_type_candidates
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(java_resolver, "_wildcard_type_candidates", counted)
+
+    assert environment.by_file["Main.java"][0][1].resolution == Resolution(
+        None, ResolutionFailureReason.INCOMPLETE_PARSE
+    )
+    expected = Resolution(None, ResolutionFailureReason.INCOMPLETE_PARSE)
+    assert resolve_reference(index, environment, reference) == expected
+    assert resolve_reference(index, environment, reference) == expected
+    assert calls == 1
+
+
+@pytest.mark.parametrize("wildcard_has_other_type", [False, True])
+def test_same_package_type_survives_nonmatching_wildcard(
+    cg, wildcard_has_other_type
+):
+    item = ImportInfo("r", (), True, (), cg.loc(1, 10))
+    child = cg.symbol(
+        "Child", kind=SymbolKind.CLASS, qualified_name="p.Child", start=100, end=300
+    )
+    source = _java_file(cg, "Main.java", imports=(item,), symbols=(child,))
+    base = cg.symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    package_file = _java_file(cg, "package.java", symbols=(base,))
+    files = [source, package_file]
+    if wildcard_has_other_type:
+        other = cg.symbol("Other", kind=SymbolKind.CLASS, qualified_name="r.Other")
+        files.append(_java_file(cg, "wildcard.java", symbols=(other,)))
+    index = build_graph_indexes(validate_inputs(*cg.pair(*files)))
+    reference = _reference(source, child, ReferenceKind.INHERITS, "Base")
+
+    assert resolve_reference(index, _environment(index, source), reference) == Resolution(
+        symbol_node_id("repo", "package.java", base), None
+    )

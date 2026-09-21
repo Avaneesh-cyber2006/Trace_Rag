@@ -405,9 +405,15 @@ def _wildcard_type_candidates(
             unsupported = unsupported or len(typed_members) != len(type_members)
             candidates.extend(typed_members)
             incomplete = incomplete or (
-                bool(owner_ids)
-                and not type_members
-                and _incomplete_files(index, owner_files)
+                (
+                    bool(owner_ids)
+                    and not type_members
+                    and _incomplete_files(index, owner_files)
+                )
+                or (
+                    not owner_ids
+                    and _qualified_package_has_partial(index, item.module)
+                )
             )
             external = external or not owner_ids
             continue
@@ -515,6 +521,15 @@ def resolve_reference(
     if binding is not None:
         return binding
 
+    package = _source_package(index, reference.source_node_id)
+    if package:
+        qualified = _qualified_types(index, f"{package}.{raw_target}")
+        outcome = _visible_type_outcome(index, qualified, required_kind)
+        if outcome is not None:
+            return outcome
+        if _package_has_partial_file(index, package):
+            return Resolution(None, ResolutionFailureReason.INCOMPLETE_PARSE)
+
     wildcard_items = environment.wildcards_by_file.get(
         reference.relative_path, ()
     )
@@ -549,14 +564,5 @@ def resolve_reference(
             incomplete=incomplete,
             external=external and not candidates,
         )
-
-    package = _source_package(index, reference.source_node_id)
-    if package:
-        qualified = _qualified_types(index, f"{package}.{raw_target}")
-        outcome = _visible_type_outcome(index, qualified, required_kind)
-        if outcome is not None:
-            return outcome
-        if _package_has_partial_file(index, package):
-            return Resolution(None, ResolutionFailureReason.INCOMPLETE_PARSE)
 
     return Resolution(None, ResolutionFailureReason.NOT_FOUND)
