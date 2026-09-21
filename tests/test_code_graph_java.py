@@ -6,12 +6,13 @@ import backend.code_graph.resolvers.java as java_resolver
 from backend.code_graph.identities import symbol_node_id
 from backend.code_graph.indexes import build_graph_indexes
 from backend.code_graph.models import ReferenceKind, ResolutionFailureReason
-from backend.code_graph.references import Reference, type_references
+from backend.code_graph.references import Reference, call_reference, type_references
 from backend.code_graph.resolvers.base import ImportEnvironment, Resolution
 from backend.code_graph.resolvers.java import resolve_import, resolve_reference
 from backend.code_graph.validation import validate_inputs
 from backend.code_parser.models import (
-    ImportInfo, ParseIssue, ParseIssueKind, ParsedLanguage, ParseStatus, SymbolKind,
+    CallKind, CallSite, ImportInfo, ParameterInfo, ParseIssue, ParseIssueKind,
+    ParsedLanguage, ParseStatus, SymbolKind,
 )
 
 
@@ -460,7 +461,7 @@ def test_unrelated_partial_and_failed_files_do_not_taint_missing_type(cg):
     ) == Resolution(None, ResolutionFailureReason.NOT_FOUND)
 
 
-def test_java_call_is_unsupported_until_call_dispatch_task(cg):
+def test_java_call_without_containing_type_is_unsupported(cg):
     method = cg.symbol("run", kind=SymbolKind.METHOD)
     file = _java_file(cg, "Main.java", symbols=(method,))
     index = build_graph_indexes(validate_inputs(*cg.pair(file)))
@@ -469,6 +470,359 @@ def test_java_call_is_unsupported_until_call_dispatch_task(cg):
     assert resolve_reference(
         index, ImportEnvironment({"Main.java": ()}), reference
     ) == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
+def test_overloads_cannot_use_missing_argument_evidence(cg):
+    owner = cg.symbol(
+        "A", kind=SymbolKind.CLASS, qualified_name="p.A", end=500
+    )
+    run = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.A.run",
+        parent="p.A", start=10, end=90,
+    )
+    first = cg.symbol(
+        "m", kind=SymbolKind.METHOD, qualified_name="p.A.m",
+        parent="p.A", start=100, end=150,
+    )
+    second = cg.symbol(
+        "m", kind=SymbolKind.METHOD, qualified_name="p.A.m",
+        parent="p.A", start=160, end=220,
+        parameters=(ParameterInfo("x", "int", None),),
+    )
+    call = CallSite("p.A.run", "this.m", CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(
+        cg, "A.java", symbols=(owner, run, first, second), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    outcome = resolve_reference(
+        index,
+        ImportEnvironment({"A.java": ()}),
+        call_reference(index, file, call),
+    )
+
+    assert outcome.reason is ResolutionFailureReason.AMBIGUOUS
+    assert len(outcome.candidate_node_ids) == 2
+    assert outcome.target_node_id is None
+
+
+@pytest.mark.parametrize("callee_text", ["m", "this.m"])
+def test_current_type_calls_resolve_from_bare_and_this_syntax(cg, callee_text):
+    owner = cg.symbol(
+        "A", kind=SymbolKind.CLASS, qualified_name="p.A", end=500
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.A.run",
+        parent="p.A", start=10, end=90,
+    )
+    target = cg.symbol(
+        "m", kind=SymbolKind.METHOD, qualified_name="p.A.m",
+        parent="p.A", start=100, end=150,
+    )
+    call = CallSite("p.A.run", callee_text, CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(cg, "A.java", symbols=(owner, caller, target), calls=(call,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"A.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(symbol_node_id("repo", "A.java", target), None)
+
+
+def test_type_qualified_call_requires_static_method(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools",
+        start=400, end=700,
+    )
+    static_method = cg.symbol(
+        "work", kind=SymbolKind.METHOD, qualified_name="p.Tools.work",
+        parent="p.Tools", modifiers=("static",), start=420, end=480,
+    )
+    call = CallSite("p.Main.run", "Tools.work", CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(
+        cg, "Main.java", symbols=(owner, caller, tools, static_method), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(symbol_node_id("repo", "Main.java", static_method), None)
+
+
+def test_type_qualified_call_rejects_instance_method(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools",
+        start=400, end=700,
+    )
+    instance_method = cg.symbol(
+        "work", kind=SymbolKind.METHOD, qualified_name="p.Tools.work",
+        parent="p.Tools", start=420, end=480,
+    )
+    call = CallSite("p.Main.run", "Tools.work", CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(
+        cg,
+        "Main.java",
+        symbols=(owner, caller, tools, instance_method),
+        calls=(call,),
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(None, ResolutionFailureReason.NOT_FOUND)
+
+
+def test_explicit_static_import_resolves_bare_call(cg):
+    item = ImportInfo("p.Tools.work", (), False, ("static",), cg.loc(1, 9))
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="q.Main",
+        start=100, end=400,
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="q.Main.run",
+        parent="q.Main", start=120, end=200,
+    )
+    call = CallSite("q.Main.run", "work", CallKind.CALL, cg.loc(130, 140))
+    source = _java_file(
+        cg, "Main.java", symbols=(owner, caller), imports=(item,), calls=(call,)
+    )
+    tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools", end=300
+    )
+    target = cg.symbol(
+        "work", kind=SymbolKind.METHOD, qualified_name="p.Tools.work",
+        parent="p.Tools", modifiers=("static",), start=20, end=80,
+    )
+    target_file = _java_file(cg, "Tools.java", symbols=(tools, target))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, target_file)))
+
+    assert resolve_reference(
+        index, _environment(index, source), call_reference(index, source, call)
+    ) == Resolution(symbol_node_id("repo", "Tools.java", target), None)
+
+
+def test_parameter_receiver_conflict_blocks_type_qualified_call(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+        parameters=(ParameterInfo("Tools", "Object", None),),
+    )
+    tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools",
+        start=400, end=700,
+    )
+    target = cg.symbol(
+        "work", kind=SymbolKind.METHOD, qualified_name="p.Tools.work",
+        parent="p.Tools", modifiers=("static",), start=420, end=480,
+    )
+    call = CallSite("p.Main.run", "Tools.work", CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(
+        cg, "Main.java", symbols=(owner, caller, tools, target), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
+def test_external_static_binding_propagates_to_call(cg):
+    item = ImportInfo("external.Tools.work", (), False, ("static",), cg.loc(1, 9))
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="q.Main",
+        start=100, end=400,
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="q.Main.run",
+        parent="q.Main", start=120, end=200,
+    )
+    call = CallSite("q.Main.run", "work", CallKind.CALL, cg.loc(130, 140))
+    source = _java_file(
+        cg, "Main.java", symbols=(owner, caller), imports=(item,), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(source)))
+
+    assert resolve_reference(
+        index, _environment(index, source), call_reference(index, source, call)
+    ) == Resolution(None, ResolutionFailureReason.EXTERNAL)
+
+
+def test_unknown_receiver_is_unsupported(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    call = CallSite("p.Main.run", "value.work", CallKind.CALL, cg.loc(20, 30))
+    file = _java_file(cg, "Main.java", symbols=(owner, caller), calls=(call,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
+def test_constructor_call_selects_explicit_constructor_child(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    service = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, qualified_name="p.Service",
+        start=400, end=700,
+    )
+    constructor = cg.symbol(
+        "Service", kind=SymbolKind.CONSTRUCTOR,
+        qualified_name="p.Service.Service", parent="p.Service",
+        start=420, end=480,
+    )
+    call = CallSite("p.Main.run", "Service", CallKind.CONSTRUCTOR, cg.loc(20, 30))
+    file = _java_file(
+        cg, "Main.java", symbols=(owner, caller, service, constructor), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(symbol_node_id("repo", "Main.java", constructor), None)
+
+
+def test_missing_implicit_constructor_is_not_found(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    service = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, qualified_name="p.Service",
+        start=400, end=700,
+    )
+    call = CallSite("p.Main.run", "Service", CallKind.CONSTRUCTOR, cg.loc(20, 30))
+    file = _java_file(cg, "Main.java", symbols=(owner, caller, service), calls=(call,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    assert resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    ) == Resolution(None, ResolutionFailureReason.NOT_FOUND)
+
+
+def test_constructor_overloads_are_ambiguous(cg):
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="p.Main", end=300
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="p.Main.run",
+        parent="p.Main", start=10, end=90,
+    )
+    service = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, qualified_name="p.Service",
+        start=400, end=800,
+    )
+    first = cg.symbol(
+        "Service", kind=SymbolKind.CONSTRUCTOR,
+        qualified_name="p.Service.Service", parent="p.Service",
+        start=420, end=480,
+    )
+    second = cg.symbol(
+        "Service", kind=SymbolKind.CONSTRUCTOR,
+        qualified_name="p.Service.Service", parent="p.Service",
+        start=500, end=560,
+        parameters=(ParameterInfo("value", "int", None),),
+    )
+    call = CallSite("p.Main.run", "Service", CallKind.CONSTRUCTOR, cg.loc(20, 30))
+    file = _java_file(
+        cg, "Main.java", symbols=(owner, caller, service, first, second), calls=(call,)
+    )
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+
+    outcome = resolve_reference(
+        index,
+        ImportEnvironment({"Main.java": ()}),
+        call_reference(index, file, call),
+    )
+
+    assert outcome == Resolution(
+        None,
+        ResolutionFailureReason.AMBIGUOUS,
+        tuple(sorted((
+            symbol_node_id("repo", "Main.java", first),
+            symbol_node_id("repo", "Main.java", second),
+        ))),
+    )
+
+
+def test_ambiguous_type_preserves_single_known_static_candidate(cg):
+    item = ImportInfo("p.Tools", (), False, (), cg.loc(1, 9))
+    owner = cg.symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="q.Main",
+        start=100, end=400,
+    )
+    caller = cg.symbol(
+        "run", kind=SymbolKind.METHOD, qualified_name="q.Main.run",
+        parent="q.Main", start=120, end=200,
+    )
+    call = CallSite("q.Main.run", "Tools.work", CallKind.CALL, cg.loc(130, 140))
+    source = _java_file(
+        cg, "Main.java", symbols=(owner, caller), imports=(item,), calls=(call,)
+    )
+    first_tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools", end=300
+    )
+    known = cg.symbol(
+        "work", kind=SymbolKind.METHOD, qualified_name="p.Tools.work",
+        parent="p.Tools", modifiers=("static",), start=20, end=80,
+    )
+    second_tools = cg.symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools", end=300
+    )
+    first = _java_file(cg, "one.java", symbols=(first_tools, known))
+    second = _java_file(cg, "two.java", symbols=(second_tools,))
+    index = build_graph_indexes(validate_inputs(*cg.pair(source, first, second)))
+
+    assert resolve_reference(
+        index, _environment(index, source), call_reference(index, source, call)
+    ) == Resolution(
+        None,
+        ResolutionFailureReason.AMBIGUOUS,
+        (symbol_node_id("repo", "one.java", known),),
+    )
 
 
 def test_wildcard_member_lookup_is_memoized_per_environment(cg, monkeypatch):
