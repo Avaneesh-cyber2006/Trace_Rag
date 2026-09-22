@@ -341,9 +341,11 @@ def _visible_outcome(
     if not candidates:
         return None
     eligible = _eligible_ids(index, candidates, required_kinds)
-    if len(eligible) != len(candidates):
-        return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
-    return choose_resolution(eligible)
+    return (
+        choose_resolution(eligible)
+        if eligible
+        else Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+    )
 
 
 def _filtered_resolution(
@@ -353,8 +355,10 @@ def _filtered_resolution(
 ) -> Resolution:
     if resolution.reason is ResolutionFailureReason.AMBIGUOUS:
         candidates = resolution.candidate_node_ids
+        if not candidates:
+            return resolution
         eligible = _eligible_ids(index, candidates, required_kinds)
-        if len(eligible) != len(candidates):
+        if not eligible:
             return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
         return Resolution(
             None,
@@ -472,6 +476,12 @@ def _same_file_resolution(
     for scope_id in _scope_ids(
         index, source_id, callable_only=callable_scopes
     ):
+        if (
+            callable_scopes
+            and scope_id != file_id
+            and _parameter_conflict(index, scope_id, name)
+        ):
+            return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
         candidates = _children_named(
             index, scope_id, name, excluded_id=excluded_id
         )
@@ -675,8 +685,6 @@ def _resolve_call(
 
     raw_target = reference.raw_target
     if _is_binding_identifier(raw_target):
-        if _parameter_conflict(index, source_id, raw_target):
-            return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
         required_kinds = (
             (SymbolKind.CLASS,)
             if reference.call_kind is CallKind.CONSTRUCTOR

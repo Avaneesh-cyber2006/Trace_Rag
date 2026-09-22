@@ -18,6 +18,7 @@ from backend.code_parser.models import (
     CallSite,
     ImportBinding,
     ImportInfo,
+    ParameterInfo,
     ParsedLanguage,
     SymbolKind,
 )
@@ -1345,4 +1346,186 @@ def test_bare_method_name_does_not_infer_current_receiver(cg):
 
     assert result == Resolution(
         symbol_node_id("repo", "main.js", file_function), None
+    )
+
+
+def test_same_scope_call_filters_noncallable_exact_name(cg):
+    callable_target = cg.symbol("helper", start=0, end=20)
+    noncallable = cg.symbol(
+        "helper", kind=SymbolKind.CLASS, start=30, end=50
+    )
+    caller = cg.symbol("main", start=60, end=160)
+    call = CallSite("main", "helper", CallKind.CALL, cg.loc(100, 110))
+    file = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(callable_target, noncallable, caller),
+        calls=(call,),
+    )
+    index = _index(cg, file)
+
+    result = resolve_reference(
+        index,
+        ImportEnvironment({"main.js": ()}),
+        call_reference(index, file, call),
+    )
+
+    assert result == Resolution(
+        symbol_node_id("repo", "main.js", callable_target), None
+    )
+
+
+def test_ambiguous_import_retains_only_eligible_callable_candidates(cg):
+    item = ImportInfo(
+        "./util",
+        (ImportBinding("run", "execute"),),
+        False,
+        (),
+        cg.loc(0, 15),
+    )
+    caller = cg.symbol("main", start=20, end=100)
+    call = CallSite("main", "execute", CallKind.CALL, cg.loc(50, 60))
+    source = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(caller,),
+        imports=(item,),
+        calls=(call,),
+    )
+    callable_target = cg.symbol("run", modifiers=("export",))
+    first = cg.parsed(
+        "util.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(callable_target,),
+    )
+    noncallable = cg.symbol(
+        "run", kind=SymbolKind.CONSTANT, modifiers=("export",)
+    )
+    second = cg.parsed(
+        "util.ts",
+        language=ParsedLanguage.TYPESCRIPT,
+        symbols=(noncallable,),
+    )
+    index = _index(cg, source, first, second)
+    known = symbol_node_id("repo", "util.js", callable_target)
+
+    result = resolve_reference(
+        index,
+        _environment(index, source, first, second),
+        call_reference(index, source, call),
+    )
+
+    assert result == Resolution(
+        None, ResolutionFailureReason.AMBIGUOUS, (known,)
+    )
+
+
+def test_zero_eligible_local_tier_blocks_imported_callable_fallback(cg):
+    item = ImportInfo(
+        "./util.js",
+        (ImportBinding("run", "helper"),),
+        False,
+        (),
+        cg.loc(0, 15),
+    )
+    local_class = cg.symbol(
+        "helper", kind=SymbolKind.CLASS, start=20, end=50
+    )
+    caller = cg.symbol("main", start=60, end=160)
+    call = CallSite("main", "helper", CallKind.CALL, cg.loc(100, 110))
+    source = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(local_class, caller),
+        imports=(item,),
+        calls=(call,),
+    )
+    exported = cg.symbol("run", modifiers=("export",))
+    target = cg.parsed(
+        "util.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(exported,),
+    )
+    index = _index(cg, source, target)
+
+    result = resolve_reference(
+        index,
+        _environment(index, source, target),
+        call_reference(index, source, call),
+    )
+
+    assert result == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
+def test_enclosing_callable_parameter_blocks_file_fallback(cg):
+    file_helper = cg.symbol("helper", start=0, end=20)
+    outer = cg.symbol(
+        "outer",
+        start=30,
+        end=300,
+        parameters=(ParameterInfo("helper", None, None),),
+    )
+    inner = cg.symbol(
+        "inner",
+        qualified_name="outer.inner",
+        parent="outer",
+        start=60,
+        end=220,
+    )
+    call = CallSite("outer.inner", "helper", CallKind.CALL, cg.loc(150, 160))
+    file = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(file_helper, outer, inner),
+        calls=(call,),
+    )
+    index = _index(cg, file)
+
+    result = resolve_reference(
+        index,
+        ImportEnvironment({"main.js": ()}),
+        call_reference(index, file, call),
+    )
+
+    assert result == Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+
+
+def test_nearer_lexical_declaration_precedes_outer_parameter(cg):
+    outer = cg.symbol(
+        "outer",
+        start=0,
+        end=300,
+        parameters=(ParameterInfo("helper", None, None),),
+    )
+    inner = cg.symbol(
+        "inner",
+        qualified_name="outer.inner",
+        parent="outer",
+        start=30,
+        end=250,
+    )
+    helper = cg.symbol(
+        "helper",
+        qualified_name="outer.inner.helper",
+        parent="outer.inner",
+        start=60,
+        end=100,
+    )
+    call = CallSite("outer.inner", "helper", CallKind.CALL, cg.loc(150, 160))
+    file = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(outer, inner, helper),
+        calls=(call,),
+    )
+    index = _index(cg, file)
+
+    result = resolve_reference(
+        index,
+        ImportEnvironment({"main.js": ()}),
+        call_reference(index, file, call),
+    )
+
+    assert result == Resolution(
+        symbol_node_id("repo", "main.js", helper), None
     )
