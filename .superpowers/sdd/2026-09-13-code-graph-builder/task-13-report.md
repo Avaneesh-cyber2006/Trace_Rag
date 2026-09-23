@@ -42,4 +42,4 @@ Scoped `git diff --check -- backend/code_graph/references.py backend/code_graph/
 
 ## Commit
 
-Pending.
+Implementation commit: `67749223091538df3235f0b48a4195f9e0af6b27`
