@@ -275,3 +275,30 @@ def test_inventory_rejects_non_iterable_or_wrong_shaped_mapping_values(
 )
 def test_specialized_errors_are_direct_code_graph_error_subclasses(exception_type):
     assert exception_type.__bases__ == (CodeGraphError,)
+
+
+def test_inventory_equality_depends_only_on_canonical_values(cg):
+    node = GraphNode(
+        "a" * 64,
+        GraphNodeKind.FILE,
+        "repo",
+        "a.py",
+        ParsedLanguage.PYTHON,
+        ParseStatus.SUCCESS,
+        None,
+        None,
+        None,
+        None,
+    )
+    first_backing = {node.node_id: []}
+    second_backing = {node.node_id: ()}
+
+    first = CodeGraphInventory(
+        "repo", (node,), (), (), first_backing, first_backing, {"a.py": (node,)}, {}
+    )
+    second = CodeGraphInventory(
+        "repo", (node,), (), (), second_backing, second_backing, {"a.py": [node]}, {}
+    )
+    first_backing.clear()
+
+    assert first == second

@@ -15,7 +15,7 @@ from backend.code_parser.models import (
 
 from .exceptions import CodeGraphIdentityError
 from .identities import file_node_id, symbol_node_id
-from .models import GraphNode, GraphNodeKind
+from .models import CodeGraphInventory, GraphEdge, GraphNode, GraphNodeKind, UnresolvedReference
 from .structure import _resolve_parent_ids
 from .validation import ValidatedInputs
 
@@ -256,3 +256,58 @@ def build_graph_indexes(inputs: ValidatedInputs) -> GraphIndexes:
         _sorted_buckets(java_packages),
         symbol_ranges_by_file,
     )
+
+
+def finalize_graph(
+    index: GraphIndexes,
+    edges: tuple[GraphEdge, ...],
+    unresolved: tuple[UnresolvedReference, ...],
+) -> CodeGraphInventory:
+    """Publish canonical immutable tuples and detached derived indexes."""
+
+    nodes = tuple(sorted(index.nodes, key=lambda node: node.node_id))
+    canonical_edges = tuple(sorted(edges, key=lambda edge: edge.edge_id))
+    canonical_unresolved = tuple(
+        sorted(unresolved, key=lambda item: item.reference_id)
+    )
+
+    outgoing: dict[str, list[GraphEdge]] = {node.node_id: [] for node in nodes}
+    incoming: dict[str, list[GraphEdge]] = {node.node_id: [] for node in nodes}
+    nodes_by_file: dict[str, list[GraphNode]] = {
+        path: [] for path in index.files_by_path
+    }
+    nodes_by_qualified_name: defaultdict[str, list[GraphNode]] = defaultdict(list)
+    for node in nodes:
+        nodes_by_file[node.relative_path].append(node)
+        if node.node_kind is GraphNodeKind.SYMBOL and node.qualified_name is not None:
+            nodes_by_qualified_name[node.qualified_name].append(node)
+    for edge in canonical_edges:
+        outgoing.setdefault(edge.source_node_id, []).append(edge)
+        incoming.setdefault(edge.target_node_id, []).append(edge)
+
+    graph = CodeGraphInventory(
+        index.repository_namespace,
+        nodes,
+        canonical_edges,
+        canonical_unresolved,
+        {
+            key: tuple(sorted(values, key=lambda edge: edge.edge_id))
+            for key, values in sorted(outgoing.items())
+        },
+        {
+            key: tuple(sorted(values, key=lambda edge: edge.edge_id))
+            for key, values in sorted(incoming.items())
+        },
+        {
+            key: tuple(sorted(values, key=lambda node: node.node_id))
+            for key, values in sorted(nodes_by_file.items())
+        },
+        {
+            key: tuple(sorted(values, key=lambda node: node.node_id))
+            for key, values in sorted(nodes_by_qualified_name.items())
+        },
+    )
+    from .invariants import validate_graph
+
+    validate_graph(graph, index)
+    return graph

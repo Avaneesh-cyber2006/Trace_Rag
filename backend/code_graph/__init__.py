@@ -1,5 +1,6 @@
 """Public interface for TraceRAG's Code Graph Builder."""
 
+from .builder import CodeGraphBuilder, build_code_graph
 from .exceptions import (
     CodeGraphError,
     CodeGraphIdentityError,
@@ -19,6 +20,7 @@ from .models import (
 )
 
 __all__ = [
+    "CodeGraphBuilder",
     "CodeGraphError",
     "CodeGraphIdentityError",
     "CodeGraphInventory",
@@ -32,4 +34,5 @@ __all__ = [
     "ReferenceKind",
     "ResolutionFailureReason",
     "UnresolvedReference",
+    "build_code_graph",
 ]

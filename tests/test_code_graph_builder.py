@@ -5,9 +5,14 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+import backend.code_graph.builder as builder_module
+from backend.code_graph import CodeGraphBuilder, build_code_graph
+from backend.code_graph import resolvers as resolver_dispatch
+from backend.code_graph.resolvers import ecmascript, java, python
 from backend.code_graph.resolvers import base as resolver_base
 from backend.code_graph.exceptions import (
     CodeGraphIdentityError,
+    CodeGraphInvariantError,
     CodeGraphResolutionError,
     CodeGraphValidationError,
 )
@@ -17,7 +22,8 @@ from backend.code_graph.identities import (
     reference_id,
     symbol_node_id,
 )
-from backend.code_graph.indexes import build_graph_indexes
+from backend.code_graph.indexes import build_graph_indexes, finalize_graph
+from backend.code_graph.invariants import validate_graph
 from backend.code_graph.models import (
     GraphEdge,
     GraphEdgeKind,
@@ -46,6 +52,7 @@ from backend.code_graph.validation import validate_inputs
 from backend.code_parser.models import (
     CallKind,
     CallSite,
+    ImportBinding,
     ImportInfo,
     ParsedLanguage,
     ParseIssue,
@@ -1013,3 +1020,352 @@ def test_materialize_rejects_invalid_resolver_outcomes(cg, source, target):
 
     with pytest.raises(CodeGraphResolutionError):
         materialize(index, reference, Resolution(target_id, None))
+
+
+def test_public_builder_produces_calls(cg):
+    call = CallSite("run", "helper", CallKind.CALL, cg.loc(20, 25))
+    file = cg.parsed(
+        symbols=(cg.symbol("run"), cg.symbol("helper", start=200, end=250)),
+        calls=(call,),
+    )
+    pair = cg.pair(file)
+
+    graph = build_code_graph(*pair)
+
+    assert graph == CodeGraphBuilder().build(*pair)
+    assert sum(edge.edge_kind is GraphEdgeKind.CALLS for edge in graph.edges) == 1
+
+
+def test_builder_publishes_canonical_indexes_for_isolated_and_duplicate_names(cg):
+    first = cg.parsed(
+        "z.py",
+        symbols=(cg.symbol("same", qualified_name="shared"),),
+    )
+    second = cg.parsed(
+        "a.py",
+        symbols=(cg.symbol("same", qualified_name="shared"),),
+    )
+    isolated = cg.parsed("empty.py")
+
+    graph = build_code_graph(*cg.pair(first, isolated, second))
+
+    assert graph.nodes == tuple(sorted(graph.nodes, key=lambda node: node.node_id))
+    assert graph.edges == tuple(sorted(graph.edges, key=lambda edge: edge.edge_id))
+    assert tuple(graph.outgoing_edges) == tuple(sorted(graph.outgoing_edges))
+    assert tuple(graph.incoming_edges) == tuple(sorted(graph.incoming_edges))
+    assert tuple(graph.nodes_by_file) == ("a.py", "empty.py", "z.py")
+    assert len(graph.nodes_by_file["empty.py"]) == 1
+    assert graph.outgoing_edges[graph.nodes_by_file["empty.py"][0].node_id] == ()
+    assert graph.incoming_edges[graph.nodes_by_file["empty.py"][0].node_id] == ()
+    assert tuple(node.node_id for node in graph.nodes_by_qualified_name["shared"]) == tuple(
+        sorted(node.node_id for node in graph.nodes_by_qualified_name["shared"])
+    )
+    assert len(graph.nodes_by_qualified_name["shared"]) == 2
+
+
+def test_empty_graph_and_reused_builder_have_no_retained_state(cg):
+    builder = CodeGraphBuilder()
+    populated = builder.build(*cg.pair(cg.parsed(symbols=(cg.symbol("run"),))))
+    empty = builder.build(*cg.pair())
+
+    assert populated.nodes
+    assert empty.repository_namespace == "repo"
+    assert empty.nodes == ()
+    assert empty.edges == ()
+    assert empty.unresolved_references == ()
+    assert dict(empty.outgoing_edges) == {}
+    assert empty == build_code_graph(*cg.pair())
+
+
+def test_builder_preserves_import_recursion_and_callable_cycles(cg):
+    import_b = ImportInfo("b", (ImportBinding("b", None),), False, (), cg.loc(1, 2))
+    import_a = ImportInfo("a", (ImportBinding("a", None),), False, (), cg.loc(1, 2))
+    a = cg.symbol("a", start=10, end=90)
+    b = cg.symbol("b", start=100, end=190)
+    first = cg.parsed(
+        "a.py",
+        symbols=(a, b),
+        imports=(import_b,),
+        calls=(
+            CallSite("a", "a", CallKind.CALL, cg.loc(20, 25)),
+            CallSite("a", "b", CallKind.CALL, cg.loc(30, 35)),
+            CallSite("b", "a", CallKind.CALL, cg.loc(120, 125)),
+        ),
+    )
+    second = cg.parsed("b.py", imports=(import_a,))
+
+    graph = build_code_graph(*cg.pair(first, second))
+
+    assert sum(edge.edge_kind is GraphEdgeKind.IMPORTS for edge in graph.edges) == 2
+    assert sum(edge.edge_kind is GraphEdgeKind.CALLS for edge in graph.edges) == 3
+
+
+def test_builder_collects_every_import_outcome_before_resolving_calls(cg, monkeypatch):
+    call = CallSite("run", "run", CallKind.CALL, cg.loc(20, 25))
+    first = cg.parsed("a.py", symbols=(cg.symbol("run"),), calls=(call,))
+    late_import = ImportInfo(
+        "external", (ImportBinding("external", None),), False, (), cg.loc(1, 2)
+    )
+    second = cg.parsed("z.py", imports=(late_import,))
+    original = resolver_dispatch.resolve_reference
+    seen = []
+
+    def checking_resolver(index, environment, reference):
+        seen.append(tuple(environment.by_file))
+        assert tuple(environment.by_file) == ("a.py", "z.py")
+        assert environment.by_file["z.py"][0][0] is late_import
+        return original(index, environment, reference)
+
+    monkeypatch.setattr(builder_module, "resolve_reference", checking_resolver)
+
+    build_code_graph(*cg.pair(first, second))
+
+    assert seen == [("a.py", "z.py")]
+
+
+def test_builder_deduplicates_identical_records_by_identity(cg):
+    duplicate = CallSite("run", "run", CallKind.CALL, cg.loc(20, 25))
+    file = cg.parsed(
+        symbols=(cg.symbol("run"),),
+        calls=(duplicate, duplicate),
+    )
+
+    graph = build_code_graph(*cg.pair(file))
+
+    call_edges = [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.CALLS]
+    assert len(call_edges) == 1
+
+
+def test_builder_rejects_conflicting_same_identity_records(cg, monkeypatch):
+    duplicate = CallSite("run", "run", CallKind.CALL, cg.loc(20, 25))
+    file = cg.parsed(
+        symbols=(cg.symbol("run"), cg.symbol("other", start=200, end=300)),
+        calls=(duplicate, duplicate),
+    )
+    calls = 0
+
+    def conflicting_materialize(index, reference, resolution):
+        nonlocal calls
+        calls += 1
+        ids = tuple(
+            node.node_id for node in index.nodes if node.node_kind is GraphNodeKind.SYMBOL
+        )
+        return GraphEdge("f" * 64, GraphEdgeKind.CALLS, ids[0], ids[calls - 1], reference.location)
+
+    monkeypatch.setattr(builder_module, "materialize", conflicting_materialize)
+
+    with pytest.raises(CodeGraphIdentityError):
+        build_code_graph(*cg.pair(file))
+
+
+def test_builder_does_not_swallow_graph_faults(cg, monkeypatch):
+    file = cg.parsed(
+        symbols=(cg.symbol("run"),),
+        calls=(CallSite("run", "run", CallKind.CALL, cg.loc(20, 25)),),
+    )
+
+    def broken_resolver(index, environment, reference):
+        raise CodeGraphResolutionError("resolver contract broke")
+
+    monkeypatch.setattr(builder_module, "resolve_reference", broken_resolver)
+
+    with pytest.raises(CodeGraphResolutionError, match="resolver contract broke"):
+        build_code_graph(*cg.pair(file))
+
+
+@pytest.mark.parametrize(
+    ("language", "module"),
+    [
+        (ParsedLanguage.PYTHON, python),
+        (ParsedLanguage.JAVA, java),
+        (ParsedLanguage.JAVASCRIPT, ecmascript),
+        (ParsedLanguage.TYPESCRIPT, ecmascript),
+        (ParsedLanguage.TSX, ecmascript),
+    ],
+)
+def test_dispatchers_use_the_static_language_module(language, module, cg, monkeypatch):
+    suffix = {
+        ParsedLanguage.PYTHON: ".py",
+        ParsedLanguage.JAVA: ".java",
+        ParsedLanguage.JAVASCRIPT: ".js",
+        ParsedLanguage.TYPESCRIPT: ".ts",
+        ParsedLanguage.TSX: ".tsx",
+    }[language]
+    file = cg.parsed("a" + suffix, language=language)
+    index = build_graph_indexes(validate_inputs(*cg.pair(file)))
+    item = ImportInfo("target", (), False, (), cg.loc(1, 2))
+    import_result = ImportResult(Resolution(None, ResolutionFailureReason.EXTERNAL), ())
+    reference_result = Resolution(None, ResolutionFailureReason.NOT_FOUND)
+    reference = Reference(
+        ReferenceKind.CALL,
+        file.relative_path,
+        language,
+        None,
+        cg.loc(3, 4),
+        "target",
+        CallKind.CALL,
+    )
+    monkeypatch.setattr(module, "resolve_import", lambda *_: import_result)
+    monkeypatch.setattr(module, "resolve_reference", lambda *_: reference_result)
+
+    assert resolver_dispatch.resolve_import(index, file, item) is import_result
+    assert resolver_dispatch.resolve_reference(
+        index, ImportEnvironment({file.relative_path: ()}), reference
+    ) is reference_result
+
+
+def _invariant_fixture(cg):
+    owner = cg.symbol("Owner", kind=SymbolKind.CLASS, end=300)
+    method = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="Owner.run",
+        parent="Owner",
+        start=20,
+        end=100,
+    )
+    helper = cg.symbol("helper", start=400, end=500)
+    first = cg.parsed(
+        "a.py",
+        symbols=(owner, method, helper),
+        calls=(CallSite("Owner.run", "missing", CallKind.CALL, cg.loc(30, 35)),),
+    )
+    other = cg.parsed("b.py", symbols=(cg.symbol("other"),))
+    inputs = validate_inputs(*cg.pair(first, other))
+    index = build_graph_indexes(inputs)
+    graph = build_code_graph(*cg.pair(first, other))
+    return graph, index
+
+
+def test_validate_graph_rejects_duplicate_identity_and_projection_corruption(cg):
+    graph, index = _invariant_fixture(cg)
+    symbol = next(node for node in graph.nodes if node.node_kind is GraphNodeKind.SYMBOL)
+    edge = graph.edges[0]
+    cases = (
+        replace(graph, nodes=graph.nodes + (symbol,)),
+        replace(graph, edges=graph.edges + (edge,)),
+        replace(graph, repository_namespace="other"),
+        replace(
+            graph,
+            nodes=tuple(
+                replace(node, name="fabricated") if node.node_id == symbol.node_id else node
+                for node in graph.nodes
+            ),
+        ),
+    )
+
+    for malformed in cases:
+        with pytest.raises(CodeGraphInvariantError):
+            validate_graph(malformed, index)
+
+
+def test_validate_graph_rejects_dangling_and_invalid_reference_endpoints(cg):
+    graph, index = _invariant_fixture(cg)
+    call = next(item for item in graph.unresolved_references if item.reference_kind is ReferenceKind.CALL)
+    callable_node = next(
+        node for node in graph.nodes if node.symbol_kind is SymbolKind.FUNCTION
+    )
+    class_node = next(node for node in graph.nodes if node.symbol_kind is SymbolKind.CLASS)
+    bad_source = replace(
+        graph.edges[0],
+        edge_id=edge_id("repo", GraphEdgeKind.DEFINES, "f" * 64, graph.edges[0].target_node_id, None),
+        source_node_id="f" * 64,
+    )
+    bad_target = replace(
+        graph.edges[0],
+        edge_id=edge_id("repo", GraphEdgeKind.DEFINES, graph.edges[0].source_node_id, "e" * 64, None),
+        target_node_id="e" * 64,
+    )
+    class_call = GraphEdge(
+        edge_id("repo", GraphEdgeKind.CALLS, class_node.node_id, callable_node.node_id, cg.loc(1, 2)),
+        GraphEdgeKind.CALLS,
+        class_node.node_id,
+        callable_node.node_id,
+        cg.loc(1, 2),
+    )
+    cases = (
+        replace(graph, edges=(bad_source, *graph.edges[1:])),
+        replace(graph, edges=(bad_target, *graph.edges[1:])),
+        replace(
+            graph,
+            unresolved_references=tuple(
+                replace(item, reason=ResolutionFailureReason.AMBIGUOUS, candidate_node_ids=("d" * 64,))
+                if item.reference_id == call.reference_id
+                else item
+                for item in graph.unresolved_references
+            ),
+        ),
+        replace(graph, edges=graph.edges + (class_call,)),
+    )
+
+    for malformed in cases:
+        with pytest.raises(CodeGraphInvariantError):
+            validate_graph(malformed, index)
+
+
+def test_validate_graph_rejects_structural_parent_mismatch_and_cycle(cg):
+    graph, index = _invariant_fixture(cg)
+    structural = tuple(
+        edge for edge in graph.edges if edge.edge_kind in (GraphEdgeKind.DEFINES, GraphEdgeKind.CONTAINS)
+    )
+    nonstructural = tuple(edge for edge in graph.edges if edge not in structural)
+    symbols = [node for node in graph.nodes if node.node_kind is GraphNodeKind.SYMBOL]
+    cycle_edges = tuple(
+        GraphEdge(
+            edge_id("repo", GraphEdgeKind.CONTAINS, source.node_id, target.node_id, None),
+            GraphEdgeKind.CONTAINS,
+            source.node_id,
+            target.node_id,
+            None,
+        )
+        for source, target in ((symbols[0], symbols[1]), (symbols[1], symbols[0]))
+    )
+    extra = GraphEdge(
+        edge_id("repo", GraphEdgeKind.CONTAINS, symbols[0].node_id, symbols[-1].node_id, None),
+        GraphEdgeKind.CONTAINS,
+        symbols[0].node_id,
+        symbols[-1].node_id,
+        None,
+    )
+    cases = (
+        replace(graph, edges=graph.edges[1:]),
+        replace(graph, edges=graph.edges + (extra,)),
+        replace(graph, edges=nonstructural + cycle_edges),
+    )
+
+    for malformed in cases:
+        with pytest.raises(CodeGraphInvariantError):
+            validate_graph(malformed, index)
+
+
+def test_validate_graph_rejects_incorrect_indexes_and_cross_file_source(cg):
+    graph, index = _invariant_fixture(cg)
+    call = next(item for item in graph.unresolved_references if item.reference_kind is ReferenceKind.CALL)
+    other = next(
+        node
+        for node in graph.nodes
+        if node.relative_path == "b.py" and node.node_kind is GraphNodeKind.SYMBOL
+    )
+    moved = replace(
+        call,
+        reference_id=reference_id(
+            "repo", call.relative_path, call.reference_kind, other.node_id, call.location, call.raw_target
+        ),
+        source_node_id=other.node_id,
+    )
+    bad_outgoing = dict(graph.outgoing_edges)
+    bad_outgoing.pop(next(iter(bad_outgoing)))
+
+    with pytest.raises(CodeGraphInvariantError):
+        validate_graph(replace(graph, outgoing_edges=bad_outgoing), index)
+    with pytest.raises(CodeGraphInvariantError):
+        validate_graph(
+            replace(
+                graph,
+                unresolved_references=tuple(
+                    moved if item.reference_id == call.reference_id else item
+                    for item in graph.unresolved_references
+                ),
+            ),
+            index,
+        )
