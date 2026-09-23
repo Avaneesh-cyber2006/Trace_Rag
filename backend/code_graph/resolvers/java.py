@@ -13,6 +13,7 @@ from backend.code_graph.resolvers.base import (
     ImportResult,
     Resolution,
     choose_resolution,
+    classify_relevant_parse_loss,
     import_scope,
 )
 from backend.code_parser.models import (
@@ -906,18 +907,24 @@ def resolve_reference(
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
 
     if reference.reference_kind is ReferenceKind.CALL:
-        return _resolve_call(index, environment, reference)
+        resolution = _resolve_call(index, environment, reference)
+        return classify_relevant_parse_loss(
+            index, reference.relative_path, reference.location, resolution
+        )
     if not _is_dotted_identifier(reference.raw_target):
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
 
     required_kind = _required_target_kind(reference, source.symbol_kind)
     if required_kind is None:
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
-    return _resolve_type_name(
+    resolution = _resolve_type_name(
         index,
         environment,
         reference,
         reference.raw_target,
         (required_kind,),
         excluded_id=reference.source_node_id,
+    )
+    return classify_relevant_parse_loss(
+        index, reference.relative_path, reference.location, resolution
     )

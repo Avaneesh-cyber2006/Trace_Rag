@@ -15,6 +15,7 @@ from backend.code_graph.resolvers.base import (
     ImportResult,
     Resolution,
     choose_resolution,
+    classify_relevant_parse_loss,
     import_scope,
 )
 from backend.code_parser.models import (
@@ -850,7 +851,10 @@ def resolve_reference(
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
 
     if reference.reference_kind is ReferenceKind.CALL:
-        return _resolve_call(index, environment, reference)
+        resolution = _resolve_call(index, environment, reference)
+        return classify_relevant_parse_loss(
+            index, reference.relative_path, reference.location, resolution
+        )
 
     if (
         reference.reference_kind is ReferenceKind.IMPLEMENTS
@@ -860,4 +864,7 @@ def resolve_reference(
     required_kinds = _required_type_kinds(reference, source.symbol_kind)
     if required_kinds is None:
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
-    return _resolve_type(index, environment, reference, required_kinds)
+    resolution = _resolve_type(index, environment, reference, required_kinds)
+    return classify_relevant_parse_loss(
+        index, reference.relative_path, reference.location, resolution
+    )

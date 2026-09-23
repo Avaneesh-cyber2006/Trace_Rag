@@ -293,6 +293,23 @@ def _relevant_parse_loss(file: ParsedFile, location: SourceLocation) -> bool:
     )
 
 
+def classify_relevant_parse_loss(
+    index: GraphIndexes,
+    relative_path: str,
+    location: SourceLocation,
+    resolution: Resolution,
+) -> Resolution:
+    """Promote an otherwise definitive miss when relevant evidence was lost."""
+
+    file = index.files_by_path[relative_path]
+    if (
+        resolution.reason is ResolutionFailureReason.NOT_FOUND
+        and _relevant_parse_loss(file, location)
+    ):
+        return choose_resolution((), incomplete=True)
+    return resolution
+
+
 def choose_resolution(
     candidates: tuple[str, ...],
     *,

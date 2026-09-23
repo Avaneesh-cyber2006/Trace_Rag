@@ -15,6 +15,7 @@ from backend.code_graph.resolvers.base import (
     ImportResult,
     Resolution,
     choose_resolution,
+    classify_relevant_parse_loss,
     import_scope,
 )
 from backend.code_parser.models import (
@@ -214,10 +215,14 @@ def resolve_reference(
         return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
 
     if reference.reference_kind is ReferenceKind.CALL:
-        return _resolve_call(index, environment, reference)
-    if reference.reference_kind is ReferenceKind.INHERITS:
-        return _resolve_base(index, environment, reference)
-    return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+        resolution = _resolve_call(index, environment, reference)
+    elif reference.reference_kind is ReferenceKind.INHERITS:
+        resolution = _resolve_base(index, environment, reference)
+    else:
+        return Resolution(None, ResolutionFailureReason.UNSUPPORTED)
+    return classify_relevant_parse_loss(
+        index, reference.relative_path, reference.location, resolution
+    )
 
 
 def _callable_scope_ids(index: GraphIndexes, source_id: str) -> tuple[str, ...]:
