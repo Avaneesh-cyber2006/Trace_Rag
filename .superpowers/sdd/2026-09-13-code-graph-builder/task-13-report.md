@@ -43,3 +43,18 @@ Scoped `git diff --check -- backend/code_graph/references.py backend/code_graph/
 ## Commit
 
 Implementation commit: `67749223091538df3235f0b48a4195f9e0af6b27`
+
+## Review fix round 1
+
+Added a public-pipeline boundary test proving a supported missing call in a
+`PARTIAL` source remains `NOT_FOUND` when the located parse issue is disjoint
+from that call.
+
+RED was established with a temporary fault probe that treated every `PARTIAL`
+file as relevant. The new test then failed because the call was classified as
+`INCOMPLETE_PARSE`; the overlap-based production logic was restored before the
+final checks.
+
+Focused Task 13 suite: 34 passed. Required graph regression scope: 461 passed,
+1803 deselected. Scoped `git diff --check` passed. No production file changed in
+this review fix.

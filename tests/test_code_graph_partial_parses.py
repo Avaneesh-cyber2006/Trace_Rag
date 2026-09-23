@@ -181,6 +181,23 @@ def test_locationless_parse_loss_keeps_truncated_call_incomplete(cg):
     assert graph.unresolved_references[0].reason is ResolutionFailureReason.INCOMPLETE_PARSE
 
 
+def test_disjoint_partial_issue_does_not_change_a_complete_missing_call(cg):
+    caller = cg.symbol("caller", start=0, end=100)
+    location = cg.loc(40, 50)
+    call = CallSite("caller", "missing", CallKind.CALL, location)
+    issue = ParseIssue(ParseIssueKind.SYNTAX_ERROR, "elsewhere", cg.loc(300, 310))
+    file = cg.parsed(
+        status=ParseStatus.PARTIAL,
+        symbols=(caller,),
+        calls=(call,),
+        issues=(issue,),
+    )
+
+    graph = build_code_graph(*cg.pair(file))
+
+    assert graph.unresolved_references[0].reason is ResolutionFailureReason.NOT_FOUND
+
+
 def test_dynamic_expression_remains_unsupported_under_relevant_parse_loss(cg):
     caller = cg.symbol("caller", start=0, end=100)
     location = cg.loc(40, 50)
