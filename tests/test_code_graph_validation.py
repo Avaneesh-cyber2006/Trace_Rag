@@ -736,3 +736,16 @@ def test_validated_inputs_is_frozen_slotted_and_sorted_by_exact_path(cg):
     assert getattr(ValidatedInputs, "__dataclass_params__").frozen is True
     with pytest.raises(AttributeError):
         result.repository_namespace = "changed"
+
+
+def test_case_distinct_unicode_paths_are_validated_as_distinct(cg):
+    first = cg.parsed("Módül.py")
+    second = cg.parsed("módül.py")
+    file_inventory, parse_inventory = cg.pair(second, first)
+
+    result = validate_inputs(file_inventory, parse_inventory)
+
+    assert tuple(parsed.relative_path for _, parsed in result.pairs) == (
+        "Módül.py",
+        "módül.py",
+    )
