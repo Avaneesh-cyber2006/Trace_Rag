@@ -2,6 +2,7 @@
 
 import ast
 import builtins
+from dataclasses import FrozenInstanceError
 import importlib
 import io
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from backend.code_graph import build_code_graph
+from backend.code_graph.models import GraphEdgeKind, ReferenceKind
 from backend.code_parser.models import (
     CallKind,
     CallSite,
@@ -37,11 +39,33 @@ def _patch_io(guard):
         (io, "open"),
         (os, "open"),
         (os, "scandir"),
+        (os, "remove"),
+        (os, "unlink"),
+        (os, "rename"),
+        (os, "replace"),
+        (os, "mkdir"),
+        (os, "makedirs"),
+        (os, "rmdir"),
+        (os, "removedirs"),
+        (os, "chmod"),
+        (os, "symlink"),
+        (os, "link"),
         (Path, "open"),
         (Path, "read_text"),
         (Path, "read_bytes"),
+        (Path, "write_text"),
+        (Path, "write_bytes"),
         (Path, "stat"),
         (Path, "resolve"),
+        (Path, "unlink"),
+        (Path, "rename"),
+        (Path, "replace"),
+        (Path, "mkdir"),
+        (Path, "rmdir"),
+        (Path, "touch"),
+        (Path, "chmod"),
+        (Path, "symlink_to"),
+        (Path, "hardlink_to"),
         (subprocess, "run"),
         (subprocess, "Popen"),
         (importlib, "import_module"),
@@ -74,6 +98,33 @@ def test_repeated_public_builds_are_equal_fresh_in_memory_results(cg, monkeypatc
     assert first == second
     assert first is not second
     assert first.nodes_by_file is not second.nodes_by_file
+    with pytest.raises(FrozenInstanceError):
+        first.nodes = ()
+    with pytest.raises(TypeError):
+        first.nodes_by_file["injected.py"] = ()
+
+
+def test_caller_inputs_are_immutable_and_later_builds_do_not_change_prior_graph(
+    cg, monkeypatch
+):
+    source = cg.parsed(symbols=(cg.symbol("first"),))
+    pair = cg.pair(source)
+    file_inventory, parse_inventory = pair
+    first = _build_under_guard(monkeypatch, pair)
+    original_nodes = first.nodes
+
+    with pytest.raises(FrozenInstanceError):
+        parse_inventory.files[0].symbols = ()
+    with pytest.raises(FrozenInstanceError):
+        parse_inventory.files[0].symbols[0].name = "changed"
+    with pytest.raises(FrozenInstanceError):
+        file_inventory.files[0].relative_path = "changed.py"
+
+    different = cg.pair(cg.parsed(symbols=(cg.symbol("second"),)))
+    second = _build_under_guard(monkeypatch, different)
+
+    assert first.nodes == original_nodes
+    assert first != second
 
 
 @pytest.mark.parametrize(
@@ -173,6 +224,21 @@ def test_all_language_dispatch_paths_use_only_prepared_metadata(
     graph = _build_under_guard(monkeypatch, cg.pair(source, target))
 
     assert len(graph.nodes) >= 3
+    assert any(edge.edge_kind is GraphEdgeKind.IMPORTS for edge in graph.edges) or any(
+        item.reference_kind is ReferenceKind.IMPORT
+        for item in graph.unresolved_references
+    )
+    assert any(edge.edge_kind is GraphEdgeKind.CALLS for edge in graph.edges) or any(
+        item.reference_kind is ReferenceKind.CALL
+        for item in graph.unresolved_references
+    )
+    assert any(
+        edge.edge_kind in {GraphEdgeKind.INHERITS, GraphEdgeKind.IMPLEMENTS}
+        for edge in graph.edges
+    ) or any(
+        item.reference_kind in {ReferenceKind.INHERITS, ReferenceKind.IMPLEMENTS}
+        for item in graph.unresolved_references
+    )
 
 
 def test_ambiguous_import_and_partial_parse_stay_in_memory(cg, monkeypatch):
@@ -300,6 +366,23 @@ def _forbidden_calls(tree, module_name):
         "create_connection",
         "import_module",
         "__import__",
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "remove",
+        "rename",
+        "replace",
+        "mkdir",
+        "makedirs",
+        "rmdir",
+        "removedirs",
+        "touch",
+        "chmod",
+        "symlink",
+        "symlink_to",
+        "link",
+        "hardlink_to",
+        "truncate",
     }
     aliases = {}
     for node in ast.walk(tree):
@@ -332,12 +415,29 @@ def _forbidden_calls(tree, module_name):
             parts = aliases[parts[0]].split(".") + parts[1:]
         resolved_name = ".".join(parts)
         leaf_name = parts[-1] if parts else ""
+        path_replace = False
+        if (
+            leaf_name == "replace"
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Call)
+        ):
+            constructor = node.func.value.func
+            constructor_name = (
+                constructor.id
+                if isinstance(constructor, ast.Name)
+                else ""
+            )
+            if constructor_name in aliases:
+                constructor_name = aliases[constructor_name]
+            path_replace = constructor_name in {"pathlib.Path", "Path"}
         if (
             resolved_name in {"eval", "exec", "builtins.eval", "builtins.exec"}
-            or leaf_name in forbidden_io
+            or (leaf_name in forbidden_io and leaf_name != "replace")
+            or resolved_name == "os.replace"
+            or path_replace
             or resolved_name in unsafe_deserializers
         ):
-            yield resolved_name or leaf_name
+            yield resolved_name or ("pathlib.Path.replace" if path_replace else leaf_name)
 
 
 def _audit_code_graph_sources(root):
@@ -370,6 +470,24 @@ def test_dependency_audit_rejects_forbidden_calls_and_aliased_deserialization():
     calls = tuple(_forbidden_calls(tree, "backend.code_graph.audit"))
 
     assert calls == ("pickle.loads",)
+
+
+def test_dependency_audit_rejects_filesystem_mutation_calls_in_memory():
+    tree = ast.parse(
+        "import os as filesystem\n"
+        "filesystem.unlink('source.py')\n"
+        "filesystem.replace('source.py', 'other.py')\n"
+        "from pathlib import Path as P\n"
+        "P('source.py').write_text('changed')\n"
+        "P('source.py').replace('other.py')\n"
+    )
+
+    calls = tuple(_forbidden_calls(tree, "backend.code_graph.audit"))
+
+    assert "os.unlink" in calls
+    assert "os.replace" in calls
+    assert "write_text" in calls
+    assert "replace" in calls
 
 
 def test_code_graph_sources_stay_within_approved_dependencies_and_apis():
