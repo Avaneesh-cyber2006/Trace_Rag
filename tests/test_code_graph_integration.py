@@ -34,15 +34,19 @@ def _forbid(*args, **kwargs):
 
 
 def _guard_source_reads(guard):
-    """Block every path-based opener while the graph build runs.
+    """Block every filesystem/process/import/network vector after scan/parse.
 
     Scanner and parser have already finished by the time this is applied, so the
-    guard cannot interfere with upstream source reading. It covers all seven
-    vectors Module 6 could plausibly use to reopen a file.
+    guard cannot interfere with upstream source reading. It mirrors Task 15's
+    complete forbidden-API list so a source reread or side effect during graph
+    construction fails the test instead of passing silently.
     """
     import builtins
+    import importlib
     import io
     import os
+    import socket
+    import subprocess
     from pathlib import Path
 
     for owner, name in (
@@ -50,9 +54,42 @@ def _guard_source_reads(guard):
         (io, "open"),
         (os, "open"),
         (os, "scandir"),
+        (os, "remove"),
+        (os, "unlink"),
+        (os, "rename"),
+        (os, "replace"),
+        (os, "mkdir"),
+        (os, "makedirs"),
+        (os, "rmdir"),
+        (os, "removedirs"),
+        (os, "chmod"),
+        (os, "symlink"),
+        (os, "link"),
+        (os, "truncate"),
+        (os, "fdopen"),
+        (os, "listdir"),
         (Path, "open"),
         (Path, "read_text"),
         (Path, "read_bytes"),
+        (Path, "write_text"),
+        (Path, "write_bytes"),
+        (Path, "stat"),
+        (Path, "resolve"),
+        (Path, "iterdir"),
+        (Path, "unlink"),
+        (Path, "rename"),
+        (Path, "replace"),
+        (Path, "mkdir"),
+        (Path, "rmdir"),
+        (Path, "touch"),
+        (Path, "chmod"),
+        (Path, "symlink_to"),
+        (Path, "hardlink_to"),
+        (subprocess, "run"),
+        (subprocess, "Popen"),
+        (importlib, "import_module"),
+        (socket, "socket"),
+        (socket, "create_connection"),
     ):
         guard.setattr(owner, name, _forbid)
 
@@ -306,16 +343,42 @@ def test_ambiguous_real_import_produces_no_edge_and_sorted_candidates(
         for node in graph.nodes
         if node.node_kind is GraphNodeKind.FILE
     }
-    unresolved = [
+    mod_js_file = files_by_path["mod.js"]
+    mod_ts_file = files_by_path["mod.ts"]
+    # There are two eligible helper symbols (one per module file).
+    helper_candidates = tuple(
+        sorted(
+            node.node_id
+            for node in graph.nodes
+            if node.node_kind is GraphNodeKind.SYMBOL
+            and node.qualified_name.endswith("helper")
+        )
+    )
+
+    unresolved = {
         (item.reference_kind, item.raw_target, item.reason, item.candidate_node_ids)
         for item in graph.unresolved_references
-    ]
-    assert (ReferenceKind.IMPORT, "./mod", ResolutionFailureReason.AMBIGUOUS, (
-        tuple(sorted((files_by_path["mod.js"], files_by_path["mod.ts"])))
-    )) in unresolved
+    }
+    expected = {
+        (
+            ReferenceKind.IMPORT,
+            "./mod",
+            ResolutionFailureReason.AMBIGUOUS,
+            tuple(sorted((mod_js_file, mod_ts_file))),
+        ),
+        (
+            ReferenceKind.CALL,
+            "helper",
+            ResolutionFailureReason.AMBIGUOUS,
+            helper_candidates,
+        ),
+    }
+    assert unresolved == expected
+    assert len(graph.unresolved_references) == 2
 
-    # An ambiguous module must never become an edge.
+    # Ambiguity must never become an edge of either kind.
     assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.IMPORTS]
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.CALLS]
     for item in graph.unresolved_references:
         assert item.candidate_node_ids == tuple(sorted(set(item.candidate_node_ids)))
         if item.reason is ResolutionFailureReason.AMBIGUOUS:
@@ -732,10 +795,14 @@ def test_public_entry_points_take_only_two_inventories(tmp_path, monkeypatch):
 )
 def test_public_entry_points_reject_path_and_callback_keywords(tmp_path, keyword):
     """No repository path or source-reading callback may be supplied."""
+    from backend.code_graph import CodeGraphBuilder
+
     _inventory, parsed, _graph = _pipeline_unguarded(tmp_path)
 
     with pytest.raises(TypeError):
         build_code_graph(_inventory, parsed, **{keyword: tmp_path})
+    with pytest.raises(TypeError):
+        CodeGraphBuilder().build(_inventory, parsed, **{keyword: tmp_path})
 
 
 def _pipeline_unguarded(tmp_path):
