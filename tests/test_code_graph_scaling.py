@@ -48,7 +48,9 @@ NAMESPACE = "test-repo"
 #: maps" the approved plan names; ``parent_ids`` is the O(S) ownership map a
 #: scope walk must not reverse-scan; ``java_packages``/``python_modules`` are the
 #: package/wildcard indexes; ``by_file_name``/``children`` are the keyed buckets
-#: that make same-file and nesting lookups O(1).
+#: that make same-file and nesting lookups O(1). The single exception is
+#: ``structural_edges``, which legitimately performs one linear pass over
+#: ``parent_ids``; that pass is asserted explicitly rather than forbidden.
 GLOBAL_MAPS = (
     "nodes_by_id",
     "symbols_by_id",
@@ -60,12 +62,50 @@ GLOBAL_MAPS = (
     "file_ids",
     "java_packages",
     "python_modules",
-    "nodes",
 )
+
+#: The node tuple is a sequence, not a mapping: iterating it must yield GraphNode
+#: objects exactly as production does, so it gets a counting *sequence* wrapper.
+GLOBAL_SEQUENCES = ("nodes",)
+
+
+class CountingSequence:
+    """Wraps a sequence to count iteration while yielding the original items."""
+
+    def __init__(self, source):
+        self.source = source
+        self.counts = Counter()
+
+    def __iter__(self):
+        self.counts["iter"] += 1
+        return iter(self.source)
+
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, item):
+        self.counts["get"] += 1
+        return self.source[item]
+
+
+class _CountingIterator:
+    """Iterator that records each item it yields from a CountingTuple."""
+
+    def __init__(self, source):
+        self._source = source
+        self._iterator = tuple.__iter__(source)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = next(self._iterator)
+        self._source.counts["yield"] += 1
+        return item
 
 
 class CountingTuple(tuple):
-    """A tuple that counts how many times it is iterated or indexed."""
+    """A tuple that counts passes over itself and items yielded from it."""
 
     def __new__(cls, source):
         instance = super().__new__(cls, source)
@@ -74,11 +114,7 @@ class CountingTuple(tuple):
 
     def __iter__(self):
         self.counts["iter"] += 1
-        return super().__iter__()
-
-    def __getitem__(self, item):
-        self.counts["get"] += 1
-        return super().__getitem__(item)
+        return _CountingIterator(self)
 
 
 class CountingMapping(Mapping):
@@ -207,14 +243,31 @@ def inventories(*files):
 
 
 def counted_index(index):
-    """Clone ``index`` with its global maps replaced by counting wrappers."""
+    """Clone ``index`` with its global maps/sequences replaced by counters."""
     clone = copy.copy(index)
     counters = {}
     for name in GLOBAL_MAPS:
         counter = CountingMapping(getattr(index, name))
         object.__setattr__(clone, name, counter)
         counters[name] = counter
+    for name in GLOBAL_SEQUENCES:
+        counter = CountingSequence(getattr(index, name))
+        object.__setattr__(clone, name, counter)
+        counters[name] = counter
     return clone, counters
+
+
+def counted_environment(build):
+    """Build an ImportEnvironment whose raw import records count their reads.
+
+    ``build`` receives the environment and populates ``by_file`` and
+    ``bindings_by_scope_name`` through the public constructor path, so the
+    wrapper can be installed afterwards without touching resolver code.
+    """
+    environment = build()
+    records = CountingMapping(environment.by_file)
+    object.__setattr__(environment, "by_file", records)
+    return environment, records
 
 
 def counted_inputs(inputs):
@@ -350,6 +403,8 @@ def test_unrelated_symbols_do_not_change_per_reference_lookup_cost():
         measurements[unrelated] = _lookups(counters) / len(calls)
         assert _iterations(counters) == 0
 
+    assert _lookups(counters) > 0
+
     assert measurements[0] == measurements[200] == measurements[800]
     assert measurements[800] <= 20
 
@@ -410,11 +465,11 @@ def test_import_environment_is_keyed_by_scope_and_name_not_rebuilt_per_call():
 
     index = build_graph_indexes(validate_inputs(*inventories(source, target)))
     counted, counters = counted_index(index)
-    environment = ImportEnvironment(
-        {"main.py": ((item, resolve_import(counted, source, item)),)}
+    environment, records = counted_environment(
+        lambda: ImportEnvironment(
+            {"main.py": ((item, resolve_import(counted, source, item)),)}
+        )
     )
-    records = CountingMapping(environment.by_file)
-    object.__setattr__(environment, "by_file", records)
 
     for item_call in calls:
         result = resolve_reference(
@@ -512,8 +567,8 @@ def test_structural_edge_pass_count_is_independent_of_symbol_count():
 
 
 def test_index_construction_visits_each_file_and_symbol_a_fixed_number_of_times():
-    """Build-time node visits are a fixed number of linear passes, not F x S."""
-    visits = {}
+    """Build-time reads are a fixed number of linear passes over files and symbols."""
+    by_files = {}
     for file_count in (4, 16, 64):
         files = tuple(
             parsed(
@@ -536,15 +591,42 @@ def test_index_construction_visits_each_file_and_symbol_a_fixed_number_of_times(
         per_file = {
             path: sum(counter.values()) for path, counter in symbol_reads.items()
         }
-        visits[file_count] = (sorted(set(per_file.values())), sum(per_file.values()))
+        by_files[file_count] = (sorted(set(per_file.values())), sum(per_file.values()))
 
-    passes_per_file = {count: value[0] for count, value in visits.items()}
-    assert passes_per_file[4] == passes_per_file[16] == passes_per_file[64]
-    assert len(passes_per_file[4]) == 1
-    # Each file's symbols are read a constant number of times, so total visits
-    # grow linearly with the file count.
-    assert visits[16][1] == 4 * visits[4][1]
-    assert visits[64][1] == 16 * visits[4][1]
+    passes = {count: value[0] for count, value in by_files.items()}
+    assert passes[4] == passes[16] == passes[64]
+    assert len(passes[4]) == 1
+    assert by_files[16][1] == 4 * by_files[4][1]
+    assert by_files[64][1] == 16 * by_files[4][1]
+
+    by_symbols = {}
+    for symbol_count in (1, 4, 16, 64):
+        file = parsed(
+            "one.py",
+            symbols=tuple(
+                symbol(
+                    f"symbol_{position}",
+                    start=position * 20,
+                    end=position * 20 + 10,
+                )
+                for position in range(symbol_count)
+            ),
+        )
+        counted, symbol_reads = counted_inputs(validate_inputs(*inventories(file)))
+
+        index = build_graph_indexes(counted)
+
+        only = next(iter(symbol_reads.values()))
+        by_symbols[symbol_count] = (only["yield"], len(index.nodes))
+
+    # Every symbol must become exactly one SYMBOL node, so node count is the
+    # ground truth the yielded-symbol count has to track. A per-file quadratic
+    # rescan would yield S*S items while the node count stays S+1.
+    for count, (yielded, node_count) in by_symbols.items():
+        assert yielded == count, (count, yielded)
+        assert node_count == count + 1, (count, node_count)
+    assert by_symbols[16][0] == 16 * by_symbols[1][0]
+    assert by_symbols[64][0] == 64 * by_symbols[1][0]
 
 
 def _nested_file(depth, unrelated):
@@ -592,6 +674,8 @@ def test_scope_walk_cost_grows_with_depth_not_with_file_size():
         measurements[filler] = _lookups(counters)
 
         assert _iterations(counters) == 0
+
+    assert _lookups(counters) > 0
 
     assert measurements[0] == measurements[200] == measurements[800]
 
@@ -652,6 +736,24 @@ def _java_wildcard_case(matching, unrelated):
     files = [source]
     for position in range(matching):
         files.append(_java_package_file("wild", f"Part{position}", position))
+    # A non-Java file deliberately carries the same package spelling as the Java
+    # types. Its name and qualified name differ only by that prefix, so every
+    # package-index condition except the language predicate is satisfied; only
+    # that predicate keeps it out, and it can never become a candidate.
+    files.append(
+        parsed(
+            "wild_part.py",
+            symbols=(
+                symbol(
+                    "Python",
+                    kind=SymbolKind.CLASS,
+                    qualified_name="wild.Python",
+                    start=0,
+                    end=10,
+                ),
+            ),
+        )
+    )
     for position in range(unrelated):
         files.append(
             parsed(
@@ -662,6 +764,53 @@ def _java_wildcard_case(matching, unrelated):
             )
         )
     return source, files
+
+
+def test_java_package_index_ignores_non_java_files_in_the_same_package():
+    """Only Java sources may populate the Java package index.
+
+    The Python file carries a ``wild.``-prefixed qualified name and the right
+    symbol kind, so the language predicate is the only thing keeping it out of
+    the package index. Both the membership assertion and the Java wildcard
+    candidate set depend on that predicate holding.
+    """
+    source, files = _java_wildcard_case(matching=2, unrelated=0)
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+
+    python_file = file_node_id(NAMESPACE, "wild_part.py")
+    assert index.java_packages["wild"] == tuple(
+        sorted(file_node_id(NAMESPACE, f"Part{position}.java") for position in range(2))
+    )
+    assert python_file not in index.java_packages["wild"]
+
+    result = resolve_import(index, source, source.imports[0]).resolution
+
+    assert result.reason is ResolutionFailureReason.AMBIGUOUS
+    assert result.candidate_node_ids == index.java_packages["wild"]
+    assert python_file not in result.candidate_node_ids
+
+
+def test_java_package_index_only_accepts_type_declarations():
+    """A non-type Java symbol must not register a package entry."""
+    package_symbol = symbol(
+        "Helper",
+        kind=SymbolKind.FUNCTION,
+        qualified_name="wild.Helper",
+        start=0,
+        end=10,
+    )
+    source = parsed(
+        "Use.java",
+        language=ParsedLanguage.JAVA,
+        imports=(ImportInfo("wild", (), True, (), loc(0, 12)),),
+        symbols=(package_symbol,),
+    )
+    index = build_graph_indexes(validate_inputs(*inventories(source)))
+
+    assert "wild" not in index.java_packages
+    assert resolve_import(
+        index, source, source.imports[0]
+    ).resolution.reason is ResolutionFailureReason.EXTERNAL
 
 
 @pytest.mark.parametrize("matching", [2, 4, 8])
@@ -700,6 +849,8 @@ def test_java_wildcard_resolution_cost_is_independent_of_unrelated_files():
     # The measurement must be provably non-zero, otherwise the equality below
     # would be the vacuous 0 == 0 == 0.
     assert measurements[0] > 0
+    assert _lookups(counters) > 0
+
     assert measurements[0] == measurements[200] == measurements[800]
 
 
@@ -748,6 +899,201 @@ def test_java_wildcard_member_lookup_memo_is_per_build_not_a_global_cache():
 
     assert first.target_node_id == symbol_node_id(NAMESPACE, "first.java", first_base)
     assert second.target_node_id == symbol_node_id(NAMESPACE, "second.java", second_base)
+
+
+def test_java_reference_resolution_never_rescans_import_records(monkeypatch):
+    """Java must reach bindings through bindings_by_scope_name, not by_file."""
+    item = ImportInfo(
+        "p.Base",
+        (ImportBinding("Base", "Base"),),
+        False,
+        (),
+        loc(0, 10),
+    )
+    child = symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        qualified_name="p.Child",
+        base_types=("Base",),
+        start=100,
+        end=400,
+    )
+    source = parsed(
+        "Child.java", language=ParsedLanguage.JAVA, imports=(item,), symbols=(child,)
+    )
+    base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    target = parsed("Base.java", language=ParsedLanguage.JAVA, symbols=(base,))
+    index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+    counted, counters = counted_index(index)
+    environment, records = counted_environment(
+        lambda: ImportEnvironment(
+            {"Child.java": ((item, resolve_import(counted, source, item)),)}
+        )
+    )
+    source_id = counted.by_file_name[("Child.java", "Child")][0]
+    (reference,) = type_references(counted, source, source_id)
+
+    result = resolve_reference(counted, environment, reference)
+
+    assert result.target_node_id is not None
+    assert records.counts["iter"] == 0
+    assert records.counts["get"] == 0
+    assert _iterations(counters) == 0
+    assert _lookups(counters) > 0
+    assert _lookups(counters) <= 40
+
+
+def test_ecmascript_reference_resolution_never_rescans_import_records():
+    """ECMAScript must reach bindings through bindings_by_scope_name too."""
+    item = ImportInfo(
+        "./util.js",
+        (ImportBinding("run", "execute"),),
+        False,
+        (),
+        loc(0, 10),
+    )
+    caller = symbol("main", start=20, end=100)
+    source = parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(caller,),
+        imports=(item,),
+        calls=(CallSite("main", "execute", CallKind.CALL, loc(50, 60)),),
+    )
+    exported = symbol("run", modifiers=("export",), start=0, end=40)
+    target = parsed("util.js", language=ParsedLanguage.JAVASCRIPT, symbols=(exported,))
+    index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+    counted, counters = counted_index(index)
+    environment, records = counted_environment(
+        lambda: ImportEnvironment(
+            {"main.js": ((item, resolve_import(counted, source, item)),)}
+        )
+    )
+
+    result = resolve_reference(
+        counted, environment, call_reference(index, source, source.calls[0])
+    )
+
+    assert result.target_node_id == symbol_node_id(NAMESPACE, "util.js", exported)
+    assert records.counts["iter"] == 0
+    assert records.counts["get"] == 0
+    assert _iterations(counters) == 0
+    assert _lookups(counters) > 0
+    assert _lookups(counters) <= 40
+    assert list(environment.bindings_by_scope_name) == [
+        (file_node_id(NAMESPACE, "main.js"), "execute")
+    ]
+
+
+def test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance():
+    """The memo key must carry the index identity, not just the file and name.
+
+    Two structurally identical repositories produce distinct GraphIndexes
+    instances with identical file ids, paths and wildcard items. If the memo key
+    omitted the index identity, the second build would be served the first
+    build's cached candidates, which is exactly a cross-repository cache leak.
+    """
+    def build():
+        item = ImportInfo("p", (), True, (), loc(0, 10))
+        child = symbol(
+            "Child",
+            kind=SymbolKind.CLASS,
+            qualified_name="q.Child",
+            base_types=("Base",),
+            start=100,
+            end=400,
+        )
+        source = parsed(
+            "Main.java",
+            language=ParsedLanguage.JAVA,
+            imports=(item,),
+            symbols=(child,),
+        )
+        base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+        target = parsed(
+            "base.java", language=ParsedLanguage.JAVA, symbols=(base,)
+        )
+        index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+        environment = ImportEnvironment(
+            {"Main.java": ((item, resolve_import(index, source, item)),)}
+        )
+        source_id = index.by_file_name[("Main.java", "Child")][0]
+        (reference,) = type_references(index, source, source_id)
+        return index, environment, reference
+
+    first_index, first_env, first_ref = build()
+    second_index, second_env, second_ref = build()
+
+    assert first_index is not second_index
+    assert first_index.file_ids == second_index.file_ids
+    assert first_index.file_ids["base.java"] == second_index.file_ids["base.java"]
+
+    original = java_resolver._wildcard_type_candidates
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    java_resolver._wildcard_type_candidates = counted
+    try:
+        first = resolve_reference(first_index, first_env, first_ref)
+        second = resolve_reference(second_index, second_env, second_ref)
+    finally:
+        java_resolver._wildcard_type_candidates = original
+
+    # Two distinct index identities means two cache entries: the second build
+    # cannot be answered from the first build's entry. This holds whether the
+    # memo distinguishes builds by key identity, by the per-build reset, or by
+    # both, so it is a property of the result rather than of one mechanism.
+    assert len(calls) == 2
+    assert first.target_node_id is not None
+    assert second.target_node_id is not None
+
+
+def test_wildcard_memo_does_not_share_entries_across_environments():
+    """A memo held by one environment must never serve another build."""
+    def build():
+        item = ImportInfo("p", (), True, (), loc(0, 10))
+        child = symbol(
+            "Child",
+            kind=SymbolKind.CLASS,
+            qualified_name="q.Child",
+            base_types=("Base",),
+            start=100,
+            end=400,
+        )
+        source = parsed(
+            "Main.java",
+            language=ParsedLanguage.JAVA,
+            imports=(item,),
+            symbols=(child,),
+        )
+        base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+        target = parsed(
+            "base.java", language=ParsedLanguage.JAVA, symbols=(base,)
+        )
+        index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+        environment = ImportEnvironment(
+            {"Main.java": ((item, resolve_import(index, source, item)),)}
+        )
+        source_id = index.by_file_name[("Main.java", "Child")][0]
+        (reference,) = type_references(index, source, source_id)
+        return index, environment, reference
+
+    first_index, first_env, first_ref = build()
+    second_index, second_env, second_ref = build()
+
+    # Resolving through the first environment, then through a separately
+    # constructed one, must reach the candidate factory again. A module-level or
+    # otherwise shared memo would answer the second build from the first entry.
+    first = resolve_reference(first_index, first_env, first_ref)
+    second = resolve_reference(second_index, second_env, second_ref)
+
+    assert first.target_node_id is not None
+    assert second.target_node_id is not None
+    assert first_env._wildcard_memo is not second_env._wildcard_memo
+    assert first_env._wildcard_memo._values != {}
 
 
 def test_java_wildcard_member_lookup_is_computed_once_per_environment(monkeypatch):
