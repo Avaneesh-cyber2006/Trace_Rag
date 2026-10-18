@@ -6,15 +6,26 @@ from dataclasses import FrozenInstanceError
 import importlib
 import io
 import os
+import shutil
 import socket
 import subprocess
 import sys
-from pathlib import Path
+from dataclasses import FrozenInstanceError
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 import pytest
 
 from backend.code_graph import build_code_graph
-from backend.code_graph.models import GraphEdgeKind, ReferenceKind
+from backend.code_graph.identities import file_node_id, symbol_node_id
+from backend.code_graph.models import (
+    CodeGraphInventory,
+    GraphEdgeKind,
+    GraphNode,
+    GraphNodeKind,
+    ReferenceKind,
+    ResolutionFailureReason,
+)
 from backend.code_parser.models import (
     CallKind,
     CallSite,
@@ -50,6 +61,8 @@ def _patch_io(guard):
         (os, "chmod"),
         (os, "symlink"),
         (os, "link"),
+        (os, "truncate"),
+        (os, "fdopen"),
         (Path, "open"),
         (Path, "read_text"),
         (Path, "read_bytes"),
@@ -127,118 +140,498 @@ def test_caller_inputs_are_immutable_and_later_builds_do_not_change_prior_graph(
     assert first != second
 
 
-@pytest.mark.parametrize(
-    "language,path,module,imported",
-    [
-        (ParsedLanguage.PYTHON, "main.py", "pkg.dep", "pkg.dep"),
-        (ParsedLanguage.JAVA, "Main.java", "pkg.Dep", "pkg.Dep"),
-        (ParsedLanguage.JAVASCRIPT, "main.js", "./dep", "./dep"),
-        (ParsedLanguage.TYPESCRIPT, "main.ts", "./dep", "./dep"),
-        (ParsedLanguage.TSX, "main.tsx", "./dep", "./dep"),
-    ],
-)
-def test_all_language_dispatch_paths_use_only_prepared_metadata(
-    cg, monkeypatch, language, path, module, imported
-):
-    is_java = language is ParsedLanguage.JAVA
-    owner_name = "pkg.C" if is_java else "C"
-    caller_name = f"{owner_name}.run" if is_java else "run"
-    owner = cg.symbol(
-        "C",
-        kind=SymbolKind.CLASS,
-        qualified_name=owner_name,
-        base_types=("Base",),
-        implemented_types=("Contract",),
-        start=0,
-        end=100,
-    )
-    caller = cg.symbol(
-        "run",
-        kind=SymbolKind.METHOD if is_java else SymbolKind.FUNCTION,
-        qualified_name=caller_name,
-        parent=owner_name if is_java else None,
-        start=10 if is_java else 0,
-        end=80,
-    )
-    bindings = (
-        (ImportBinding(imported, "dep"),)
-        if language
-        in {
-            ParsedLanguage.PYTHON,
-            ParsedLanguage.JAVASCRIPT,
-            ParsedLanguage.TYPESCRIPT,
-            ParsedLanguage.TSX,
-        }
-        else ()
-    )
-    import_item = ImportInfo(
-        module,
-        bindings,
+def _edge_pairs(graph):
+    return {
+        (edge.edge_kind, edge.source_node_id, edge.target_node_id)
+        for edge in graph.edges
+    }
+
+
+def _unresolved_index(graph):
+    return {
+        (item.reference_kind, item.relative_path, item.raw_target): (
+            item.reason,
+            item.candidate_node_ids,
+            item.source_node_id,
+        )
+        for item in graph.unresolved_references
+    }
+
+
+def _java_file(cg, path, **kwargs):
+    return cg.parsed(path, language=ParsedLanguage.JAVA, **kwargs)
+
+
+def test_python_fixture_resolves_import_call_and_inherits_exactly(cg, monkeypatch):
+    """Python metadata proves an IMPORTS, a CALLS and an INHERITS edge."""
+    item = ImportInfo(
+        "pkg.util",
+        (ImportBinding("run", "execute"),),
         False,
         (),
-        cg.loc(1, 10),
+        cg.loc(20, 45),
     )
-    call_target = "pkg.Dep.execute" if is_java else "dep.execute"
-    call = CallSite(caller_name, call_target, CallKind.CALL, cg.loc(20, 30))
+    caller = cg.symbol("main", start=100, end=300)
+    base = cg.symbol("Base", kind=SymbolKind.CLASS, start=400, end=500)
+    child = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        start=600,
+        end=700,
+        base_types=("Base",),
+    )
+    call = CallSite("main", "execute", CallKind.CALL, cg.loc(150, 160))
     source = cg.parsed(
-        path,
-        language=language,
-        symbols=(owner, caller),
-        imports=(import_item,),
+        "main.py",
+        symbols=(caller, base, child),
+        imports=(item,),
         calls=(call,),
     )
-    target_path = {
-        ParsedLanguage.PYTHON: "dep.py",
-        ParsedLanguage.JAVA: "pkg/Dep.java",
-        ParsedLanguage.JAVASCRIPT: "dep.js",
-        ParsedLanguage.TYPESCRIPT: "dep.ts",
-        ParsedLanguage.TSX: "dep.tsx",
-    }[language]
-    target_symbols = (
-        (
-            cg.symbol(
-                "Dep",
-                kind=SymbolKind.CLASS,
-                qualified_name="pkg.Dep",
-                start=0,
-                end=100,
-            ),
-            cg.symbol(
-                "execute",
-                kind=SymbolKind.METHOD,
-                qualified_name="pkg.Dep.execute",
-                parent="pkg.Dep",
-                start=10,
-                end=80,
-            ),
-        )
-        if is_java
-        else (cg.symbol("execute"),)
+    imported = cg.symbol("run", start=5, end=15)
+    target = cg.parsed("pkg/util.py", symbols=(imported,))
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source, target))
+
+    assert (
+        GraphEdgeKind.IMPORTS,
+        file_node_id("repo", "main.py"),
+        file_node_id("repo", "pkg/util.py"),
+    ) in _edge_pairs(graph)
+    assert (
+        GraphEdgeKind.CALLS,
+        symbol_node_id("repo", "main.py", caller),
+        symbol_node_id("repo", "pkg/util.py", imported),
+    ) in _edge_pairs(graph)
+    assert (
+        GraphEdgeKind.INHERITS,
+        symbol_node_id("repo", "main.py", child),
+        symbol_node_id("repo", "main.py", base),
+    ) in _edge_pairs(graph)
+    assert not [
+        item
+        for item in graph.unresolved_references
+        if item.reference_kind is ReferenceKind.IMPORT
+    ]
+
+
+def test_python_unresolved_reference_reasons_are_exact(cg, monkeypatch):
+    """Python keeps NOT_FOUND and EXTERNAL with their exact evidence."""
+    caller = cg.symbol("main", start=100, end=300)
+    missing_call = CallSite("main", "absent_helper", CallKind.CALL, cg.loc(150, 160))
+    external = ImportInfo("thirdparty", (), False, (), cg.loc(10, 30))
+    source = cg.parsed(
+        "main.py",
+        symbols=(caller,),
+        imports=(external,),
+        calls=(missing_call,),
     )
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source))
+
+    index = _unresolved_index(graph)
+    assert index[ReferenceKind.CALL, "main.py", "absent_helper"] == (
+        ResolutionFailureReason.NOT_FOUND,
+        (),
+        symbol_node_id("repo", "main.py", caller),
+    )
+    assert index[ReferenceKind.IMPORT, "main.py", "thirdparty"] == (
+        ResolutionFailureReason.EXTERNAL,
+        (),
+        file_node_id("repo", "main.py"),
+    )
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.IMPORTS]
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.CALLS]
+
+
+def test_java_fixture_resolves_import_call_inherits_and_implements_exactly(
+    cg, monkeypatch
+):
+    """Java qualified metadata proves all four provable relationship edges."""
+    service = cg.symbol(
+        "Service", kind=SymbolKind.CLASS, qualified_name="p.Service"
+    )
+    imported_file = _java_file(cg, "Service.java", symbols=(service,))
+    item = ImportInfo("p.Service", (), False, (), cg.loc(1, 10))
+
+    owner = cg.symbol("A", kind=SymbolKind.CLASS, qualified_name="p.A", end=500)
+    caller = cg.symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="p.A.run",
+        parent="p.A",
+        start=10,
+        end=90,
+    )
+    target_method = cg.symbol(
+        "m",
+        kind=SymbolKind.METHOD,
+        qualified_name="p.A.m",
+        parent="p.A",
+        start=100,
+        end=150,
+    )
+    call = CallSite("p.A.run", "m", CallKind.CALL, cg.loc(20, 30))
+
+    base = cg.symbol("Base", kind=SymbolKind.CLASS, start=600, end=700)
+    child = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        start=800,
+        end=900,
+        base_types=("Base",),
+    )
+    port = cg.symbol("Port", kind=SymbolKind.INTERFACE, start=1000, end=1100)
+    adapter = cg.symbol(
+        "Adapter",
+        kind=SymbolKind.CLASS,
+        start=1200,
+        end=1300,
+        implemented_types=("Port",),
+    )
+    main = _java_file(
+        cg,
+        "Main.java",
+        symbols=(owner, caller, target_method, base, child, port, adapter),
+        imports=(item,),
+        calls=(call,),
+    )
+
+    graph = _build_under_guard(monkeypatch, cg.pair(main, imported_file))
+
+    pairs = _edge_pairs(graph)
+    assert (
+        GraphEdgeKind.IMPORTS,
+        file_node_id("repo", "Main.java"),
+        file_node_id("repo", "Service.java"),
+    ) in pairs
+    assert (
+        GraphEdgeKind.CALLS,
+        symbol_node_id("repo", "Main.java", caller),
+        symbol_node_id("repo", "Main.java", target_method),
+    ) in pairs
+    assert (
+        GraphEdgeKind.INHERITS,
+        symbol_node_id("repo", "Main.java", child),
+        symbol_node_id("repo", "Main.java", base),
+    ) in pairs
+    assert (
+        GraphEdgeKind.IMPLEMENTS,
+        symbol_node_id("repo", "Main.java", adapter),
+        symbol_node_id("repo", "Main.java", port),
+    ) in pairs
+    assert not graph.unresolved_references
+
+
+def test_java_unresolved_import_reason_is_exact(cg, monkeypatch):
+    """An unanchored Java package import is EXTERNAL, never a fabricated edge."""
+    item = ImportInfo("absent.pkg.Thing", (), False, (), cg.loc(1, 10))
+    main = _java_file(cg, "Main.java", imports=(item,))
+
+    graph = _build_under_guard(monkeypatch, cg.pair(main))
+
+    index = _unresolved_index(graph)
+    assert index[ReferenceKind.IMPORT, "Main.java", "absent.pkg.Thing"] == (
+        ResolutionFailureReason.EXTERNAL,
+        (),
+        file_node_id("repo", "Main.java"),
+    )
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.IMPORTS]
+
+
+@pytest.mark.parametrize(
+    "path,language",
+    [
+        pytest.param("main.js", ParsedLanguage.JAVASCRIPT, id="javascript"),
+        pytest.param("main.jsx", ParsedLanguage.JAVASCRIPT, id="jsx"),
+        pytest.param("main.ts", ParsedLanguage.TYPESCRIPT, id="typescript"),
+        pytest.param("main.tsx", ParsedLanguage.TSX, id="tsx"),
+    ],
+)
+def test_ecmascript_fixture_resolves_import_and_call_exactly(
+    cg, monkeypatch, path, language
+):
+    """ECMAScript relative import plus exported callable proves both edges."""
+    suffix = PurePosixPath(path).suffix
+    item = ImportInfo(
+        f"./util{suffix}",
+        (ImportBinding("run", "execute"),),
+        False,
+        (),
+        cg.loc(0, 15),
+    )
+    caller = cg.symbol("main", start=20, end=100)
+    call = CallSite("main", "execute", CallKind.CALL, cg.loc(50, 60))
+    source = cg.parsed(
+        path, language=language, symbols=(caller,), imports=(item,), calls=(call,)
+    )
+    exported = cg.symbol("run", modifiers=("export",))
     target = cg.parsed(
-        target_path,
-        language=language,
-        symbols=target_symbols,
+        f"util{suffix}", language=language, symbols=(exported,)
     )
 
     graph = _build_under_guard(monkeypatch, cg.pair(source, target))
 
-    assert len(graph.nodes) >= 3
-    assert any(edge.edge_kind is GraphEdgeKind.IMPORTS for edge in graph.edges) or any(
-        item.reference_kind is ReferenceKind.IMPORT
-        for item in graph.unresolved_references
+    pairs = _edge_pairs(graph)
+    assert (
+        GraphEdgeKind.IMPORTS,
+        file_node_id("repo", path),
+        file_node_id("repo", f"util{suffix}"),
+    ) in pairs
+    assert (
+        GraphEdgeKind.CALLS,
+        symbol_node_id("repo", path, caller),
+        symbol_node_id("repo", f"util{suffix}", exported),
+    ) in pairs
+    assert not graph.unresolved_references
+
+
+def test_ecmascript_extends_and_typescript_implements_resolve_exactly(
+    cg, monkeypatch
+):
+    """ECMAScript extends and TypeScript implements both prove typed edges."""
+    base = cg.symbol("Base", kind=SymbolKind.CLASS, start=0, end=50)
+    child = cg.symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        start=60,
+        end=160,
+        base_types=("Base",),
     )
-    assert any(edge.edge_kind is GraphEdgeKind.CALLS for edge in graph.edges) or any(
-        item.reference_kind is ReferenceKind.CALL
-        for item in graph.unresolved_references
+    js_file = cg.parsed("local.js", language=ParsedLanguage.JAVASCRIPT,
+                        symbols=(base, child))
+    js_graph = _build_under_guard(monkeypatch, cg.pair(js_file))
+    assert (
+        GraphEdgeKind.INHERITS,
+        symbol_node_id("repo", "local.js", child),
+        symbol_node_id("repo", "local.js", base),
+    ) in _edge_pairs(js_graph)
+
+    port = cg.symbol("Port", kind=SymbolKind.INTERFACE, start=0, end=50)
+    adapter = cg.symbol(
+        "Adapter",
+        kind=SymbolKind.CLASS,
+        start=60,
+        end=160,
+        implemented_types=("Port",),
     )
-    assert any(
-        edge.edge_kind in {GraphEdgeKind.INHERITS, GraphEdgeKind.IMPLEMENTS}
-        for edge in graph.edges
-    ) or any(
-        item.reference_kind in {ReferenceKind.INHERITS, ReferenceKind.IMPLEMENTS}
-        for item in graph.unresolved_references
+    ts_file = cg.parsed("a.ts", language=ParsedLanguage.TYPESCRIPT,
+                        symbols=(port, adapter))
+    ts_graph = _build_under_guard(monkeypatch, cg.pair(ts_file))
+    assert (
+        GraphEdgeKind.IMPLEMENTS,
+        symbol_node_id("repo", "a.ts", adapter),
+        symbol_node_id("repo", "a.ts", port),
+    ) in _edge_pairs(ts_graph)
+    assert not js_graph.unresolved_references
+    assert not ts_graph.unresolved_references
+
+
+def test_ecmascript_unresolved_reasons_are_exact(cg, monkeypatch):
+    """ECMAScript keeps EXTERNAL and sorted AMBIGUOUS evidence exactly."""
+    external = ImportInfo("lodash", (), False, (), cg.loc(0, 10))
+    ambiguous = ImportInfo("./dep", (), False, (), cg.loc(12, 22))
+    caller = cg.symbol("main", start=20, end=100)
+    source = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        symbols=(caller,),
+        imports=(external, ambiguous),
     )
+    first = cg.parsed("dep.js", language=ParsedLanguage.JAVASCRIPT)
+    second = cg.parsed("dep.ts", language=ParsedLanguage.TYPESCRIPT)
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source, first, second))
+
+    index = _unresolved_index(graph)
+    assert index[ReferenceKind.IMPORT, "main.js", "lodash"] == (
+        ResolutionFailureReason.EXTERNAL,
+        (),
+        file_node_id("repo", "main.js"),
+    )
+    reason, candidates, source_id = index[ReferenceKind.IMPORT, "main.js", "./dep"]
+    assert reason is ResolutionFailureReason.AMBIGUOUS
+    assert candidates == tuple(
+        sorted((file_node_id("repo", "dep.js"), file_node_id("repo", "dep.ts")))
+    )
+    assert source_id == file_node_id("repo", "main.js")
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.IMPORTS]
+
+
+def test_ecmascript_unsupported_alias_is_not_turned_into_an_edge(cg, monkeypatch):
+    """A configured alias form stays UNSUPPORTED rather than becoming a guess."""
+    alias = ImportInfo("@/util", (), False, (), cg.loc(0, 10))
+    source = cg.parsed(
+        "main.ts", language=ParsedLanguage.TYPESCRIPT, imports=(alias,)
+    )
+    target = cg.parsed("util.ts", language=ParsedLanguage.TYPESCRIPT)
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source, target))
+
+    index = _unresolved_index(graph)
+    assert index[ReferenceKind.IMPORT, "main.ts", "@/util"] == (
+        ResolutionFailureReason.UNSUPPORTED,
+        (),
+        file_node_id("repo", "main.ts"),
+    )
+    assert not [edge for edge in graph.edges if edge.edge_kind is GraphEdgeKind.IMPORTS]
+
+
+def _file_node(path, namespace="repo"):
+    return GraphNode(
+        node_id=file_node_id(namespace, path),
+        node_kind=GraphNodeKind.FILE,
+        repository_namespace=namespace,
+        relative_path=path,
+        language=ParsedLanguage.PYTHON,
+        parse_status=ParseStatus.SUCCESS,
+        symbol_kind=None,
+        name=None,
+        qualified_name=None,
+        location=None,
+    )
+
+
+PUBLIC_INDEX_NAMES = (
+    "outgoing_edges",
+    "incoming_edges",
+    "nodes_by_file",
+    "nodes_by_qualified_name",
+)
+
+
+def test_published_inventory_is_frozen_and_slotted(cg, monkeypatch):
+    graph = _build_under_guard(monkeypatch, cg.pair(cg.parsed(symbols=(cg.symbol("run"),))))
+
+    assert graph.__dataclass_params__.frozen
+    assert not hasattr(graph, "__dict__")
+    for name in ("repository_namespace", "nodes", "edges", "unresolved_references"):
+        with pytest.raises(FrozenInstanceError):
+            setattr(graph, name, ())
+
+
+def test_canonical_record_tuples_reject_append_and_replacement(cg, monkeypatch):
+    graph = _build_under_guard(monkeypatch, cg.pair(cg.parsed(symbols=(cg.symbol("run"),))))
+
+    for name in ("nodes", "edges", "unresolved_references"):
+        record = getattr(graph, name)
+        assert type(record) is tuple
+        with pytest.raises(AttributeError):
+            record.append(None)
+        with pytest.raises(TypeError):
+            record[0] = None
+
+
+def test_every_public_index_rejects_mutation_and_hides_its_backing_store(
+    cg, monkeypatch
+):
+    graph = _build_under_guard(monkeypatch, cg.pair(cg.parsed(symbols=(cg.symbol("run"),))))
+
+    for name in PUBLIC_INDEX_NAMES:
+        index = getattr(graph, name)
+        assert isinstance(index, MappingProxyType), name
+        with pytest.raises(TypeError):
+            index["injected"] = ()
+        for mutator in ("pop", "popitem", "clear", "update", "setdefault", "__setitem__"):
+            assert not hasattr(index, mutator), (name, mutator)
+        leaked = [
+            attribute
+            for attribute in dir(index)
+            if attribute in {"source", "_mapping", "_data", "_snapshot", "mapping"}
+        ]
+        assert leaked == [], name
+
+
+def test_published_indexes_do_not_retain_a_caller_owned_mutable_mapping():
+    node = _file_node("a.py")
+    backing = {"a.py": [node]}
+    edges_backing = {file_node_id("repo", "a.py"): []}
+
+    inventory = CodeGraphInventory(
+        repository_namespace="repo",
+        nodes=(node,),
+        edges=(),
+        unresolved_references=(),
+        outgoing_edges=edges_backing,
+        incoming_edges=edges_backing,
+        nodes_by_file=backing,
+        nodes_by_qualified_name={},
+    )
+
+    backing["a.py"].append(_file_node("b.py"))
+    backing["c.py"] = []
+    edges_backing[file_node_id("repo", "a.py")].append("injected")
+
+    assert inventory.nodes_by_file["a.py"] == (node,)
+    assert "c.py" not in inventory.nodes_by_file
+    assert inventory.outgoing_edges[file_node_id("repo", "a.py")] == ()
+
+
+def test_unresolved_candidate_ids_are_immutable_and_sorted_evidence(cg, monkeypatch):
+    source = cg.parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dep", (), False, (), cg.loc(0, 10)),),
+    )
+    first = cg.parsed("dep.js", language=ParsedLanguage.JAVASCRIPT)
+    second = cg.parsed("dep.ts", language=ParsedLanguage.TYPESCRIPT)
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source, first, second))
+
+    (reference,) = [
+        item
+        for item in graph.unresolved_references
+        if item.reference_kind is ReferenceKind.IMPORT
+    ]
+    assert reference.reason is ResolutionFailureReason.AMBIGUOUS
+    assert type(reference.candidate_node_ids) is tuple
+    assert list(reference.candidate_node_ids) == sorted(reference.candidate_node_ids)
+    assert set(reference.candidate_node_ids) == {
+        file_node_id("repo", "dep.js"),
+        file_node_id("repo", "dep.ts"),
+    }
+    with pytest.raises(AttributeError):
+        reference.candidate_node_ids.append("x")
+    with pytest.raises(TypeError):
+        reference.candidate_node_ids[0] = "x"
+    with pytest.raises(FrozenInstanceError):
+        reference.reason = ResolutionFailureReason.NOT_FOUND
+
+
+def test_separate_builds_publish_disjoint_indexes_and_ignore_later_input(
+    cg, monkeypatch
+):
+    first_input = cg.parsed("a.py", symbols=(cg.symbol("alpha"),))
+    second_input = cg.parsed("b.py", symbols=(cg.symbol("beta"),))
+
+    first = _build_under_guard(monkeypatch, cg.pair(first_input))
+    first_nodes = first.nodes
+    first_index = dict(first.nodes_by_file)
+
+    second = _build_under_guard(monkeypatch, cg.pair(second_input))
+
+    for name in PUBLIC_INDEX_NAMES:
+        assert getattr(first, name) is not getattr(second, name), name
+    assert first is not second
+    assert first.nodes == first_nodes
+    assert dict(first.nodes_by_file) == first_index
+    assert first.nodes != second.nodes
+    assert first.nodes_by_qualified_name.get("beta") is None
+
+
+def test_every_symbol_and_file_node_kind_is_published(cg, monkeypatch):
+    """Publication keeps only FILE and SYMBOL nodes under one namespace."""
+    source = cg.parsed(
+        "main.py",
+        symbols=(cg.symbol("run"), cg.symbol("K", kind=SymbolKind.CLASS)),
+    )
+
+    graph = _build_under_guard(monkeypatch, cg.pair(source))
+
+    assert {node.node_kind for node in graph.nodes} == {
+        GraphNodeKind.FILE,
+        GraphNodeKind.SYMBOL,
+    }
+    assert {node.repository_namespace for node in graph.nodes} == {"repo"}
 
 
 def test_ambiguous_import_and_partial_parse_stay_in_memory(cg, monkeypatch):
@@ -383,6 +776,22 @@ def _forbidden_calls(tree, module_name):
         "link",
         "hardlink_to",
         "truncate",
+        "fdopen",
+    }
+    recursive_mutations = {
+        "shutil.rmtree",
+        "shutil.move",
+        "shutil.copy",
+        "shutil.copy2",
+        "shutil.copyfile",
+        "shutil.copymode",
+        "shutil.copystat",
+        "shutil.copytree",
+        "tempfile.mkstemp",
+        "tempfile.mkdtemp",
+        "tempfile.NamedTemporaryFile",
+        "tempfile.TemporaryFile",
+        "tempfile.NamedTemporaryDirectory",
     }
     aliases = {}
     for node in ast.walk(tree):
@@ -434,6 +843,7 @@ def _forbidden_calls(tree, module_name):
             resolved_name in {"eval", "exec", "builtins.eval", "builtins.exec"}
             or (leaf_name in forbidden_io and leaf_name != "replace")
             or resolved_name == "os.replace"
+            or resolved_name in recursive_mutations
             or path_replace
             or resolved_name in unsafe_deserializers
         ):
@@ -488,6 +898,84 @@ def test_dependency_audit_rejects_filesystem_mutation_calls_in_memory():
     assert "os.replace" in calls
     assert "write_text" in calls
     assert "replace" in calls
+
+
+def test_dependency_audit_rejects_file_writing_primitives_in_memory():
+    tree = ast.parse(
+        "import os\n"
+        "os.truncate('source.py', 0)\n"
+        "os.fdopen(3, 'w')\n"
+    )
+
+    calls = tuple(_forbidden_calls(tree, "backend.code_graph.audit"))
+
+    assert "os.truncate" in calls
+    assert "os.fdopen" in calls
+
+
+def test_dependency_audit_rejects_recursive_move_and_copy_helpers_in_memory():
+    tree = ast.parse(
+        "import shutil as fs\n"
+        "fs.rmtree('tree')\n"
+        "fs.move('a', 'b')\n"
+        "fs.copytree('a', 'b')\n"
+        "import tempfile\n"
+        "tempfile.mkstemp()\n"
+        "tempfile.mkdtemp()\n"
+    )
+
+    calls = tuple(_forbidden_calls(tree, "backend.code_graph.audit"))
+
+    assert "shutil.rmtree" in calls
+    assert "shutil.move" in calls
+    assert "shutil.copytree" in calls
+    assert "tempfile.mkstemp" in calls
+    assert "tempfile.mkdtemp" in calls
+
+
+def test_dependency_audit_does_not_flag_harmless_same_named_methods():
+    tree = ast.parse(
+        "values = {'a': 1}\n"
+        "values.copy()\n"
+        "label = 'a-b'\n"
+        "label.replace('-', '_')\n"
+        "pairs = [(1, 2)]\n"
+        "pairs.copy()\n"
+    )
+
+    assert tuple(_forbidden_calls(tree, "backend.code_graph.audit")) == ()
+
+
+def test_recursive_delete_is_blocked_by_the_runtime_guard_under_build(
+    cg, monkeypatch, tmp_path
+):
+    victim = tmp_path / "payload.txt"
+    victim.write_text("untrusted", encoding="utf-8")
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    (directory / "inner.txt").write_text("inner", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="in-memory boundary"):
+        with monkeypatch.context() as guard:
+            _patch_io(guard)
+            shutil.rmtree(directory)
+
+    assert victim.read_text(encoding="utf-8") == "untrusted"
+    assert (directory / "inner.txt").read_text(encoding="utf-8") == "inner"
+
+
+def test_file_descriptor_writers_are_blocked_by_the_runtime_guard(
+    cg, monkeypatch, tmp_path
+):
+    victim = tmp_path / "payload.txt"
+    victim.write_text("abcdef", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="in-memory boundary"):
+        with monkeypatch.context() as guard:
+            _patch_io(guard)
+            os.truncate(victim, 0)
+
+    assert victim.read_text(encoding="utf-8") == "abcdef"
 
 
 def test_code_graph_sources_stay_within_approved_dependencies_and_apis():
