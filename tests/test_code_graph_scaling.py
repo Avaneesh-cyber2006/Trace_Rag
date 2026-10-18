@@ -593,4 +593,3 @@ def test_sensitivity_probe_catches_global_scan_regression():
 
     # The key assertion: if this completes in reasonable time,
     # it proves indexed lookups are being used, not global scans
-
