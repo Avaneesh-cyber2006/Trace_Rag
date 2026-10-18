@@ -33,10 +33,12 @@ class _WildcardMemo:
         key: tuple[object, ...],
         factory: Callable[[], _MemoValue],
     ) -> _MemoValue:
-        # Two independent guards keep a build's memo private to that build:
-        # the per-build reset below, and the caller's index identity inside the
-        # key. Removing either one is caught by
-        # test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance.
+        # Two guards keep a build's memo private to that build: this per-build
+        # reset, and the caller's index identity inside the key. Each is
+        # individually redundant while the other survives, so a mutation
+        # removing only one of them is unobservable by design.
+        # test_java_wildcard_member_lookup_memo_is_per_build_not_a_global_cache
+        # covers their combined removal.
         if self._index is not index:
             self._index = index
             self._values.clear()
@@ -206,13 +208,10 @@ class ImportEnvironment:
         key: tuple[object, ...],
         factory: Callable[[], _MemoValue],
     ) -> _MemoValue:
-        # ``index`` is bound into the key by the caller so that two repositories
-        # with identical paths and wildcard items cannot share an entry. The
-        # per-build reset below is a second, independent guard: if the key ever
-        # lost its index identity, the reset would still prevent a cross-build
-        # leak. test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance
-        # asserts the key carries the identity; dropping the reset is covered by
-        # the same test's two-repository construction.
+        # ``index`` is bound into the key by the caller so two repositories with
+        # identical paths and wildcard items cannot share an entry. The exact
+        # per-build reset is enforced by _WildcardMemo.get_or_compute, which
+        # compares GraphIndexes instances rather than the caller's id().
         return self._wildcard_memo.get_or_compute(index, key, factory)
 
 

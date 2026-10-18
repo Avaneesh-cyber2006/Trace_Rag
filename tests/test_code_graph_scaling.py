@@ -17,7 +17,12 @@ from pathlib import PurePosixPath
 from backend.code_graph import build_code_graph
 from backend.code_graph.identities import file_node_id
 from backend.code_graph.indexes import build_graph_indexes
-from backend.code_graph.models import GraphEdgeKind, ReferenceKind, ResolutionFailureReason
+from backend.code_graph.models import (
+    GraphEdgeKind,
+    GraphNode,
+    ReferenceKind,
+    ResolutionFailureReason,
+)
 import backend.code_graph.resolvers.java as java_resolver
 from backend.code_graph.identities import symbol_node_id
 from backend.code_graph.references import call_reference, type_references
@@ -140,6 +145,50 @@ class CountingMapping(Mapping):
 
     def __len__(self):
         return len(self.source)
+
+
+def test_counting_sequence_yields_the_original_items():
+    """A counting sequence must not change what iterating it produces."""
+    values = ("alpha", "beta", "gamma")
+    counted = CountingSequence(values)
+
+    assert list(counted) == list(values)
+    assert counted.counts["iter"] == 1
+    assert counted.counts["get"] == 0
+    assert len(counted) == 3
+    assert counted[1] == "beta"
+    assert counted.counts["get"] == 1
+    assert list(counted) == list(values)
+    assert counted.counts["iter"] == 2
+
+
+def test_counting_sequence_wraps_graph_nodes_without_changing_them():
+    """Instrumenting the node tuple must yield GraphNode objects, not ids."""
+    file = parsed(
+        "main.py",
+        symbols=(symbol("one", start=0, end=10), symbol("two", start=20, end=30)),
+    )
+    index = build_graph_indexes(validate_inputs(*inventories(file)))
+    counted, _counters = counted_index(index)
+
+    nodes = list(counted.nodes)
+
+    assert len(nodes) == 3
+    assert all(isinstance(node, GraphNode) for node in nodes), nodes
+    assert not any(isinstance(node, str) for node in nodes)
+    assert nodes == list(index.nodes)
+
+
+def test_counting_tuple_counts_passes_and_yielded_items():
+    """The build-time instrument must count both passes and items yielded."""
+    counted = CountingTuple(("a", "b", "c"))
+
+    assert list(counted) == ["a", "b", "c"]
+    assert counted.counts["iter"] == 1
+    assert counted.counts["yield"] == 3
+    assert list(counted) == ["a", "b", "c"]
+    assert counted.counts["iter"] == 2
+    assert counted.counts["yield"] == 6
 
 
 def test_counting_mapping_tracks_accesses():
@@ -344,6 +393,29 @@ def test_index_construction_produces_one_symbol_range_index_per_file():
     assert len(index.file_ids) == 32
     assert len(index.by_file_name) == 32 * 4
 
+    # The key set alone would pass on an empty tree, so each file must also have
+    # a populated interval tree whose leaves resolve back to its own symbols.
+    for path in sorted(index.file_ids):
+        root = index.symbol_ranges_by_file[path].root
+        assert root is not None, path
+        located = _collect_range_ids(root)
+        expected = set(index.by_file_name[(path, name)] for name, _ids in ())
+        assert located == {
+            next(iter(index.by_file_name[(path, f"symbol_{position}")]))
+            for position in range(4)
+        }, path
+
+
+def _collect_range_ids(root):
+    """Every node id reachable in a symbol range interval tree."""
+    if root is None:
+        return set()
+    found = {root.node_id}
+    for child in (root.left, root.right):
+        if child is not None:
+            found |= _collect_range_ids(child)
+    return found
+
 
 # --------------------------------------------------------------------------
 # the core structural guarantee: no O(R x S) global scan
@@ -383,7 +455,8 @@ def test_reference_resolution_never_iterates_a_global_map():
         resolve_reference(counted, environment, call_reference(index, file, item))
 
     assert _iterations(counters) == 0
-    assert _lookups(counters) <= 20 * len(calls)
+    assert _lookups(counters) > 0
+    assert _lookups(counters) <= 15 * len(calls)
 
 
 def test_unrelated_symbols_do_not_change_per_reference_lookup_cost():
@@ -477,12 +550,13 @@ def test_import_environment_is_keyed_by_scope_and_name_not_rebuilt_per_call():
         )
         assert result.target_node_id is not None
 
+    assert _lookups(counters) > 0
     assert _iterations(counters) == 0
     # The raw import records are never touched at all once bindings are indexed:
     # resolution reaches every binding through bindings_by_scope_name.
     assert records.counts["iter"] == 0
     assert records.counts["get"] == 0
-    assert _lookups(counters) <= 20 * len(calls)
+    assert _lookups(counters) <= 15 * len(calls)
     assert list(environment.bindings_by_scope_name) == [
         (file_node_id(NAMESPACE, "main.py"), "execute")
     ]
@@ -1049,6 +1123,82 @@ def test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance():
     assert len(calls) == 2
     assert first.target_node_id is not None
     assert second.target_node_id is not None
+
+
+def test_static_wildcard_memo_does_not_leak_across_graph_indexes():
+    """The static-call wildcard memo must also be private to its build.
+
+    ``_wildcard_static_call_resolution`` constructs a second memo key
+    independently of the type-name path. Two structurally identical
+    repositories must each recompute, otherwise the second build would be
+    answered from the first build's entry.
+    """
+    static = ImportInfo("p.Tools", (), True, ("static",), loc(0, 14))
+    owner = symbol(
+        "Main", kind=SymbolKind.CLASS, qualified_name="q.Main",
+        start=100, end=400,
+    )
+    caller = symbol(
+        "run",
+        kind=SymbolKind.METHOD,
+        qualified_name="q.Main.run",
+        parent="q.Main",
+        start=120,
+        end=200,
+    )
+    call = CallSite("q.Main.run", "work", CallKind.CALL, loc(130, 140))
+    source = parsed(
+        "Main.java",
+        language=ParsedLanguage.JAVA,
+        imports=(static,),
+        symbols=(owner, caller),
+        calls=(call,),
+    )
+    tools = symbol(
+        "Tools", kind=SymbolKind.CLASS, qualified_name="p.Tools", end=300
+    )
+    worker = symbol(
+        "work",
+        kind=SymbolKind.METHOD,
+        qualified_name="p.Tools.work",
+        parent="p.Tools",
+        modifiers=("static",),
+        start=20,
+        end=80,
+    )
+
+    def index_with(with_worker):
+        target = parsed(
+            "Tools.java",
+            language=ParsedLanguage.JAVA,
+            symbols=(tools, worker) if with_worker else (tools,),
+        )
+        return build_graph_indexes(validate_inputs(*inventories(source, target)))
+
+    first_index = index_with(True)
+    second_index = index_with(False)
+
+    # Identical package, paths, file ids and wildcard items across both builds.
+    assert first_index.file_ids == second_index.file_ids
+
+    # One environment reused across both builds is the leak scenario: a memo
+    # entry created for the first build would otherwise answer the second.
+    environment = ImportEnvironment(
+        {"Main.java": ((static, resolve_import(first_index, source, static)),)}
+    )
+    first = resolve_reference(
+        first_index, environment, call_reference(first_index, source, call)
+    )
+    second = resolve_reference(
+        second_index, environment, call_reference(second_index, source, call)
+    )
+
+    assert first.target_node_id == symbol_node_id(NAMESPACE, "Tools.java", worker)
+    # The second repository genuinely has no such member, so it must stay
+    # unresolved rather than being answered from the first build's entry.
+    assert second.target_node_id is None
+    assert second.reason is ResolutionFailureReason.NOT_FOUND
+    assert second.candidate_node_ids == ()
 
 
 def test_wildcard_memo_does_not_share_entries_across_environments():
