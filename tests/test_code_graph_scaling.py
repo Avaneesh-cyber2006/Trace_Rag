@@ -18,7 +18,9 @@ from backend.code_graph import build_code_graph
 from backend.code_graph.identities import file_node_id
 from backend.code_graph.indexes import build_graph_indexes
 from backend.code_graph.models import GraphEdgeKind, ReferenceKind, ResolutionFailureReason
-from backend.code_graph.references import call_reference
+import backend.code_graph.resolvers.java as java_resolver
+from backend.code_graph.identities import symbol_node_id
+from backend.code_graph.references import call_reference, type_references
 from backend.code_graph.resolvers import resolve_import, resolve_reference
 from backend.code_graph.resolvers.base import ImportEnvironment
 from backend.code_graph.structure import structural_edges
@@ -42,8 +44,41 @@ NAMESPACE = "test-repo"
 
 #: Maps whose size grows with the whole repository. A resolver that iterates one
 #: of these per reference is O(R x S); a resolver that only does keyed lookups
-#: never iterates them.
-GLOBAL_MAPS = ("nodes_by_id", "symbols_by_id", "by_qualified_name", "nodes")
+#: never iterates them. ``files_by_path`` and ``file_ids`` are the literal "file
+#: maps" the approved plan names; ``parent_ids`` is the O(S) ownership map a
+#: scope walk must not reverse-scan; ``java_packages``/``python_modules`` are the
+#: package/wildcard indexes; ``by_file_name``/``children`` are the keyed buckets
+#: that make same-file and nesting lookups O(1).
+GLOBAL_MAPS = (
+    "nodes_by_id",
+    "symbols_by_id",
+    "by_qualified_name",
+    "by_file_name",
+    "parent_ids",
+    "children",
+    "files_by_path",
+    "file_ids",
+    "java_packages",
+    "python_modules",
+    "nodes",
+)
+
+
+class CountingTuple(tuple):
+    """A tuple that counts how many times it is iterated or indexed."""
+
+    def __new__(cls, source):
+        instance = super().__new__(cls, source)
+        instance.counts = Counter()
+        return instance
+
+    def __iter__(self):
+        self.counts["iter"] += 1
+        return super().__iter__()
+
+    def __getitem__(self, item):
+        self.counts["get"] += 1
+        return super().__getitem__(item)
 
 
 class CountingMapping(Mapping):
@@ -180,6 +215,21 @@ def counted_index(index):
         object.__setattr__(clone, name, counter)
         counters[name] = counter
     return clone, counters
+
+
+def counted_inputs(inputs):
+    """Return validated inputs whose per-file collections count their reads."""
+    counted = copy.copy(inputs)
+    pairs = []
+    symbol_reads = Counter()
+    for scanned, parsed in inputs.pairs:
+        clone = copy.copy(parsed)
+        symbols = CountingTuple(parsed.symbols)
+        object.__setattr__(clone, "symbols", symbols)
+        symbol_reads[parsed.relative_path] = symbols.counts
+        pairs.append((scanned, clone))
+    object.__setattr__(counted, "pairs", tuple(pairs))
+    return counted, symbol_reads
 
 
 def _iterations(counters):
@@ -363,6 +413,8 @@ def test_import_environment_is_keyed_by_scope_and_name_not_rebuilt_per_call():
     environment = ImportEnvironment(
         {"main.py": ((item, resolve_import(counted, source, item)),)}
     )
+    records = CountingMapping(environment.by_file)
+    object.__setattr__(environment, "by_file", records)
 
     for item_call in calls:
         result = resolve_reference(
@@ -371,6 +423,10 @@ def test_import_environment_is_keyed_by_scope_and_name_not_rebuilt_per_call():
         assert result.target_node_id is not None
 
     assert _iterations(counters) == 0
+    # The raw import records are never touched at all once bindings are indexed:
+    # resolution reaches every binding through bindings_by_scope_name.
+    assert records.counts["iter"] == 0
+    assert records.counts["get"] == 0
     assert _lookups(counters) <= 20 * len(calls)
     assert list(environment.bindings_by_scope_name) == [
         (file_node_id(NAMESPACE, "main.py"), "execute")
@@ -428,7 +484,67 @@ def test_structural_edges_are_driven_by_precomputed_parent_ids():
 
     contains = [edge for edge in edges if edge.edge_kind is GraphEdgeKind.CONTAINS]
     assert len(contains) == 1
-    assert _iterations(counters) == 0
+    # The single permitted linear pass is over the precomputed parent map; the
+    # node tuple and every other repository-sized map must stay untouched.
+    assert counters["parent_ids"].counts["iter"] == 1
+    assert _iterations({k: v for k, v in counters.items() if k != "parent_ids"}) == 0
+
+
+def test_structural_edge_pass_count_is_independent_of_symbol_count():
+    """Doubling the symbol count must not add structural-edge passes."""
+    passes = {}
+    for count in (4, 16, 64):
+        file = parsed(
+            "flat.py",
+            symbols=tuple(
+                symbol(f"function_{index}", start=index * 20, end=index * 20 + 10)
+                for index in range(count)
+            ),
+        )
+        index = build_graph_indexes(validate_inputs(*inventories(file)))
+        counted, counters = counted_index(index)
+
+        structural_edges(counted)
+
+        passes[count] = counters["parent_ids"].counts["iter"]
+
+    assert passes[4] == passes[16] == passes[64] == 1
+
+
+def test_index_construction_visits_each_file_and_symbol_a_fixed_number_of_times():
+    """Build-time node visits are a fixed number of linear passes, not F x S."""
+    visits = {}
+    for file_count in (4, 16, 64):
+        files = tuple(
+            parsed(
+                f"file_{index}.py",
+                symbols=tuple(
+                    symbol(
+                        f"symbol_{position}",
+                        start=position * 20,
+                        end=position * 20 + 10,
+                    )
+                    for position in range(4)
+                ),
+            )
+            for index in range(file_count)
+        )
+        counted, symbol_reads = counted_inputs(validate_inputs(*inventories(*files)))
+
+        build_graph_indexes(counted)
+
+        per_file = {
+            path: sum(counter.values()) for path, counter in symbol_reads.items()
+        }
+        visits[file_count] = (sorted(set(per_file.values())), sum(per_file.values()))
+
+    passes_per_file = {count: value[0] for count, value in visits.items()}
+    assert passes_per_file[4] == passes_per_file[16] == passes_per_file[64]
+    assert len(passes_per_file[4]) == 1
+    # Each file's symbols are read a constant number of times, so total visits
+    # grow linearly with the file count.
+    assert visits[16][1] == 4 * visits[4][1]
+    assert visits[64][1] == 16 * visits[4][1]
 
 
 def _nested_file(depth, unrelated):
@@ -549,7 +665,7 @@ def _java_wildcard_case(matching, unrelated):
 
 
 @pytest.mark.parametrize("matching", [2, 4, 8])
-def test_java_wildcard_candidates_track_matching_files_only(matching):
+def test_java_wildcard_candidates_are_exactly_the_matching_package_files(matching):
     """Wildcard candidate set is exactly the matching package files."""
     source, files = _java_wildcard_case(matching, unrelated=200)
     index = build_graph_indexes(validate_inputs(*inventories(*files)))
@@ -557,8 +673,13 @@ def test_java_wildcard_candidates_track_matching_files_only(matching):
     result = resolve_import(index, source, source.imports[0]).resolution
 
     assert result.reason is ResolutionFailureReason.AMBIGUOUS
-    assert len(result.candidate_node_ids) == matching
-    assert result.candidate_node_ids == tuple(sorted(result.candidate_node_ids))
+    expected = tuple(
+        sorted(
+            file_node_id(NAMESPACE, f"Part{position}.java")
+            for position in range(matching)
+        )
+    )
+    assert result.candidate_node_ids == expected
 
 
 def test_java_wildcard_resolution_cost_is_independent_of_unrelated_files():
@@ -568,35 +689,104 @@ def test_java_wildcard_resolution_cost_is_independent_of_unrelated_files():
         source, files = _java_wildcard_case(matching=4, unrelated=unrelated)
         index = build_graph_indexes(validate_inputs(*inventories(*files)))
         counted, counters = counted_index(index)
+        item = source.imports[0]
 
         for _ in range(5):
-            resolve_import(counted, source, source.imports[0])
+            resolve_import(counted, source, item)
 
+        assert _iterations(counters) == 0, unrelated
         measurements[unrelated] = _lookups(counters)
 
+    # The measurement must be provably non-zero, otherwise the equality below
+    # would be the vacuous 0 == 0 == 0.
+    assert measurements[0] > 0
     assert measurements[0] == measurements[200] == measurements[800]
 
 
-def test_java_wildcard_memo_is_per_build_and_not_a_global_cache():
-    """The wildcard memo must not survive across GraphIndexes instances."""
-    source, files = _java_wildcard_case(matching=4, unrelated=0)
-    first_index = build_graph_indexes(validate_inputs(*inventories(*files)))
-    environment = ImportEnvironment({"Use.java": ()})
-    item = source.imports[0]
+def test_java_wildcard_member_lookup_memo_is_per_build_not_a_global_cache():
+    """The wildcard member memo must not survive across GraphIndexes instances."""
+    item = ImportInfo("p", (), True, (), loc(0, 10))
+    child = symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        qualified_name="q.Child",
+        base_types=("Base",),
+        start=100,
+        end=400,
+    )
+    source = parsed(
+        "Main.java",
+        language=ParsedLanguage.JAVA,
+        imports=(item,),
+        symbols=(child,),
+    )
+    first_base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    first_target = parsed(
+        "first.java",
+        language=ParsedLanguage.JAVA,
+        symbols=(first_base,),
+    )
+    first_index = build_graph_indexes(validate_inputs(*inventories(source, first_target)))
+    environment = ImportEnvironment(
+        {"Main.java": ((item, resolve_import(first_index, source, item)),)}
+    )
+    source_id = first_index.by_file_name[("Main.java", "Child")][0]
+    (reference,) = type_references(first_index, source, source_id)
 
-    first = resolve_import(first_index, source, item).resolution
-    second = resolve_import(first_index, source, item).resolution
+    first = resolve_reference(first_index, environment, reference)
 
-    smaller_files = [files[0], *files[1:3]]
-    smaller_index = build_graph_indexes(validate_inputs(*inventories(*smaller_files)))
-    third = resolve_import(smaller_index, source, item).resolution
+    second_base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    second_target = parsed(
+        "second.java",
+        language=ParsedLanguage.JAVA,
+        symbols=(second_base,),
+    )
+    second_index = build_graph_indexes(
+        validate_inputs(*inventories(source, second_target))
+    )
+    second = resolve_reference(second_index, environment, reference)
 
-    assert first.reason is ResolutionFailureReason.AMBIGUOUS
-    assert second == first
-    assert len(first.candidate_node_ids) == 4
-    assert third.reason is ResolutionFailureReason.AMBIGUOUS
-    assert len(third.candidate_node_ids) == 2
-    assert environment.wildcards_by_file == {}
+    assert first.target_node_id == symbol_node_id(NAMESPACE, "first.java", first_base)
+    assert second.target_node_id == symbol_node_id(NAMESPACE, "second.java", second_base)
+
+
+def test_java_wildcard_member_lookup_is_computed_once_per_environment(monkeypatch):
+    """Repeated identical wildcard member lookups must be memoized."""
+    item = ImportInfo("p", (), True, (), loc(0, 10))
+    child = symbol(
+        "Child",
+        kind=SymbolKind.CLASS,
+        qualified_name="q.Child",
+        base_types=("Base",),
+        start=100,
+        end=400,
+    )
+    source = parsed(
+        "Main.java",
+        language=ParsedLanguage.JAVA,
+        imports=(item,),
+        symbols=(child,),
+    )
+    base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
+    target = parsed("base.java", language=ParsedLanguage.JAVA, symbols=(base,))
+    index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+    environment = ImportEnvironment(
+        {"Main.java": ((item, resolve_import(index, source, item)),)}
+    )
+    source_id = index.by_file_name[("Main.java", "Child")][0]
+    (reference,) = type_references(index, source, source_id)
+    original = java_resolver._wildcard_type_candidates
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(java_resolver, "_wildcard_type_candidates", counted)
+
+    assert resolve_reference(index, environment, reference).target_node_id is not None
+    assert resolve_reference(index, environment, reference).target_node_id is not None
+    assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------
@@ -622,8 +812,8 @@ def _ecmascript_all_eight_paths():
     return source, files
 
 
-def test_ecmascript_extensionless_import_keeps_all_eight_bounded_candidates():
-    """./dep and ./dir must each yield four extension candidates, unmerged."""
+def test_ecmascript_extensionless_import_keeps_four_direct_file_candidates():
+    """./dep must yield the four supported extensions, unmerged and unranked."""
     source, files = _ecmascript_all_eight_paths()
     index = build_graph_indexes(validate_inputs(*inventories(*files)))
 
@@ -637,7 +827,6 @@ def test_ecmascript_extensionless_import_keeps_all_eight_bounded_candidates():
         )
     )
     assert direct.candidate_node_ids == expected
-    assert len(direct.candidate_node_ids) == 4
 
 
 def test_ecmascript_directory_index_paths_are_the_other_four_candidates():
@@ -670,6 +859,40 @@ def test_ecmascript_directory_index_paths_are_the_other_four_candidates():
     assert result.candidate_node_ids == expected
 
 
+def test_ecmascript_all_eight_candidate_paths_are_bounded():
+    """The approved plan's eight paths: four direct files plus four index files."""
+    direct_source = parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dep", (), False, (), loc(0, 8)),),
+    )
+    index_source = parsed(
+        "second.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dir", (), False, (), loc(0, 8)),),
+    )
+    files = []
+    for suffix, language in (
+        (".js", ParsedLanguage.JAVASCRIPT),
+        (".jsx", ParsedLanguage.JAVASCRIPT),
+        (".ts", ParsedLanguage.TYPESCRIPT),
+        (".tsx", ParsedLanguage.TSX),
+    ):
+        files.append(parsed(f"dep{suffix}", language=language))
+        files.append(parsed(f"dir/index{suffix}", language=language))
+    index = build_graph_indexes(
+        validate_inputs(*inventories(direct_source, index_source, *files))
+    )
+
+    direct = resolve_import(index, direct_source, direct_source.imports[0]).resolution
+    through_index = resolve_import(
+        index, index_source, index_source.imports[0]
+    ).resolution
+
+    assert len(direct.candidate_node_ids) + len(through_index.candidate_node_ids) == 8
+    assert set(direct.candidate_node_ids).isdisjoint(through_index.candidate_node_ids)
+
+
 def test_ecmascript_explicit_extension_selects_only_the_exact_file():
     """An explicit supported extension is a single candidate, not a scan."""
     source = parsed(
@@ -692,7 +915,7 @@ def test_ecmascript_explicit_extension_selects_only_the_exact_file():
 
 
 def test_ecmascript_candidate_resolution_never_scans_the_file_map():
-    """Resolving the eight candidate paths must not iterate a global map."""
+    """Resolving the eight candidate paths must not iterate the file maps."""
     source, files = _ecmascript_all_eight_paths()
     index = build_graph_indexes(validate_inputs(*inventories(*files)))
     counted, counters = counted_index(index)
@@ -701,7 +924,14 @@ def test_ecmascript_candidate_resolution_never_scans_the_file_map():
     for _ in range(10):
         resolve_import(counted, source, item)
 
+    assert counters["files_by_path"].counts["iter"] == 0
+    assert counters["file_ids"].counts["iter"] == 0
+    assert counters["nodes"].counts["iter"] == 0
     assert _iterations(counters) == 0
+    # The probe must actually touch the file maps by key, so the assertions
+    # above are not vacuously satisfied by an uninstrumented path.
+    assert counters["file_ids"].counts["get"] > 0
+    assert counters["file_ids"].counts["get"] <= 16 * 10
 
 
 # --------------------------------------------------------------------------
@@ -757,8 +987,8 @@ def test_repeated_ambiguity_sites_emit_exactly_r_times_k_candidates():
     ]
 
 
-def test_ambiguity_candidate_sets_are_disjoint_across_sites_but_stable():
-    """Distinct sites may share a candidate set; each set stays sorted."""
+def test_ambiguity_candidate_sets_are_identical_across_sites_and_sorted():
+    """Distinct sites share one candidate set; each set stays sorted and unique."""
     symbols = [symbol("caller", start=0, end=400)]
     for position in range(4):
         start = 1000 + position * 20
