@@ -140,7 +140,9 @@ Rules:
 - Constructor arguments are validated: `command_timeout_seconds` must be > 0,
   `max_output_bytes` must be > 0, `git_executable` must be a nonempty string;
   invalid values raise `GitConfigurationError`. `max_commits`, when not `None`,
-  must be a positive integer.
+  must be a positive integer. The internal 100,000-commit hard cap also uses the
+  N+1 lookahead (request 100,001; truncate if exceeded), so a repository with
+  exactly 100,000 commits is not falsely marked truncated.
 - `repository_path` must resolve to an existing directory containing a valid
   Git repository (worktree or bare). If it does not, raise `GitRepositoryError`
   (or a subclass).
@@ -163,9 +165,11 @@ Rules:
   way to request "all".
 - `path_filter` is a sequence of repository-relative POSIX paths. Each is
   validated: nonempty, no NUL, no backslash, forward slashes only, no leading
-  slash, no `.` or `..` component, no empty component. It restricts commits and
-  changes to those touching at least one listed path. Duplicate entries are
-  deduplicated and sorted for scope storage.
+  slash, no `.` or `..` component, no empty component. It restricts COMMIT
+  SELECTION to commits touching at least one listed path. Every selected
+  commit retains its full first-parent file-change set (changes are not
+  filtered). Duplicate entries are deduplicated and sorted for scope storage.
+  `PATH_FILTER_APPLIED` is recorded in `incomplete_reasons`.
 - `file_inventory`, when provided, supplies `repository_namespace` (if
   `repository_namespace` is `None`) and may validate that its `repository_path`
   resolves to the same root as `repository_path`. Changed paths are not required
@@ -222,6 +226,9 @@ class GitErrorCode(str, Enum):
     INVENTORY_MISMATCH = "inventory_mismatch"
 ```
 
+`GitErrorCode` is reserved for future association with the exception
+hierarchy; v1 classifies errors by exception class (see 4.6).
+
 ### 4.2 GitCommit
 
 ```python
@@ -251,8 +258,13 @@ Invariants:
   object has `parent` lines is not root and records `PARENT_UNAVAILABLE`.
 - `is_merge == (len(parent_ids) > 1)`.
 - `is_root == (len(parent_ids) == 0)`.
-- Timestamps are non-negative integers.
-- `author_timezone`/`committer_timezone` match `^[+-]\d{2}:\d{2}$`.
+- Timestamps are integers (Git may record pre-1970 commits with negative
+  epoch values; these are accepted and preserved).
+- `author_timezone`/`committer_timezone` match `^[+-]\d{2}:\d{2}$`. Raw Git
+  timezone offsets (Git writes `±HHMM`) are normalized to `±HH:MM`. A
+  missing author/committer header records `MISSING_METADATA` with
+  `author_timezone`/`committer_timezone` set to `+00:00` and timestamps
+  set to 0.
 - `message` is `None` only when messages were suppressed; otherwise a string
   (possibly empty).
 
@@ -314,12 +326,14 @@ class GitHistoryInventory:
     changes_by_path: Mapping[str, tuple[GitFileChange, ...]]
     commits_touching_path: Mapping[str, tuple[str, ...]]
     co_changed_paths: Mapping[str, tuple[str, ...]]
+    co_change_incomplete_paths: tuple[str, ...]
     history_is_complete: bool
     incomplete_reasons: tuple[GitIncompleteReason, ...]
     commit_count: int
     change_count: int
     truncated_by_limit: bool
     shallow_boundary_commit_ids: tuple[str, ...]
+    commits_with_unavailable_baseline: tuple[str, ...]
     detached_head: bool
     git_version: str | None
 ```
@@ -333,6 +347,12 @@ Invariants:
 - Indexes are `MappingProxyType` snapshots built in `__post_init__` from copied
   backing dictionaries; no caller can mutate the published mappings or their
   backing stores. Tuple fields are validated as tuples.
+- `commits_with_unavailable_baseline` lists commit IDs for which no first-parent
+  tree could be resolved (shallow boundary or otherwise unavailable parent).
+  For those commits, `changes_by_commit` is empty and no file-change records
+  are fabricated. This distinguishes missing historical change evidence from a
+  genuinely unchanged commit (which also has an empty change list but is not
+  in this tuple).
 - `detached_head` records whether `HEAD` was detached at analysis time. It is
   repository state, not a history-completeness signal, and does not by itself
   make `history_is_complete` false.
@@ -344,14 +364,23 @@ Invariants:
   (`old_path` of a `COPIED` change) is lineage evidence and is NOT counted as
   touched by that commit. A commit touching one path contributes no co-change
   entries for that path.
-- `commits_touching_path[path]` includes a commit only when `path` is
-  genuinely touched by that commit (same rule as above). A copy source path is
-  not added to `commits_touching_path` by a copy commit.
+- `commits_touching_path[path]` contains sorted unique commit IDs; it
+  includes a commit only when `path` is genuinely touched by that commit
+  (same rule as above). A copy source path is not added to
+  `commits_touching_path` by a copy commit.
 - `changes_by_path` keys include both `old_path` and `new_path` where present,
   including copy sources, so callers can look up all changes referencing a
   path. This is a lookup convenience and does not imply the path was touched.
-- `commits_touching_path[path]` contains sorted unique commit IDs.
-- `changes_by_path` keys include both `old_path` and `new_path` where present.
+- `co_change_incomplete_paths` is a sorted tuple of paths whose co-change
+  partners may have been omitted because the global co-change pair budget was
+  exhausted. A path absent from this tuple has complete co-change coverage (its
+  partner list is authoritative, including an empty tuple meaning no partners
+  observed). A path present in this tuple must NOT be interpreted as having
+  no partners; its `co_changed_paths` entry (if present) is partial. A
+  missing `co_changed_paths` key combined with absence from
+  `co_change_incomplete_paths` is complete absence (never touched in the
+  selected history); a missing key for a path IN this tuple is omitted
+  evidence, not proof of absence.
 - `history_is_complete` is `True` only when `incomplete_reasons` is empty.
 
 ### 4.6 Exceptions
@@ -425,9 +454,9 @@ Allowed Git commands (read-only, local only):
 - `git --version`
 - `git rev-parse --is-inside-work-tree` / `--is-bare-repository`
 - `git rev-parse --is-shallow-repository`
-- `git rev-parse --git-dir`
-- `git rev-parse --verify --end-of-options <rev>^{commit}`
-- `git symbolic-ref --quiet HEAD` (for detached-HEAD detection)
+- `git rev-parse --git-dir` / `--git-common-dir`
+- `git rev-parse --verify --end-of-options <rev>^{commit}` / `<rev>^{tree}`
+- `git symbolic-ref --quiet <revision>` (for detached-HEAD detection)
 - `git rev-list ...`
 - `git cat-file --batch` (optional, for commit metadata)
 - `git diff-tree ...`
@@ -452,6 +481,7 @@ Invocation rules:
   `GIT_CONFIG_NOSYSTEM=1`, `GIT_ATTR_NOSYSTEM=1`,
   `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `PAGER=cat`,
   `GIT_EXTERNAL_DIFF=`, `GIT_NO_LAZY_FETCH=1`,
+  `GIT_NO_REPLACE_OBJECTS=1`,
   `GIT_CONFIG_GLOBAL=<empty file in temp dir>`. All inherited `GIT_*`
   variables (including `GIT_TRACE*`, `GIT_DIR`, `GIT_WORK_TREE`,
   `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
@@ -494,7 +524,9 @@ not truncated.
 - `--reverse` yields oldest-first; the inventory reverses to newest-first
   for output.
 - `--max-count` is set to `max_commits + 1` for an exact boundary check, not
-  `max_commits`.
+  `max_commits`. When `max_commits` is `None`, the effective limit is the
+  internal 100,000 cap and the request uses 100,001 for the same exact
+  boundary check.
 - `include_merges=False` adds `--no-merges`. The resulting inventory is NOT
   full history; `MERGES_EXCLUDED` is added to `incomplete_reasons`.
 - Path filter: each validated path is passed as a literal pathspec
@@ -503,8 +535,10 @@ not truncated.
   `changes` list of each selected commit is NOT filtered: it contains every
   file change in that commit. `PATH_FILTER_APPLIED` is added to
   `incomplete_reasons` to record that commit selection was restricted. This
-  preserves co-change evidence for selected commits without falsely claiming
-  unrelated changes were filtered out.
+  preserves all actual co-change evidence for selected commits (still subject
+  to the global co-change pair budget in 14, reported separately via
+  `CO_CHANGE_LIMIT_EXCEEDED`) without falsely claiming unrelated changes were
+  filtered out.
 - Shallow boundary detected via `git rev-parse --is-shallow-repository`. When
   true, shallow boundary commit IDs are read from the `shallow` file in the
   directory reported by `git rev-parse --git-common-dir` (one object ID per
@@ -581,14 +615,18 @@ because the latter silently omits merge commits and can mix parents.
 
 Commands:
 
-1. Resolve trees:
+1. Resolve trees (a single `git rev-parse` invocation accepts both
+   revision arguments, so a non-root commit needs only one resolution
+   command):
    - commit tree: `git rev-parse --verify --end-of-options <commit>^{tree}`
    - first-parent tree (non-root): `git rev-parse --verify --end-of-options <commit>^1^{tree}`
    - root baseline: the well-known empty tree ID
      (`4b825dc642cb6eb9a060e54bf8d69288fbee4904` for SHA-1;
      `6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321`
-     for SHA-256 repos, obtained once via `git hash-object -t tree /dev/null`
-     or its Windows equivalent).
+     for SHA-256 repos). Both are fixed constants, never computed at
+     runtime; no Git command is needed to obtain them. The applicable
+     constant is selected by object format (commit-ID length: 40 hex =
+     SHA-1, 64 hex = SHA-256).
 2. Diff:
    ```
    git diff-tree --no-commit-id -r -z --no-ext-diff --no-textconv \
@@ -623,6 +661,24 @@ When `detect_renames=True`, pass `--find-renames` (plus
 Merge commits: only first-parent diff is recorded; `MERGE_SEMANTICS_PARTIAL`
 reason is added to `incomplete_reasons` when merges are present.
 
+Unavailable comparison baseline (shallow or otherwise):
+- If a non-root commit's first-parent tree cannot be resolved (shallow boundary
+  or missing parent object), no file-change records are fabricated for that
+  commit. `changes_by_commit[commit_id]` is an empty tuple. The commit is
+  retained in `commits` with its raw parent IDs and `is_root == False` (a
+  shallow boundary has raw `parent` lines and is never reclassified as a
+  root). `SHALLOW_HISTORY` and `PARENT_UNAVAILABLE` are added to
+  `incomplete_reasons` when the unavailable parent belongs to a recognized
+  shallow boundary; if a required parent or tree is unavailable outside a
+  shallow boundary (for example a missing object), the same omission behavior
+  applies with `PARENT_UNAVAILABLE` recorded and no `SHALLOW_HISTORY`. The
+  commit ID is appended to `commits_with_unavailable_baseline`.
+- The commit is NOT compared against the empty tree, so a shallow boundary
+  commit does not appear to add every file.
+- Missing historical change evidence is thus distinguishable from a genuinely
+  unchanged commit: the latter has an empty change list and is absent from
+  `commits_with_unavailable_baseline`.
+
 ### 6.5 Rename/copy similarity
 
 `similarity` is the integer score (0-100) reported by Git. Rename/copy flags
@@ -648,10 +704,10 @@ threshold (50%) applies.
 ### 7.1 Parsing and path identity policy
 
 - Invalid UTF-8 in commit metadata or paths is not silently replaced.
-  - Commit metadata is requested with `--encoding=UTF-8` semantics via
-    `git cat-file` plus explicit decoding; if a byte sequence cannot be
-    decoded as UTF-8, `GitParseError` is raised with the offending byte
-    offset. No replacement characters are introduced.
+  - Commit metadata is obtained via `git cat-file --batch` as raw object bytes
+    and decoded explicitly per 6.3; if a byte sequence cannot be decoded as
+    UTF-8, `GitParseError` is raised with the offending byte offset. No
+    replacement characters are introduced.
   - Paths are decoded as UTF-8 with `errors='strict'`. A path containing
     invalid UTF-8 raises `GitParseError` whose message includes the hex of
     the offending bytes. Lossy `surrogateescape`/`replace` decoding is not
@@ -732,7 +788,7 @@ threshold (50%) applies.
   Reasons that make it false: `SHALLOW_HISTORY`, `PARENT_UNAVAILABLE`,
   `MAX_COMMITS_REACHED`, `MERGE_SEMANTICS_PARTIAL`, `MERGES_EXCLUDED`,
   `MISSING_METADATA`, `PATH_FILTER_APPLIED`, `CO_CHANGE_LIMIT_EXCEEDED`.
-  `MAX_OUTPUT_EXCEEDED` and `COMMAND_TIMEOUT` are NOT incomplete reasons:
+  `OUTPUT_TOO_LARGE` and `COMMAND_TIMEOUT` are NOT incomplete reasons:
   those conditions raise `GitOutputTooLargeError` / `GitCommandTimeoutError`
   and no inventory is returned. `detached_head` is not a reason and does not
   affect completeness.
@@ -770,6 +826,16 @@ threshold (50%) applies.
 - No external diff tools or textconv (disabled by flag and environment).
 - No hooks execution (empty hooks path).
 - No lazy fetch in promisor/partial-clone repositories (`GIT_NO_LAZY_FETCH=1`).
+- No replacement objects: `GIT_NO_REPLACE_OBJECTS=1` is set for every Git
+  invocation, so history traversal (`rev-list`), raw object reading
+  (`git cat-file --batch`), revision and tree resolution (`rev-parse`), and
+  tree/diff operations (`diff-tree`) all read the real requested objects, not
+  substituted content from `refs/replace/`. Commit metadata and parent
+  ordering come from the actual raw object, and replacement refs never alter
+  the published inventory. Module 7 never invokes `git replace` or modifies
+  replacement refs. Offline tests use a temporary repository with a
+  replacement ref to verify the analyzer sees the original commit message,
+  parents, and tree.
 - No trace output (`GIT_TRACE*` removed).
 - No repository overrides (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
   `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` removed).
@@ -797,22 +863,42 @@ threshold (50%) applies.
   cap, the process is terminated and `GitOutputTooLargeError` is raised. No
   post-hoc size check on an already-captured buffer. Process cleanup uses
   `terminate()` then `kill()` after a short grace period, with `wait()`; works
-  on Windows and POSIX. `max_output_bytes` is the per-command cap; total
-  captured output is bounded by (command count) × `max_output_bytes`, with no
-  separate aggregate knob.
+  on Windows and POSIX. stdout and stderr are read through concurrent reader
+  threads to avoid Windows pipe deadlock. `max_output_bytes` is the per-command
+  cap.
+- Cumulative output budget: stdout and stderr bytes read across all commands
+  are accumulated in a running counter (fixed internal default cap 256 MiB,
+  not configurable). The counter is checked after each chunk; if exceeded,
+  the current process is terminated with the same terminate/kill/wait cleanup
+  as the per-command cap and `GitOutputTooLargeError` is raised. This
+  prevents many small commands from bypassing the per-command cap. Raw
+  buffers are released after parsing (no retention beyond the current
+  command; nothing raw is accumulated into the inventory).
+- Global co-change pair budget: total materialized co-change pairs across
+  all commits are capped (fixed internal default 10,000,000, not
+  configurable). The per-commit cap below is insufficient on its own, because
+  many commits below that cap can still produce an enormous total number of
+  pairs. Commits are processed in inventory order (newest-first). For each
+  commit, if the number of pairs it would add fits in the remaining budget,
+  they are materialized; otherwise the commit's co-change pairs are omitted
+  entirely (atomic per commit) and all of its genuinely touched paths are
+  appended to `co_change_incomplete_paths`. `CO_CHANGE_LIMIT_EXCEEDED` is
+  added to `incomplete_reasons` if any commit was skipped. Ordinary
+  file-change and commit indexes are unaffected.
 - Copy detection uses `--find-copies-harder`, whose cost is proportional to the
   number of files in the compared trees; this is the dominant per-commit cost
   when `detect_copies=True`.
 - Total subprocess invocations are bounded by a small constant plus O(commits):
   repository validation and revision resolution, one rev-list, one cat-file
   batch, one diff-tree per commit, and at most one tree-resolution command per
-  non-root commit. No per-symbol or per-reference commands.
-- `co_changed_paths` is built with a per-commit path-count cap (default 1000
-  distinct touched paths). For a commit touching more than the cap, its
-  co-change pairs are not materialized and `CO_CHANGE_LIMIT_EXCEEDED` is added
-  to `incomplete_reasons`. This avoids unbounded O(k^2) materialization.
-  `changes_by_path` and `commits_touching_path` are still populated for that
-  commit (they are O(k)).
+  commit. No per-symbol or per-reference commands.
+- `co_changed_paths` is built with a per-commit path-count cap (default
+  1000 distinct touched paths). For a commit touching more than the cap, its
+  co-change pairs are not materialized, all of its genuinely touched paths are
+  appended to `co_change_incomplete_paths`, and `CO_CHANGE_LIMIT_EXCEEDED` is
+  added to `incomplete_reasons`. This avoids unbounded O(k^2)
+  materialization. `changes_by_path` and `commits_touching_path` are still
+  populated for that commit (they are O(k)).
 - Maximum accumulated evidence size: `changes` tuple is capped at 1,000,000
   entries; exceeding raises `GitOutputTooLargeError` (no partial inventory).
 - Indexed lookups: `commits_by_id`, `changes_by_commit`, `changes_by_path`,
@@ -827,7 +913,8 @@ threshold (50%) applies.
 - Invalid revision -> `GitRevisionError`.
 - Command failure -> `GitCommandError` with sanitized stderr.
 - Timeout -> `GitCommandTimeoutError`.
-- Output too large -> `GitOutputTooLargeError`.
+- Output too large -> `GitOutputTooLargeError` (also raised when the
+  1,000,000-change evidence cap is exceeded; see 14).
 - Parse failure -> `GitParseError`.
 - Inventory mismatch -> `GitInventoryMismatchError`.
 - Configuration error -> `GitConfigurationError`.
@@ -859,12 +946,30 @@ threshold (50%) applies.
 - Copy source unchanged (source not modified/co-changed).
 - Huge single-commit co-change cardinality (co-change cap).
 - Aggregate subprocess/output/time limits.
+- Many small commands whose combined output exceeds the cumulative output
+  budget (global cap enforced; staying under the per-command cap does not
+  bypass it).
 - Malicious Git environment/configuration.
 - Lazy-fetch prevention.
+- Replacement-ref repository (analyzer sees original commit, parents, tree;
+  never invokes `git replace`).
 - Malformed UTF-8/path handling.
+- Depth-one shallow clone with unavailable parent tree (boundary commit
+  retained, not classified as root, no fabricated changes,
+  `SHALLOW_HISTORY` + `PARENT_UNAVAILABLE`,
+  `commits_with_unavailable_baseline` populated).
 - Detached HEAD.
 - Empty repository.
 - Shallow history (via `git clone --depth` locally).
+- Many moderate-sized commits exhausting the global co-change pair budget
+  (`CO_CHANGE_LIMIT_EXCEEDED`, deterministic `co_change_incomplete_paths`,
+  `history_is_complete` is false).
+- One oversized commit exceeding the global budget (atomic omission of its
+  co-change pairs; no partial partners).
+- Co-change omission leaves ordinary file-change and commit indexes unchanged.
+- Path-filtered commit modifying both a filtered path and an unrelated path
+  (commit selection only; changes list unfiltered; `PATH_FILTER_APPLIED`
+  recorded; co-change evidence retained subject to the co-change budget).
 - Filenames with spaces and Unicode.
 - Same timestamps, distinct parents.
 - Bounded history (max_commits).
@@ -961,11 +1066,25 @@ Module 7 is complete when:
 4. Deterministic output on repeat runs (same commit order, same change order).
 5. Shallow/truncated history reported via `incomplete_reasons`.
 6. Security tests pass (no network, no mutation, no injection, no hooks).
-7. Resource bounds enforced (max_commits, timeout, output cap).
+7. Resource bounds enforced (max_commits, per-command timeout, per-command
+   output cap, cumulative output budget, co-change pair budget).
 8. Offline tests pass with temporary local repos.
 9. No upstream module modified.
 10. No Modules 8-10 functionality.
 11. Independent review approved with no Critical/Important findings.
+12. A depth-one shallow clone and a linked worktree are covered: boundary
+    commits are retained with raw parent IDs, never classified as root, never
+    compared against the empty tree, and produce no fabricated file-change
+    records; `SHALLOW_HISTORY`/`PARENT_UNAVAILABLE` and
+    `commits_with_unavailable_baseline` are populated.
+13. The cumulative output budget is enforced across the entire analysis; many
+    small commands cannot bypass it, and raw buffers are not retained.
+14. The global co-change pair budget produces deterministic atomic per-commit
+    omission with explicit `co_change_incomplete_paths` reporting;
+    `history_is_complete` is false when a budget is hit; ordinary
+    file-change/commit indexes are unaffected.
+15. `path_filter` selects commits only; every selected commit retains its full
+    first-parent file-change set, including unrelated paths.
 
 ---
 
