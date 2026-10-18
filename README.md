@@ -318,3 +318,95 @@ It skips if either guard is absent, sends one small synthetic document and one q
 ### Modules 6–10 non-goals
 
 Module 5 does not implement dependency/call graphs or graph persistence (Module 6); Git-history and temporal evidence (Module 7); runtime, log, error, or stack-trace ingestion (Module 8); BM25, lexical/hybrid retrieval, graph expansion, relevance thresholds, fusion, or reranking (Module 9); or LLM context assembly, answering, causal reasoning, citation presentation, API, or frontend behavior (Module 10).
+
+## Module 6 - Code Graph Builder
+
+Module 6 converts validated Module 2 `FileInventory` and Module 3
+`CodeParseInventory` metadata into a deterministic, immutable, in-memory
+`CodeGraphInventory`. It depends on Modules 2 and 3 only. It is an independent
+branch of the architecture: the Module 4 to Module 5 semantic-index path and the
+Module 6 graph path are separate inputs to a future Module 9, and Module 6 has no
+dependency on chunking, embeddings, or vector storage.
+
+### Requirements
+
+Python 3.12 or newer, scoped to this module. Module 6 adds no runtime
+dependency of its own and reuses only the standard library.
+
+### Python usage
+
+```python
+from backend.file_scanner import FileScanner
+from backend.code_parser import CodeParser
+from backend.code_graph import build_code_graph
+
+files = FileScanner().scan("workspace/example/repo", repository_namespace="example/repo")
+parsed = CodeParser().parse_inventory(files)
+graph = build_code_graph(files, parsed)
+print(len(graph.nodes), len(graph.edges), len(graph.unresolved_references))
+```
+
+The `CodeGraphBuilder().build(files, parsed)` entry point is equivalent. Neither
+entry point takes a repository path or a source-reading callback: repository
+content is untrusted data, so scanning and parsing read source, and graph
+construction never does.
+
+### Precision and unresolved evidence
+
+A resolved edge means the available static metadata establishes exactly one
+internal relationship. Uncertainty is never guessed. Each distinct reference
+either yields its proven edge or exactly one structured unresolved record
+carrying its kind, exact `raw_target`, and a failure reason: `external`,
+`not_found`, `ambiguous`, `unsupported`, or `incomplete_parse`. `ambiguous`
+records carry the complete sorted eligible candidate set as evidence; other
+reasons carry no candidates. Multiple eligible targets produce zero edges and one
+ambiguous record rather than a first-match winner.
+
+Supported relationships are static declaration and import evidence for Python,
+Java, and JavaScript/JSX/TypeScript/TSX: file and symbol nodes, direct `defines`
+and `contains` structure, module imports, callable calls, and declared class and
+interface inheritance and implementation. `PARTIAL` files keep their file node
+and trusted symbols; `FAILED` files keep only their file node. An unrelated parse
+failure never poisons resolution elsewhere.
+
+### Immutable in-memory output
+
+`CodeGraphInventory` is a frozen, slotted dataclass holding canonical tuples
+sorted by identity, plus four read-only derived indexes. The backing mappings
+are copied before publication, so no caller can mutate tuples, nested values, or
+retained maps, and no build can affect another's result. Identity is a lowercase
+SHA-256 hex digest of canonical JSON with `ensure_ascii=False` and
+`separators=(",", ":")`, so equal evidence always yields equal node ids across
+builds and machines. Nothing is persisted: no graph database, no cache files, no
+serialization. This module does not add NetworkX or any other graph library.
+
+### Tests
+
+```bash
+python -m pytest tests -q -k code_graph
+python -m pytest tests -q -m "not integration and not gemini_live"
+```
+
+Normal verification is fully offline and excludes both networked integration
+markers. Module 6 makes no network call of any kind, including Gemini and
+ChromaDB.
+
+### Security and scope boundaries
+
+Module 6 never reopens source, executes or imports repository modules, uses
+`eval`/`exec`, spawns a subprocess, accesses the network, reads `.env`, inspects
+`node_modules`, or uses unsafe deserialization. Graph construction performs no
+filesystem writes and creates no persistent graph, cache, or database file.
+`tests/test_code_graph_security.py` enforces this by replacing every path-based
+opener, mutator, process entry point, dynamic import, and network entry point
+with a failing stub during a guarded build, and by statically auditing the
+Module 6 sources for forbidden imports and calls. Tests only; Module 6 has no
+CLI, server, dashboard, or API surface.
+
+### Modules 7-10 non-goals
+
+Module 6 does not implement Git-history or temporal evidence (Module 7); runtime,
+log, error, or stack-trace ingestion (Module 8); BM25, lexical/hybrid retrieval,
+graph expansion, relevance thresholds, fusion, or reranking (Module 9); or LLM
+context assembly, answering, causal reasoning, citation presentation, API, or
+frontend behavior (Module 10).
