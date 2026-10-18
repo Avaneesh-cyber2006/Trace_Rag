@@ -510,6 +510,12 @@ def test_ambiguous_references_emit_candidates_without_iterating_a_global_map():
     ]
 
     assert _iterations(counters) == 0
+    assert _lookups(counters) > 0
+    # Zero iterations is the decisive assertion here: any whole-map scan must
+    # iterate one. The lookup bound only caps work per emitted candidate, since
+    # enumerating 300 candidates per site legitimately costs more than a scan of
+    # this deliberately tiny 301-symbol repository would.
+    assert _lookups(counters) <= 10 * len(calls) * 300
     for result in results:
         assert result.reason is ResolutionFailureReason.AMBIGUOUS
 
@@ -765,7 +771,12 @@ def test_scope_walk_cost_is_linear_in_depth():
 
         resolve_reference(counted, environment, call_reference(index, file, call))
         costs[depth] = _lookups(counters)
+        assert _iterations(counters) == 0
+        # A floor per depth means an entirely uninstrumented index fails here
+        # instead of trivially satisfying the doubling bounds below.
+        assert costs[depth] > 0
 
+    assert costs[4] > 0
     assert costs[8] <= 2 * costs[4]
     assert costs[16] <= 2 * costs[8]
 
@@ -1059,15 +1070,19 @@ def test_ecmascript_reference_resolution_never_rescans_import_records():
     ]
 
 
-def test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance():
-    """The memo key must carry the index identity, not just the file and name.
+def test_type_name_memo_does_not_leak_across_graph_indexes():
+    """A type-name memo entry must never answer a different build.
 
-    Two structurally identical repositories produce distinct GraphIndexes
-    instances with identical file ids, paths and wildcard items. If the memo key
-    omitted the index identity, the second build would be served the first
-    build's cached candidates, which is exactly a cross-repository cache leak.
+    Both builds share the same package, paths, file ids and wildcard item, and a
+    single ImportEnvironment is reused across them. Only the presence of the
+    ``p.Base`` declaration differs. Without build scoping, the second build would
+    be answered from the first build's cached candidates.
     """
-    def build():
+    base_symbol = symbol(
+        "Base", kind=SymbolKind.CLASS, qualified_name="p.Base", end=300
+    )
+
+    def build(with_base):
         item = ImportInfo("p", (), True, (), loc(0, 10))
         child = symbol(
             "Child",
@@ -1083,24 +1098,37 @@ def test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance():
             imports=(item,),
             symbols=(child,),
         )
-        base = symbol("Base", kind=SymbolKind.CLASS, qualified_name="p.Base")
         target = parsed(
-            "base.java", language=ParsedLanguage.JAVA, symbols=(base,)
+            "base.java",
+            language=ParsedLanguage.JAVA,
+            symbols=(base_symbol,) if with_base else (),
         )
+        return source, item, target
+
+    def indexes(with_base):
+        source, item, target = build(with_base)
         index = build_graph_indexes(validate_inputs(*inventories(source, target)))
-        environment = ImportEnvironment(
-            {"Main.java": ((item, resolve_import(index, source, item)),)}
-        )
-        source_id = index.by_file_name[("Main.java", "Child")][0]
-        (reference,) = type_references(index, source, source_id)
-        return index, environment, reference
+        return index, source, item
 
-    first_index, first_env, first_ref = build()
-    second_index, second_env, second_ref = build()
+    first_index, first_source, first_item = indexes(True)
+    second_index, _second_source, _second_item = indexes(False)
 
-    assert first_index is not second_index
     assert first_index.file_ids == second_index.file_ids
-    assert first_index.file_ids["base.java"] == second_index.file_ids["base.java"]
+
+    # One environment reused across both builds is the leak scenario.
+    environment = ImportEnvironment(
+        {
+            "Main.java": (
+                (first_item, resolve_import(first_index, first_source, first_item)),
+            )
+        }
+    )
+    first_ref = type_references(
+        first_index, first_source, first_index.by_file_name[("Main.java", "Child")][0]
+    )[0]
+    second_ref = type_references(
+        second_index, first_source, second_index.by_file_name[("Main.java", "Child")][0]
+    )[0]
 
     original = java_resolver._wildcard_type_candidates
     calls = []
@@ -1111,18 +1139,22 @@ def test_wildcard_memo_key_is_scoped_to_its_graph_indexes_instance():
 
     java_resolver._wildcard_type_candidates = counted
     try:
-        first = resolve_reference(first_index, first_env, first_ref)
-        second = resolve_reference(second_index, second_env, second_ref)
+        first = resolve_reference(first_index, environment, first_ref)
+        second = resolve_reference(second_index, environment, second_ref)
     finally:
         java_resolver._wildcard_type_candidates = original
 
-    # Two distinct index identities means two cache entries: the second build
-    # cannot be answered from the first build's entry. This holds whether the
-    # memo distinguishes builds by key identity, by the per-build reset, or by
-    # both, so it is a property of the result rather than of one mechanism.
     assert len(calls) == 2
-    assert first.target_node_id is not None
-    assert second.target_node_id is not None
+    assert first.target_node_id == symbol_node_id(NAMESPACE, "base.java", base_symbol)
+    # The second repository has no p.Base declaration, so the wildcard package
+    # resolves to nothing there. What matters is that it is unresolved: a
+    # leaked entry would hand back the first build's node id.
+    assert second.target_node_id is None
+    assert second.reason in (
+        ResolutionFailureReason.NOT_FOUND,
+        ResolutionFailureReason.EXTERNAL,
+    )
+    assert second.candidate_node_ids == ()
 
 
 def test_static_wildcard_memo_does_not_leak_across_graph_indexes():
@@ -1463,6 +1495,10 @@ def test_repeated_ambiguity_sites_emit_exactly_r_times_k_candidates():
     ]
 
     assert _iterations(counters) == 0
+    assert _lookups(counters) > 0
+    # Each of the R sites emits K candidate ids, so the emitted work is bounded
+    # by R*K rather than by any repository-wide symbol count.
+    assert _lookups(counters) <= 10 * references * targets
     assert all(
         result.reason is ResolutionFailureReason.AMBIGUOUS for result in results
     )
