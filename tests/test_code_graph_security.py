@@ -1,7 +1,15 @@
-"""Security boundaries for graph construction from prepared metadata only."""
+"""Security boundaries for graph construction from prepared metadata only.
+
+Filesystem reads/writes, process execution and network entry points are blocked
+at runtime by ``_patch_io``. Module import execution is NOT blocked at runtime,
+because CPython loads modules through ``_io.open_code`` rather than the patched
+openers. Imports are constrained instead by the static allowlist in
+``_is_allowed_module``, which is covered by the audit tests below.
+"""
 
 import ast
 import builtins
+import copy
 from dataclasses import FrozenInstanceError
 import importlib
 import io
@@ -10,7 +18,6 @@ import shutil
 import socket
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
@@ -63,6 +70,7 @@ def _patch_io(guard):
         (os, "link"),
         (os, "truncate"),
         (os, "fdopen"),
+        (os, "listdir"),
         (Path, "open"),
         (Path, "read_text"),
         (Path, "read_bytes"),
@@ -70,6 +78,7 @@ def _patch_io(guard):
         (Path, "write_bytes"),
         (Path, "stat"),
         (Path, "resolve"),
+        (Path, "iterdir"),
         (Path, "unlink"),
         (Path, "rename"),
         (Path, "replace"),
@@ -124,7 +133,8 @@ def test_caller_inputs_are_immutable_and_later_builds_do_not_change_prior_graph(
     pair = cg.pair(source)
     file_inventory, parse_inventory = pair
     first = _build_under_guard(monkeypatch, pair)
-    original_nodes = first.nodes
+    original_nodes = copy.deepcopy(first.nodes)
+    original_index = dict(first.nodes_by_file)
 
     with pytest.raises(FrozenInstanceError):
         parse_inventory.files[0].symbols = ()
@@ -137,6 +147,8 @@ def test_caller_inputs_are_immutable_and_later_builds_do_not_change_prior_graph(
     second = _build_under_guard(monkeypatch, different)
 
     assert first.nodes == original_nodes
+    assert first.nodes is not original_nodes
+    assert dict(first.nodes_by_file) == original_index
     assert first != second
 
 
@@ -651,7 +663,8 @@ def test_ambiguous_import_and_partial_parse_stay_in_memory(cg, monkeypatch):
 
     assert any(node.parse_status is ParseStatus.PARTIAL for node in graph.nodes)
     assert any(
-        item.reason.value == "ambiguous" for item in graph.unresolved_references
+        item.reason is ResolutionFailureReason.AMBIGUOUS
+         for item in graph.unresolved_references
     )
 
 
@@ -851,8 +864,15 @@ def _forbidden_calls(tree, module_name):
 
 
 def _audit_code_graph_sources(root):
+    """Return (violations, audited_relative_paths).
+
+    The audited path list is returned so a caller can prove the scan was not
+    vacuous; returning violations alone would let an empty package pass.
+    """
     violations = []
+    audited = []
     for source_path in sorted((root / "backend" / "code_graph").rglob("*.py")):
+        audited.append(source_path.relative_to(root).as_posix())
         module_name = _module_name_for(source_path.relative_to(root))
         tree = ast.parse(
             source_path.read_text(encoding="utf-8"), filename=str(source_path)
@@ -862,7 +882,56 @@ def _audit_code_graph_sources(root):
                 violations.append(f"{source_path}: forbidden import {imported}")
         for call_name in _forbidden_calls(tree, module_name):
             violations.append(f"{source_path}: forbidden call {call_name}")
-    return violations
+    return violations, audited
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from backend.embedding_vector_store import VectorStore",
+            id="module5-top-level",
+        ),
+        pytest.param(
+            "from backend.embedding_vector_store.chroma import ChromaAdapter",
+            id="module5-dotted-submodule",
+        ),
+        pytest.param("import chromadb", id="chroma-third-party"),
+        pytest.param("import networkx", id="graph-library"),
+        pytest.param(
+            "from backend.embedding_vector_store.adapters import chroma_client",
+            id="module5-nested-package",
+        ),
+        pytest.param(
+            "import backend.code_chunker as chunks", id="module4-production"
+        ),
+        pytest.param(
+            "from backend.code_parser.grammar import load_grammar", id="parser-registry"
+        ),
+        pytest.param("import google.generativeai as genai", id="gemini"),
+    ],
+)
+def test_dependency_audit_rejects_non_approved_module_imports(source):
+    tree = ast.parse(source)
+
+    imported = tuple(_imported_modules(tree, "backend.code_graph.audit"))
+
+    assert imported
+    assert all(not _is_allowed_module(module) for module in imported), imported
+
+
+def test_dependency_audit_allows_only_the_approved_module_surface():
+    allowed = (
+        "backend.code_graph",
+        "backend.code_graph.builder",
+        "backend.code_parser.models",
+        "backend.file_scanner.models",
+        "json",
+        "collections.abc",
+    )
+
+    for module in allowed:
+        assert _is_allowed_module(module), module
 
 
 def test_dependency_audit_rejects_module_4_or_5_imports_in_memory():
@@ -872,6 +941,31 @@ def test_dependency_audit_rejects_module_4_or_5_imports_in_memory():
 
     assert imported
     assert any(not _is_allowed_module(module) for module in imported)
+
+
+def test_dependency_audit_detects_a_planted_violation_in_a_synthetic_tree(tmp_path):
+    package = tmp_path / "backend" / "code_graph"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "bad.py").write_text(
+        "import os\n\n\ndef damage():\n    os.remove('source.py')\n",
+        encoding="utf-8",
+    )
+
+    violations, audited = _audit_code_graph_sources(tmp_path)
+
+    assert any("forbidden call os.remove" in item for item in violations)
+    assert audited == ["backend/code_graph/__init__.py", "backend/code_graph/bad.py"]
+
+
+def test_dependency_audit_reports_an_empty_scan_instead_of_succeeding(tmp_path):
+    empty = tmp_path / "backend" / "code_graph"
+    empty.mkdir(parents=True)
+
+    violations, audited = _audit_code_graph_sources(tmp_path)
+
+    assert violations == []
+    assert audited == []
 
 
 def test_dependency_audit_rejects_forbidden_calls_and_aliased_deserialization():
@@ -947,7 +1041,7 @@ def test_dependency_audit_does_not_flag_harmless_same_named_methods():
 
 
 def test_recursive_delete_is_blocked_by_the_runtime_guard_under_build(
-    cg, monkeypatch, tmp_path
+    monkeypatch, tmp_path
 ):
     victim = tmp_path / "payload.txt"
     victim.write_text("untrusted", encoding="utf-8")
@@ -965,7 +1059,7 @@ def test_recursive_delete_is_blocked_by_the_runtime_guard_under_build(
 
 
 def test_file_descriptor_writers_are_blocked_by_the_runtime_guard(
-    cg, monkeypatch, tmp_path
+    monkeypatch, tmp_path
 ):
     victim = tmp_path / "payload.txt"
     victim.write_text("abcdef", encoding="utf-8")
@@ -978,7 +1072,29 @@ def test_file_descriptor_writers_are_blocked_by_the_runtime_guard(
     assert victim.read_text(encoding="utf-8") == "abcdef"
 
 
+def test_directory_enumeration_is_blocked_by_the_runtime_guard(monkeypatch, tmp_path):
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    (directory / "inner.txt").write_text("inner", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="in-memory boundary"):
+        with monkeypatch.context() as guard:
+            _patch_io(guard)
+            os.listdir(directory)
+
+    with pytest.raises(AssertionError, match="in-memory boundary"):
+        with monkeypatch.context() as guard:
+            _patch_io(guard)
+            list(directory.iterdir())
+
+    assert (directory / "inner.txt").read_text(encoding="utf-8") == "inner"
+
+
 def test_code_graph_sources_stay_within_approved_dependencies_and_apis():
     root = Path(__file__).resolve().parents[1]
 
-    assert _audit_code_graph_sources(root) == []
+    violations, audited = _audit_code_graph_sources(root)
+
+    assert audited, "no backend/code_graph sources were audited"
+    assert len(audited) == 15, audited
+    assert violations == []

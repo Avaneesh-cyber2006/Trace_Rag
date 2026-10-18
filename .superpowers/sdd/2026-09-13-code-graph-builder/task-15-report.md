@@ -94,14 +94,76 @@ Module 6 production security violation exists.
 
 ## Ruling on remaining low-level descriptor APIs
 
-`os.write`, `os.fsync` and `os.ftruncate` operate only on an already-open file
-descriptor. Every path-based opener is already guarded (`builtins.open`,
-`io.open`, `os.open`, `os.fdopen`, `Path.open`, `Path.write_text`,
-`Path.write_bytes`), so Module 6 can never obtain a descriptor to pass to them.
-Guarding them would patch interpreter-level write primitives for no reachable
-gain and risks breaking pytest and Python itself, which the approved plan
-explicitly warns against. They are therefore deliberately left unguarded, and
-the static audit rejects them by leaf name where that is unambiguous.
+`os.write`, `os.fsync` and `os.ftruncate` are **deliberately unguarded and also
+unaudited**. They are not in the runtime guard and the static audit does not
+reject them; this is stated plainly because an earlier revision of this section
+incorrectly claimed the audit covered them.
+
+The sole reason they are left out is that they operate only on an
+already-open file descriptor. Every path-based opener is guarded
+(`builtins.open`, `io.open`, `os.open`, `os.fdopen`, `Path.open`,
+`Path.write_text`, `Path.write_bytes`), so Module 6 cannot obtain a descriptor
+to pass to them, and guarding interpreter-level write primitives risks breaking
+pytest and Python itself, which the approved plan explicitly warns against.
+
+## Independent review of fix round 2
+
+A fresh reviewer agent with no authoring context reviewed the original Task 15
+work plus both fix rounds and returned **APPROVED** with no Critical or
+Important findings. It independently mutation-tested the guards (23/23 fire with
+the exact message and zero filesystem effect), swept the static audit for both
+false negatives (0/43 missed) and false positives, confirmed production contains
+no filesystem/network/process/eval/exec usage, and confirmed Modules 1-5 are
+untouched.
+
+Its Minor findings, and their adjudication:
+
+- **Minor 1 — `os.listdir`/`Path.iterdir` audited but not guarded.** Fixed:
+  both added to the runtime guard with a committed blocking test. `Path.glob`
+  and `rglob` were already blocked transitively through patched `os.scandir`.
+- **Minor 2 — leaf-name rules flag ordinary same-named methods**
+  (`seen.remove`, `worker.run`, `db.connect`, `f.truncate`, …). Deferred by
+  ruling: the audit is intentionally receiver-agnostic so that a forbidden call
+  is caught whatever it is called on, and the approved plan asks for
+  attribute-based I/O to be reviewed. Module 6 contains no such calls today.
+  Narrowing to known I/O receivers would trade detection breadth for a cosmetic
+  gain. A control test pins the three behaviours the spec names
+  (`str.replace`, `dict.copy`, `list.copy`) as not flagged.
+- **Minor 3 — `assert first.nodes == original_nodes` was tautological.** Fixed:
+  the snapshot is now a `copy.deepcopy` taken before the second build, is
+  asserted to be a distinct object, and the published index contents are
+  compared as well.
+- **Minor 4 — the source audit could pass vacuously on an empty package.**
+  Fixed: `_audit_code_graph_sources` now returns the audited relative path list,
+  the main test asserts 15 audited files, and two new tests prove a planted
+  violation is reported and an empty scan is visibly empty.
+- **Minor 5 — this report overstated the `os.write`/`os.fsync`/`os.ftruncate`
+  defence.** Fixed: corrected above.
+- **Minor 6 — module import execution is not blocked at runtime.** Accepted and
+  documented: CPython loads modules through `_io.open_code`, not the patched
+  openers, so the static allowlist is the real control. The module docstring now
+  says so, and a new parametrized test proves the allowlist rejects Module 4/5
+  (including a dotted submodule and a nested package), Chroma, NetworkX, the
+  parser registry and Gemini, alongside a test pinning the allowed surface.
+
+Nits fixed: duplicate `FrozenInstanceError` import, two unused `cg` fixture
+parameters, and a string comparison replaced with enum identity.
+
+Nits deferred by ruling: `is not` on index wrappers cannot by itself detect
+shared backing storage (the cross-build test does detect it, so the weaker
+assertion is kept as a secondary signal); `_edge_pairs` collapses duplicate
+`(kind, source, target)` triples (no fixture exercises two import sites at one
+pair, and multi-site edge identity is covered by
+`tests/test_code_graph_determinism.py`); line length exceeds 79 characters in a
+few places (the repository has no lint configuration and other Module 6 tests
+already exceed it).
+
+The reviewer also noted that the fix-round-2 RED claims are not reproducible from
+the committed tree, because the commits are linear. That is accurate: the RED was
+observed interactively before the fixture change and the probe script and its
+output were recorded at the time. The committed sensitivity probes — the
+synthetic-tree violation test, the empty-scan test and the mutation-rejecting
+index tests — are the durable, re-runnable form of that evidence.
 
 ## Verification
 
