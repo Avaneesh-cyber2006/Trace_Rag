@@ -165,12 +165,42 @@ output were recorded at the time. The committed sensitivity probes — the
 synthetic-tree violation test, the empty-scan test and the mutation-rejecting
 index tests — are the durable, re-runnable form of that evidence.
 
-## Verification
+## Verification (re-measured after fix rounds 3 and 4)
 
-- `tests/test_code_graph_security.py`: 36 passed.
-- Required builder/Python/Java/ECMAScript neighbors: 250 passed.
-- Remaining Module 6 focused files: 239 passed.
+- `tests/test_code_graph_security.py`: 49 passed, exit 0.
+- All ten neighbouring Module 6 focused files: 489 passed, exit 0.
+- Plan Task 15 required neighbors (builder/python/java/ecmascript): 250 passed.
 - `python -m compileall -q backend/code_graph`: exit 0.
 - `git diff --check -- backend/code_graph tests/test_code_graph_security.py`: exit 0.
 - No dependency, upstream production module, network, or repository file was
   touched. All pytest basetemps were outside the repository tree.
+
+## Scoped re-review of fix round 3
+
+A second fresh reviewer agent, given only the fix diff and the prior finding
+list, returned **APPROVED**: all ten in-scope findings ADDRESSED, all deferred
+rulings coherent with the actual code, and no new Critical or Important
+breakage. It re-verified by mutation rather than by reading — deleting the
+`__post_init__` snapshot, neutering `_is_allowed_module`, and emptying the audit
+scan each produced the expected RED.
+
+Its six follow-up observations were test hygiene and report accuracy, all closed
+here in fix round 4:
+
+- The `(Path, "iterdir")` guard entry was blocked only transitively through
+  patched `os.listdir`, so deleting it left the suite green. Added
+  `test_path_iterdir_guard_entry_is_load_bearing`, which restores the real
+  `os.listdir` so only the `Path.iterdir` entry can stop the call. Verified by
+  mutation: removing the entry makes exactly that test fail.
+- The module docstring claimed the guard blocks all filesystem access. It now
+  states precisely what is guarded (path-based openers, file mutators, directory
+  enumerators) and what is deliberately out of scope (descriptor writers,
+  metadata queries, module import execution), matching the ruling above.
+- `assert len(audited) == 15` was a brittle magic number that any future
+  production file would break. Replaced with `>= 15` plus an assertion over the
+  fifteen expected module paths, which still defeats a vacuous scan.
+- Two test names overstated what they assert
+  (`..._allows_only_the_approved_module_surface`,
+  `..._reports_an_empty_scan_instead_of_succeeding`); renamed to match.
+- The Verification block above was stale (36 rather than the actual count) and
+  has been re-measured.

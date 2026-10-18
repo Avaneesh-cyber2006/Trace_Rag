@@ -1,10 +1,18 @@
 """Security boundaries for graph construction from prepared metadata only.
 
-Filesystem reads/writes, process execution and network entry points are blocked
-at runtime by ``_patch_io``. Module import execution is NOT blocked at runtime,
-because CPython loads modules through ``_io.open_code`` rather than the patched
-openers. Imports are constrained instead by the static allowlist in
-``_is_allowed_module``, which is covered by the audit tests below.
+Scope of the runtime guard ``_patch_io``: every path-based opener, file mutator
+and directory enumerator is replaced with a failing stub, so a guarded build
+that touches the filesystem, spawns a process or opens a socket raises. Low
+level descriptor writers (``os.write``, ``os.fsync``, ``os.ftruncate``) and
+metadata queries (``os.stat``, ``os.access``, ``socket.getaddrinfo``) are
+deliberately OUT OF SCOPE: Module 6 cannot obtain a descriptor because every
+opener is blocked, and guarding interpreter primitives would break pytest
+itself. See the Task 15 report for the full ruling.
+
+Module import execution is also outside the runtime guard, because CPython
+loads modules through ``_io.open_code`` rather than the patched openers.
+Imports are constrained instead by the static allowlist in
+``_is_allowed_module``, which is proven by the audit tests below.
 """
 
 import ast
@@ -920,7 +928,7 @@ def test_dependency_audit_rejects_non_approved_module_imports(source):
     assert all(not _is_allowed_module(module) for module in imported), imported
 
 
-def test_dependency_audit_allows_only_the_approved_module_surface():
+def test_dependency_audit_allows_the_approved_module_surface():
     allowed = (
         "backend.code_graph",
         "backend.code_graph.builder",
@@ -958,7 +966,7 @@ def test_dependency_audit_detects_a_planted_violation_in_a_synthetic_tree(tmp_pa
     assert audited == ["backend/code_graph/__init__.py", "backend/code_graph/bad.py"]
 
 
-def test_dependency_audit_reports_an_empty_scan_instead_of_succeeding(tmp_path):
+def test_dependency_audit_documents_an_empty_scan_result(tmp_path):
     empty = tmp_path / "backend" / "code_graph"
     empty.mkdir(parents=True)
 
@@ -1090,11 +1098,50 @@ def test_directory_enumeration_is_blocked_by_the_runtime_guard(monkeypatch, tmp_
     assert (directory / "inner.txt").read_text(encoding="utf-8") == "inner"
 
 
+def test_path_iterdir_guard_entry_is_load_bearing(monkeypatch, tmp_path):
+    """Removing the Path.iterdir guard entry must be detectable.
+
+    ``Path.iterdir`` delegates to ``os.listdir``, so with ``os.listdir`` already
+    guarded the block would pass transitively even without its own entry. This
+    test restores the real ``os.listdir`` so that only the ``Path.iterdir``
+    entry can stop the call.
+    """
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    (directory / "inner.txt").write_text("inner", encoding="utf-8")
+    real_listdir = os.listdir
+
+    with pytest.raises(AssertionError, match="in-memory boundary"):
+        with monkeypatch.context() as guard:
+            _patch_io(guard)
+            guard.setattr(os, "listdir", real_listdir)
+            list(directory.iterdir())
+
+    assert (directory / "inner.txt").exists()
+
+
 def test_code_graph_sources_stay_within_approved_dependencies_and_apis():
     root = Path(__file__).resolve().parents[1]
 
     violations, audited = _audit_code_graph_sources(root)
 
     assert audited, "no backend/code_graph sources were audited"
-    assert len(audited) == 15, audited
+    assert len(audited) >= 15, audited
+    assert {
+        "backend/code_graph/__init__.py",
+        "backend/code_graph/builder.py",
+        "backend/code_graph/exceptions.py",
+        "backend/code_graph/identities.py",
+        "backend/code_graph/indexes.py",
+        "backend/code_graph/invariants.py",
+        "backend/code_graph/models.py",
+        "backend/code_graph/references.py",
+        "backend/code_graph/structure.py",
+        "backend/code_graph/validation.py",
+        "backend/code_graph/resolvers/__init__.py",
+        "backend/code_graph/resolvers/base.py",
+        "backend/code_graph/resolvers/ecmascript.py",
+        "backend/code_graph/resolvers/java.py",
+        "backend/code_graph/resolvers/python.py",
+    }.issubset(set(audited))
     assert violations == []
