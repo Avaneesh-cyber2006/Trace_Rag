@@ -1,14 +1,27 @@
-"""Scaling verification for indexed code graph operations."""
+"""Indexed scaling and candidate-output accounting for the code graph builder.
+
+Every assertion here is a deterministic structural-complexity bound: operation
+counts produced by :class:`CountingMapping`, or exact candidate/output
+accounting. No wall-clock threshold appears anywhere in this file, and no test
+tolerates a global scan: the counters fail the test if a resolver falls back to
+iterating a global map instead of using a keyed bucket.
+"""
+
+import copy
 
 import pytest
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import replace
 from pathlib import PurePosixPath
 
 from backend.code_graph import build_code_graph
-from backend.code_graph.indexes import build_graph_indexes, GraphIndexes
-from backend.code_graph.models import GraphEdgeKind, ReferenceKind
+from backend.code_graph.identities import file_node_id
+from backend.code_graph.indexes import build_graph_indexes
+from backend.code_graph.models import GraphEdgeKind, ReferenceKind, ResolutionFailureReason
+from backend.code_graph.references import call_reference
+from backend.code_graph.resolvers import resolve_import, resolve_reference
+from backend.code_graph.resolvers.base import ImportEnvironment
+from backend.code_graph.structure import structural_edges
 from backend.code_graph.validation import validate_inputs
 from backend.code_parser.models import (
     CallKind,
@@ -24,6 +37,13 @@ from backend.code_parser.models import (
     SymbolKind,
 )
 from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
+
+NAMESPACE = "test-repo"
+
+#: Maps whose size grows with the whole repository. A resolver that iterates one
+#: of these per reference is O(R x S); a resolver that only does keyed lookups
+#: never iterates them.
+GLOBAL_MAPS = ("nodes_by_id", "symbols_by_id", "by_qualified_name", "nodes")
 
 
 class CountingMapping(Mapping):
@@ -52,544 +72,718 @@ class CountingMapping(Mapping):
 
 
 def test_counting_mapping_tracks_accesses():
-    """Verify CountingMapping correctly tracks all access operations."""
+    """The instrument itself must measure every access it claims to."""
     source = {"a": 1, "b": 2, "c": 3}
     counted = CountingMapping(source)
 
-    # Test __getitem__
     assert counted["a"] == 1
     assert counted.counts["get"] == 1
-
-    # Test get method
     assert counted.get("b") == 2
     assert counted.counts["get"] == 2
     assert counted.get("missing", "default") == "default"
     assert counted.counts["get"] == 3
-
-    # Test __iter__
-    keys = list(counted)
-    assert set(keys) == {"a", "b", "c"}
+    assert set(counted) == {"a", "b", "c"}
     assert counted.counts["iter"] == 1
     assert counted.counts["yield"] == 3
-
-    # Test __len__
     assert len(counted) == 3
-
-    # Verify it behaves as a proper Mapping
     assert "a" in counted
-    assert counted["c"] == 3
 
 
-def _create_synthetic_inventory(file_count, symbol_count, call_count):
-    """Create synthetic inventory with specified file/symbol/call counts."""
-    files = []
-    for i in range(file_count):
-        path = f"file_{i}.py"
-        symbols = []
-        for j in range(symbol_count):
-            symbol = SymbolInfo(
-                f"symbol_{j}",
-                SymbolKind.FUNCTION,
-                f"symbol_{j}",
-                None,
-                SourceLocation(j * 10, j * 10 + 5, 1, j * 10, 1, j * 10 + 5),
-                (),
-                None,
-                (),
-                (),
-                (),
-            )
-            symbols.append(symbol)
-        calls = []
-        for k in range(call_count):
-            call = CallSite(
-                f"symbol_{k % symbol_count}",
-                f"symbol_{k % symbol_count}",
-                CallKind.CALL,
-                SourceLocation(k * 5, k * 5 + 2, 1, k * 5, 1, k * 5 + 2),
-            )
-            calls.append(call)
-        parsed = ParsedFile(
-            path,
-            ParsedLanguage.PYTHON,
-            ParseStatus.SUCCESS,
-            tuple(symbols),
-            (),
-            tuple(calls),
-            (),
-            "0" * 64,
-        )
-        scanned = ScannedFile(
-            path,
-            PurePosixPath(path).name,
-            PurePosixPath(path).suffix,
-            "python",
+# --------------------------------------------------------------------------
+# inventory builders
+# --------------------------------------------------------------------------
+
+
+def loc(start=0, end=100):
+    return SourceLocation(start, end, 1, start, 1, end)
+
+
+def symbol(
+    name,
+    *,
+    kind=SymbolKind.FUNCTION,
+    qualified_name=None,
+    parent=None,
+    start=0,
+    end=100,
+    modifiers=(),
+    base_types=(),
+    implemented_types=(),
+):
+    return SymbolInfo(
+        name,
+        kind,
+        qualified_name or name,
+        parent,
+        loc(start, end),
+        (),
+        None,
+        modifiers,
+        base_types,
+        implemented_types,
+    )
+
+
+def parsed(path, *, language=ParsedLanguage.PYTHON, symbols=(), imports=(), calls=()):
+    return ParsedFile(
+        path,
+        language,
+        ParseStatus.SUCCESS,
+        tuple(symbols),
+        tuple(imports),
+        tuple(calls),
+        (),
+        "0" * 64,
+    )
+
+
+def _language_name(language):
+    return "typescript" if language is ParsedLanguage.TSX else language.value
+
+
+def inventories(*files):
+    scanned = tuple(
+        ScannedFile(
+            item.relative_path,
+            PurePosixPath(item.relative_path).name,
+            PurePosixPath(item.relative_path).suffix,
+            _language_name(item.language),
             FileCategory.SOURCE,
-            4096,
+            1 << 20,
         )
-        files.append((scanned, parsed))
-
-    scanned_files = tuple(f[0] for f in files)
-    parsed_files = tuple(f[1] for f in files)
-
-    file_inventory = FileInventory(
-        "/inert/repo",
-        file_count,
-        file_count,
-        0,
-        scanned_files,
-        (),
-        (),
-        "test-repo",
+        for item in files
     )
-    parse_inventory = CodeParseInventory(
-        "/inert/repo",
-        file_count,
-        file_count,
-        0,
-        0,
-        0,
-        parsed_files,
-        (),
-        "test-repo",
+    return (
+        FileInventory(
+            "/inert/repo", len(files), len(files), 0, scanned, (), (), NAMESPACE
+        ),
+        CodeParseInventory(
+            "/inert/repo",
+            len(files),
+            len(files),
+            0,
+            0,
+            0,
+            tuple(files),
+            (),
+            NAMESPACE,
+        ),
     )
-    return file_inventory, parse_inventory
+
+
+def counted_index(index):
+    """Clone ``index`` with its global maps replaced by counting wrappers."""
+    clone = copy.copy(index)
+    counters = {}
+    for name in GLOBAL_MAPS:
+        counter = CountingMapping(getattr(index, name))
+        object.__setattr__(clone, name, counter)
+        counters[name] = counter
+    return clone, counters
+
+
+def _iterations(counters):
+    return sum(counter.counts["iter"] for counter in counters.values())
+
+
+def _lookups(counters):
+    return sum(counter.counts["get"] for counter in counters.values())
+
+
+# --------------------------------------------------------------------------
+# inventory size scaling
+# --------------------------------------------------------------------------
 
 
 def test_synthetic_inventories_scale_linearly():
-    """Build synthetic inventories with varying sizes and verify linear scaling."""
-    # Test with 64 files
-    fi_64, pi_64 = _create_synthetic_inventory(64, 4, 8)
-    graph_64 = build_code_graph(fi_64, pi_64)
-    assert len(graph_64.nodes) == 64 * (4 + 1)  # 4 symbols + 1 file node per file
+    """Doubling files and symbols doubles the published node count."""
+    counts = []
+    for file_count in (64, 128, 256):
+        files = tuple(
+            parsed(
+                f"file_{file_index}.py",
+                symbols=tuple(
+                    symbol(
+                        f"symbol_{position}",
+                        start=position * 20,
+                        end=position * 20 + 10,
+                    )
+                    for position in range(4)
+                ),
+            )
+            for file_index in range(file_count)
+        )
+        graph = build_code_graph(*inventories(*files))
+        counts.append(len(graph.nodes))
+        assert len(graph.nodes) == file_count * 5
+        assert len(graph.edges) == file_count * 4
 
-    # Test with 128 files
-    fi_128, pi_128 = _create_synthetic_inventory(128, 4, 8)
-    graph_128 = build_code_graph(fi_128, pi_128)
-    assert len(graph_128.nodes) == 128 * (4 + 1)
-
-    # Test with 256 files
-    fi_256, pi_256 = _create_synthetic_inventory(256, 4, 8)
-    graph_256 = build_code_graph(fi_256, pi_256)
-    assert len(graph_256.nodes) == 256 * (4 + 1)
-
-    # Verify node count scales linearly with file count
-    assert len(graph_128.nodes) == 2 * len(graph_64.nodes)
-    assert len(graph_256.nodes) == 4 * len(graph_64.nodes)
-
-
-def test_same_file_calls_use_indexed_lookups_not_global_scans():
-    """Verify same-file call resolution uses indexed lookups, not global scans."""
-    # Create a moderate inventory with 50 files, 5 symbols each, 10 calls each
-    fi, pi = _create_synthetic_inventory(50, 5, 10)
-
-    # Build graph and verify it completes in reasonable time
-    # If it used O(R*S) global scans, this would be noticeably slow
-    graph = build_code_graph(fi, pi)
-
-    # Verify graph has expected structure
-    assert len(graph.nodes) == 50 * (5 + 1)  # 5 symbols + 1 file per file
-    assert len(graph.edges) > 0  # Should have resolved some calls
-
-    # Test with larger inventory to verify scaling
-    fi_large, pi_large = _create_synthetic_inventory(100, 5, 10)
-    graph_large = build_code_graph(fi_large, pi_large)
-
-    assert len(graph_large.nodes) == 100 * (5 + 1)
-
-    # The key scaling property: doubling files should roughly double work
-    # If it were O(R*S) with R=500, S=250, this would be 125,000 operations
-    # With indexed lookups, it should be closer to O(R + S) = 750 operations
-    # We verify this by checking that the larger graph doesn't take exponentially longer
+    assert counts[1] == 2 * counts[0]
+    assert counts[2] == 4 * counts[0]
 
 
-def test_index_construction_is_linear_scan():
-    """Verify index construction scales linearly with file/symbol count."""
-    # Build indexes for 64 files
-    fi_64, pi_64 = _create_synthetic_inventory(64, 4, 0)
-    inputs_64 = validate_inputs(fi_64, pi_64)
-    index_64 = build_graph_indexes(inputs_64)
+def test_index_construction_produces_one_symbol_range_index_per_file():
+    """Index construction is driven by files, and covers every file."""
+    files = tuple(
+        parsed(
+            f"file_{index}.py",
+            symbols=tuple(
+                symbol(f"symbol_{position}", start=position * 20, end=position * 20 + 10)
+                for position in range(4)
+            ),
+        )
+        for index in range(32)
+    )
 
-    # Build indexes for 128 files (2x)
-    fi_128, pi_128 = _create_synthetic_inventory(128, 4, 0)
-    inputs_128 = validate_inputs(fi_128, pi_128)
-    index_128 = build_graph_indexes(inputs_128)
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
 
-    # Build indexes for 256 files (4x)
-    fi_256, pi_256 = _create_synthetic_inventory(256, 4, 0)
-    inputs_256 = validate_inputs(fi_256, pi_256)
-    index_256 = build_graph_indexes(inputs_256)
-
-    # Verify correct node counts scale linearly
-    assert len(index_64.nodes) == 64 * (4 + 1)
-    assert len(index_128.nodes) == 128 * (4 + 1)
-    assert len(index_256.nodes) == 256 * (4 + 1)
-
-    # Verify linear scaling property
-    assert len(index_128.nodes) == 2 * len(index_64.nodes)
-    assert len(index_256.nodes) == 4 * len(index_64.nodes)
+    assert len(index.symbol_ranges_by_file) == 32
+    assert len(index.file_ids) == 32
+    assert len(index.by_file_name) == 32 * 4
 
 
-def test_deep_nested_parents_use_precomputed_scope_links():
-    """Verify parent resolution is efficient and doesn't require repeated walking."""
-    # Create a file with top-level symbols only (no complex nesting)
-    # This tests that the parent_id precomputation works correctly
+# --------------------------------------------------------------------------
+# the core structural guarantee: no O(R x S) global scan
+# --------------------------------------------------------------------------
+
+
+def _same_file_call_batch(unrelated_symbols, reference_count):
+    symbols = [
+        symbol("helper", start=0, end=40),
+        symbol("caller", start=50, end=150),
+    ]
+    for offset in range(unrelated_symbols):
+        start = 200 + offset * 20
+        symbols.append(
+            symbol(f"unrelated_{offset}", start=start, end=start + 10)
+        )
+    calls = tuple(
+        CallSite(
+            "caller",
+            "helper",
+            CallKind.CALL,
+            loc(60 + 2 * position, 61 + 2 * position),
+        )
+        for position in range(reference_count)
+    )
+    return parsed("main.py", symbols=symbols, calls=calls), calls
+
+
+def test_reference_resolution_never_iterates_a_global_map():
+    """A batch of same-file calls must not scan any whole-repository map."""
+    file, calls = _same_file_call_batch(unrelated_symbols=400, reference_count=20)
+    index = build_graph_indexes(validate_inputs(*inventories(file)))
+    counted, counters = counted_index(index)
+    environment = ImportEnvironment({"main.py": ()})
+
+    for item in calls:
+        resolve_reference(counted, environment, call_reference(index, file, item))
+
+    assert _iterations(counters) == 0
+    assert _lookups(counters) <= 20 * len(calls)
+
+
+def test_unrelated_symbols_do_not_change_per_reference_lookup_cost():
+    """Repository size must not change per-reference work: no O(R x S)."""
+    measurements = {}
+    for unrelated in (0, 200, 800):
+        file, calls = _same_file_call_batch(
+            unrelated_symbols=unrelated, reference_count=20
+        )
+        index = build_graph_indexes(validate_inputs(*inventories(file)))
+        counted, counters = counted_index(index)
+        environment = ImportEnvironment({"main.py": ()})
+
+        for item in calls:
+            resolve_reference(counted, environment, call_reference(index, file, item))
+
+        measurements[unrelated] = _lookups(counters) / len(calls)
+        assert _iterations(counters) == 0
+
+    assert measurements[0] == measurements[200] == measurements[800]
+    assert measurements[800] <= 20
+
+
+def test_ambiguous_references_emit_candidates_without_iterating_a_global_map():
+    """Even AMBIGUOUS output accounting must not fall back to a scan."""
+    caller = symbol("caller", start=0, end=200)
+    symbols = [caller]
+    for offset in range(300):
+        start = 1000 + offset * 20
+        symbols.append(
+            symbol(
+                "target",
+                start=start,
+                end=start + 10,
+            )
+        )
+    calls = tuple(
+        CallSite("caller", "target", CallKind.CALL, loc(50 + position, 51 + position))
+        for position in range(10)
+    )
+    file = parsed("main.py", symbols=symbols, calls=calls)
+    index = build_graph_indexes(validate_inputs(*inventories(file)))
+    counted, counters = counted_index(index)
+    environment = ImportEnvironment({"main.py": ()})
+
+    results = [
+        resolve_reference(counted, environment, call_reference(index, file, item))
+        for item in calls
+    ]
+
+    assert _iterations(counters) == 0
+    for result in results:
+        assert result.reason is ResolutionFailureReason.AMBIGUOUS
+
+
+# --------------------------------------------------------------------------
+# import environment indexing
+# --------------------------------------------------------------------------
+
+
+def test_import_environment_is_keyed_by_scope_and_name_not_rebuilt_per_call():
+    """Imported-name lookups hit bindings_by_scope_name, not a record scan."""
+    item = ImportInfo(
+        "pkg.util",
+        (ImportBinding("run", "execute"),),
+        False,
+        (),
+        loc(20, 45),
+    )
+    caller = symbol("caller", start=100, end=300)
+    calls = tuple(
+        CallSite("caller", "execute", CallKind.CALL, loc(150 + position, 160 + position))
+        for position in range(10)
+    )
+    source = parsed("main.py", symbols=(caller,), imports=(item,), calls=calls)
+    target = parsed("pkg/util.py", symbols=(symbol("run", start=5, end=15),))
+
+    index = build_graph_indexes(validate_inputs(*inventories(source, target)))
+    counted, counters = counted_index(index)
+    environment = ImportEnvironment(
+        {"main.py": ((item, resolve_import(counted, source, item)),)}
+    )
+
+    for item_call in calls:
+        result = resolve_reference(
+            counted, environment, call_reference(index, source, item_call)
+        )
+        assert result.target_node_id is not None
+
+    assert _iterations(counters) == 0
+    assert _lookups(counters) <= 20 * len(calls)
+    assert list(environment.bindings_by_scope_name) == [
+        (file_node_id(NAMESPACE, "main.py"), "execute")
+    ]
+
+
+def test_import_environment_indexes_every_binding_by_scope_and_name():
+    """Bindings are bucketed once, keyed by (scope, local name)."""
+    items = (
+        ImportInfo("pkg.a", (ImportBinding("alpha", "a"),), False, (), loc(0, 12)),
+        ImportInfo("pkg.b", (ImportBinding("beta", "b"),), False, (), loc(14, 26)),
+        ImportInfo("pkg.c", (), False, (), loc(28, 38)),
+    )
+    source = parsed("main.py", imports=items)
+    files = [source]
+    for path, name in (("pkg/a.py", "alpha"), ("pkg/b.py", "beta"), ("pkg/c.py", "gamma")):
+        files.append(parsed(path, symbols=(symbol(name, start=0, end=50),)))
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+
+    environment = ImportEnvironment(
+        {"main.py": tuple((item, resolve_import(index, source, item)) for item in items)}
+    )
+
+    keys = set(environment.bindings_by_scope_name)
+    scope = file_node_id(NAMESPACE, "main.py")
+    assert (scope, "a") in keys
+    assert (scope, "b") in keys
+    assert len(keys) == 2
+    assert environment.wildcards_by_file == {}
+    assert tuple(item for item, _ in environment.by_file["main.py"]) == items
+
+
+# --------------------------------------------------------------------------
+# structural edges and nesting
+# --------------------------------------------------------------------------
+
+
+def test_structural_edges_are_driven_by_precomputed_parent_ids():
+    """structural_edges must not scan the node tuple to discover parents."""
+    outer = symbol("Outer", kind=SymbolKind.CLASS, start=0, end=9000)
+    inner = symbol(
+        "Inner",
+        kind=SymbolKind.CLASS,
+        qualified_name="Outer.Inner",
+        parent="Outer",
+        start=100,
+        end=8000,
+    )
+    plain = symbol("plain", start=20000, end=20050)
+    file = parsed("nested.py", symbols=(outer, inner, plain))
+    index = build_graph_indexes(validate_inputs(*inventories(file)))
+    counted, counters = counted_index(index)
+
+    edges = structural_edges(counted)
+
+    contains = [edge for edge in edges if edge.edge_kind is GraphEdgeKind.CONTAINS]
+    assert len(contains) == 1
+    assert _iterations(counters) == 0
+
+
+def _nested_file(depth, unrelated):
     symbols = []
-    for i in range(10):
-        symbol = SymbolInfo(
-            f"function_{i}",
-            SymbolKind.FUNCTION,
-            f"function_{i}",
-            None,
-            SourceLocation(i * 20, i * 20 + 15, 1, i * 20, 1, i * 20 + 15),
-            (),
-            None,
-            (),
-            (),
-            (),
+    parent = None
+    for level in range(depth):
+        qualified = "Outer" + "".join(f".L{position}" for position in range(level + 1))
+        start = level * 100
+        symbols.append(
+            symbol(
+                f"L{level}",
+                qualified_name=qualified,
+                parent=parent,
+                start=start,
+                end=9000 - start,
+            )
         )
-        symbols.append(symbol)
-
-    parsed = ParsedFile(
-        "flat.py",
-        ParsedLanguage.PYTHON,
-        ParseStatus.SUCCESS,
-        tuple(symbols),
-        (),
-        (),
-        (),
-        "0" * 64,
+        parent = qualified
+    for offset in range(unrelated):
+        start = 20000 + offset * 20
+        symbols.append(symbol(f"filler_{offset}", start=start, end=start + 10))
+    leaf_start = (depth - 1) * 100 + 100
+    leaf_qualified = f"{parent}.leaf"
+    symbols.append(
+        symbol("leaf", qualified_name=leaf_qualified, parent=parent,
+               start=leaf_start, end=leaf_start + 50)
     )
-    scanned = ScannedFile(
-        "flat.py",
-        "flat.py",
-        ".py",
-        "python",
-        FileCategory.SOURCE,
-        4096,
+    call = CallSite(
+        leaf_qualified, "L0", CallKind.CALL, loc(leaf_start + 5, leaf_start + 10)
     )
-
-    fi = FileInventory(
-        "/inert/repo",
-        1,
-        1,
-        0,
-        (scanned,),
-        (),
-        (),
-        "test-repo",
-    )
-    pi = CodeParseInventory(
-        "/inert/repo",
-        1,
-        1,
-        0,
-        0,
-        0,
-        (parsed,),
-        (),
-        "test-repo",
-    )
-
-    # Build graph - should use precomputed parent_ids
-    graph = build_code_graph(fi, pi)
-
-    # Verify all symbols are present and graph builds efficiently
-    assert len(graph.nodes) == 11  # 10 symbols + 1 file
-
-    # All symbols should be top-level (no CONTAINS edges)
-    contains_edges = [e for e in graph.edges if e.edge_kind == GraphEdgeKind.CONTAINS]
-    assert len(contains_edges) == 0
+    return parsed("deep.py", symbols=symbols, calls=(call,)), call
 
 
-def test_import_environment_binds_by_scope_name_not_full_scan():
-    """Verify ImportEnvironment uses indexed bindings, not full import record scans."""
-    # Create a file with multiple imports
-    imports = []
-    for i in range(20):
-        imports.append(ImportInfo(
-            f"module_{i}",
-            (ImportBinding(f"symbol_{i}", None),),
-            False,
-            (),
-            SourceLocation(i * 5, i * 5 + 10, 1, i * 5, 1, i * 5 + 10),
-        ))
+def test_scope_walk_cost_grows_with_depth_not_with_file_size():
+    """Nested scope resolution is O(depth); filler symbols must not change it."""
+    measurements = {}
+    for filler in (0, 200, 800):
+        file, call = _nested_file(depth=8, unrelated=filler)
+        index = build_graph_indexes(validate_inputs(*inventories(file)))
+        counted, counters = counted_index(index)
+        environment = ImportEnvironment({"deep.py": ()})
+        reference = call_reference(index, file, call)
 
-    parsed = ParsedFile(
-        "imports.py",
-        ParsedLanguage.PYTHON,
-        ParseStatus.SUCCESS,
-        (),
-        tuple(imports),
-        (),
-        (),
-        "0" * 64,
-    )
-    scanned = ScannedFile(
-        "imports.py",
-        "imports.py",
-        ".py",
-        "python",
-        FileCategory.SOURCE,
-        4096,
+        resolve_reference(counted, environment, reference)
+        measurements[filler] = _lookups(counters)
+
+        assert _iterations(counters) == 0
+
+    assert measurements[0] == measurements[200] == measurements[800]
+
+
+def test_scope_walk_cost_is_linear_in_depth():
+    """Doubling nesting depth must not more than double the per-call work."""
+    costs = {}
+    for depth in (4, 8, 16):
+        file, call = _nested_file(depth=depth, unrelated=0)
+        index = build_graph_indexes(validate_inputs(*inventories(file)))
+        counted, counters = counted_index(index)
+        environment = ImportEnvironment({"deep.py": ()})
+
+        resolve_reference(counted, environment, call_reference(index, file, call))
+        costs[depth] = _lookups(counters)
+
+    assert costs[8] <= 2 * costs[4]
+    assert costs[16] <= 2 * costs[8]
+
+
+# --------------------------------------------------------------------------
+# Java wildcard candidates: K matching files, U unrelated files
+# --------------------------------------------------------------------------
+
+
+def _java_package_file(package, name, offset):
+    return parsed(
+        f"{name}.java",
+        language=ParsedLanguage.JAVA,
+        symbols=(
+            symbol(
+                name,
+                kind=SymbolKind.CLASS,
+                qualified_name=f"{package}.{name}",
+                start=offset * 20,
+                end=offset * 20 + 10,
+            ),
+        ),
     )
 
-    fi = FileInventory(
-        "/inert/repo",
-        1,
-        1,
-        0,
-        (scanned,),
-        (),
-        (),
-        "test-repo",
+
+def _java_wildcard_case(matching, unrelated):
+    wildcard = ImportInfo("wild", (), True, (), loc(0, 12))
+    source = parsed(
+        "Use.java",
+        language=ParsedLanguage.JAVA,
+        imports=(wildcard,),
+        symbols=(
+            symbol(
+                "Use",
+                kind=SymbolKind.CLASS,
+                qualified_name="app.Use",
+                start=0,
+                end=9000,
+            ),
+        ),
     )
-    pi = CodeParseInventory(
-        "/inert/repo",
-        1,
-        1,
-        0,
-        0,
-        0,
-        (parsed,),
-        (),
-        "test-repo",
-    )
-
-    # Build graph - should handle many imports efficiently
-    graph = build_code_graph(fi, pi)
-
-    # Verify graph builds successfully with many imports
-    assert len(graph.nodes) == 1  # 1 file (no symbols)
-    # Unresolved import references should be tracked
-    import_refs = [r for r in graph.unresolved_references if r.reference_kind == ReferenceKind.IMPORT]
-    assert len(import_refs) == 20  # All 20 imports should produce unresolved references
-
-
-def test_java_wildcard_candidates_scale_with_k_not_unrelated_u():
-    """Verify Java files build efficiently without scanning unrelated files."""
-    # Create top-level Java classes (no package nesting to avoid parent resolution issues)
-    files = []
-    for i in range(20):
-        symbol = SymbolInfo(
-            f"Class{i}",
-            SymbolKind.CLASS,
-            f"Class{i}",
-            None,
-            SourceLocation(i * 20, i * 20 + 15, 1, i * 20, 1, i * 20 + 15),
-            (),
-            None,
-            (),
-            (),
-            (),
+    files = [source]
+    for position in range(matching):
+        files.append(_java_package_file("wild", f"Part{position}", position))
+    for position in range(unrelated):
+        files.append(
+            parsed(
+                f"other{position}.py",
+                symbols=(
+                    symbol(f"py{position}", start=position * 20, end=position * 20 + 10),
+                ),
+            )
         )
-        parsed = ParsedFile(
-            f"Class{i}.java",
-            ParsedLanguage.JAVA,
-            ParseStatus.SUCCESS,
-            (symbol,),
-            (),
-            (),
-            (),
-            "0" * 64,
-        )
-        scanned = ScannedFile(
-            f"Class{i}.java",
-            f"Class{i}.java",
-            ".java",
-            "java",
-            FileCategory.SOURCE,
-            4096,
-        )
-        files.append((scanned, parsed))
+    return source, files
 
-    scanned_files = tuple(f[0] for f in files)
-    parsed_files = tuple(f[1] for f in files)
 
-    fi = FileInventory(
-        "/inert/repo",
-        20,
-        20,
-        0,
-        scanned_files,
-        (),
-        (),
-        "test-repo",
+@pytest.mark.parametrize("matching", [2, 4, 8])
+def test_java_wildcard_candidates_track_matching_files_only(matching):
+    """Wildcard candidate set is exactly the matching package files."""
+    source, files = _java_wildcard_case(matching, unrelated=200)
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+
+    result = resolve_import(index, source, source.imports[0]).resolution
+
+    assert result.reason is ResolutionFailureReason.AMBIGUOUS
+    assert len(result.candidate_node_ids) == matching
+    assert result.candidate_node_ids == tuple(sorted(result.candidate_node_ids))
+
+
+def test_java_wildcard_resolution_cost_is_independent_of_unrelated_files():
+    """Adding unrelated files must not add per-reference work."""
+    measurements = {}
+    for unrelated in (0, 200, 800):
+        source, files = _java_wildcard_case(matching=4, unrelated=unrelated)
+        index = build_graph_indexes(validate_inputs(*inventories(*files)))
+        counted, counters = counted_index(index)
+
+        for _ in range(5):
+            resolve_import(counted, source, source.imports[0])
+
+        measurements[unrelated] = _lookups(counters)
+
+    assert measurements[0] == measurements[200] == measurements[800]
+
+
+def test_java_wildcard_memo_is_per_build_and_not_a_global_cache():
+    """The wildcard memo must not survive across GraphIndexes instances."""
+    source, files = _java_wildcard_case(matching=4, unrelated=0)
+    first_index = build_graph_indexes(validate_inputs(*inventories(*files)))
+    environment = ImportEnvironment({"Use.java": ()})
+    item = source.imports[0]
+
+    first = resolve_import(first_index, source, item).resolution
+    second = resolve_import(first_index, source, item).resolution
+
+    smaller_files = [files[0], *files[1:3]]
+    smaller_index = build_graph_indexes(validate_inputs(*inventories(*smaller_files)))
+    third = resolve_import(smaller_index, source, item).resolution
+
+    assert first.reason is ResolutionFailureReason.AMBIGUOUS
+    assert second == first
+    assert len(first.candidate_node_ids) == 4
+    assert third.reason is ResolutionFailureReason.AMBIGUOUS
+    assert len(third.candidate_node_ids) == 2
+    assert environment.wildcards_by_file == {}
+
+
+# --------------------------------------------------------------------------
+# ECMAScript: all eight bounded candidate paths
+# --------------------------------------------------------------------------
+
+
+def _ecmascript_all_eight_paths():
+    source = parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dep", (), False, (), loc(0, 8)),),
     )
-    pi = CodeParseInventory(
-        "/inert/repo",
-        20,
-        20,
-        0,
-        0,
-        0,
-        parsed_files,
-        (),
-        "test-repo",
+    files = [source]
+    for suffix, language in (
+        (".js", ParsedLanguage.JAVASCRIPT),
+        (".jsx", ParsedLanguage.JAVASCRIPT),
+        (".ts", ParsedLanguage.TYPESCRIPT),
+        (".tsx", ParsedLanguage.TSX),
+    ):
+        files.append(parsed(f"dep{suffix}", language=language))
+        files.append(parsed(f"dir/index{suffix}", language=language))
+    return source, files
+
+
+def test_ecmascript_extensionless_import_keeps_all_eight_bounded_candidates():
+    """./dep and ./dir must each yield four extension candidates, unmerged."""
+    source, files = _ecmascript_all_eight_paths()
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+
+    direct = resolve_import(index, source, source.imports[0]).resolution
+
+    assert direct.reason is ResolutionFailureReason.AMBIGUOUS
+    expected = tuple(
+        sorted(
+            file_node_id(NAMESPACE, path)
+            for path in ("dep.js", "dep.jsx", "dep.ts", "dep.tsx")
+        )
     )
-
-    # Build graph - should handle Java files efficiently
-    graph = build_code_graph(fi, pi)
-
-    # Verify all files are present
-    assert len(graph.nodes) == 40  # 20 symbols + 20 file nodes
+    assert direct.candidate_node_ids == expected
+    assert len(direct.candidate_node_ids) == 4
 
 
-def test_ecmascript_candidate_paths_use_direct_index_not_file_scan():
-    """Verify ECMAScript files build efficiently."""
-    # Simplified test - just verify JavaScript files build efficiently
-    # The specific candidate path logic is tested in the ECMAScript resolver tests
-
-    # Use synthetic inventory helper to create JavaScript file
-    fi, pi = _create_synthetic_inventory(1, 1, 0)
-
-    # Change the language to JavaScript
-    parsed_files = list(pi.files)
-    if parsed_files:
-        parsed = parsed_files[0]
-        # Create a new parsed file with JavaScript language
-        parsed = ParsedFile(
-            "dep.js",
-            ParsedLanguage.JAVASCRIPT,
-            ParseStatus.SUCCESS,
-            parsed.symbols,
-            parsed.imports,
-            parsed.calls,
-            parsed.issues,
-            parsed.source_sha256,
-        )
-        scanned = ScannedFile(
-            "dep.js",
-            "dep.js",
-            ".js",
-            ParsedLanguage.JAVASCRIPT.value,
-            FileCategory.SOURCE,
-            4096,
-        )
-
-        fi = FileInventory(
-            "/inert/repo",
-            1,
-            1,
-            0,
-            (scanned,),
-            (),
-            (),
-            "test-repo",
-        )
-        pi = CodeParseInventory(
-            "/inert/repo",
-            1,
-            1,
-            0,
-            0,
-            0,
-            (parsed,),
-            (),
-            "test-repo",
-        )
-
-    # Build graph - should handle ECMAScript files efficiently
-    graph = build_code_graph(fi, pi)
-
-    # Verify file is present
-    assert len(graph.nodes) == 2  # 1 symbol + 1 file node
-
-
-def test_ambiguity_accounting_emits_rk_candidates_correctly():
-    """Verify candidate accounting works correctly when ambiguity occurs."""
-    # Simplified test - verify that the graph builds with multiple symbols
-    # and that unresolved references are tracked correctly
-
-    # Create multiple files with different symbols to avoid complex ambiguity setup
-    files = []
-    for i in range(5):
-        symbol = SymbolInfo(
-            f"func{i}",
-            SymbolKind.FUNCTION,
-            f"func{i}",
-            None,
-            SourceLocation(i * 20, i * 20 + 15, 1, i * 20, 1, i * 20 + 15),
-            (),
-            None,
-            (),
-            (),
-            (),
-        )
-        parsed = ParsedFile(
-            f"file{i}.py",
-            ParsedLanguage.PYTHON,
-            ParseStatus.SUCCESS,
-            (symbol,),
-            (),
-            (),
-            (),
-            "0" * 64,
-        )
-        scanned = ScannedFile(
-            f"file{i}.py",
-            f"file{i}.py",
-            ".py",
-            "python",
-            FileCategory.SOURCE,
-            4096,
-        )
-        files.append((scanned, parsed))
-
-    scanned_files = tuple(f[0] for f in files)
-    parsed_files = tuple(f[1] for f in files)
-
-    fi = FileInventory(
-        "/inert/repo",
-        5,
-        5,
-        0,
-        scanned_files,
-        (),
-        (),
-        "test-repo",
+def test_ecmascript_directory_index_paths_are_the_other_four_candidates():
+    """The ./dir request resolves through four index files, not ./dep files."""
+    source = parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dir", (), False, (), loc(0, 8)),),
     )
-    pi = CodeParseInventory(
-        "/inert/repo",
-        5,
-        5,
-        0,
-        0,
-        0,
-        parsed_files,
-        (),
-        "test-repo",
+    files = [source]
+    for suffix, language in (
+        (".js", ParsedLanguage.JAVASCRIPT),
+        (".jsx", ParsedLanguage.JAVASCRIPT),
+        (".ts", ParsedLanguage.TYPESCRIPT),
+        (".tsx", ParsedLanguage.TSX),
+    ):
+        files.append(parsed(f"dep{suffix}", language=language))
+        files.append(parsed(f"dir/index{suffix}", language=language))
+
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+    result = resolve_import(index, source, source.imports[0]).resolution
+
+    assert result.reason is ResolutionFailureReason.AMBIGUOUS
+    expected = tuple(
+        sorted(
+            file_node_id(NAMESPACE, f"dir/index{suffix}")
+            for suffix in (".js", ".jsx", ".ts", ".tsx")
+        )
     )
-
-    # Build graph
-    graph = build_code_graph(fi, pi)
-
-    # Verify all files are present (5 files + 5 symbols = 10 nodes)
-    assert len(graph.nodes) == 10
-
-    # Verify that unresolved references (if any) have proper structure
-    for ref in graph.unresolved_references:
-        # Candidate IDs should be sorted if present
-        if ref.candidate_node_ids:
-            assert list(ref.candidate_node_ids) == sorted(ref.candidate_node_ids)
+    assert result.candidate_node_ids == expected
 
 
-def test_sensitivity_probe_catches_global_scan_regression():
-    """Verify that the scaling tests would catch a global scan regression."""
-    # This test verifies that if someone introduced a global scan,
-    # the scaling tests would detect it through lookup count assertions.
-    # We verify this by checking that the current implementation
-    # completes in reasonable time for larger inventories.
+def test_ecmascript_explicit_extension_selects_only_the_exact_file():
+    """An explicit supported extension is a single candidate, not a scan."""
+    source = parsed(
+        "main.js",
+        language=ParsedLanguage.JAVASCRIPT,
+        imports=(ImportInfo("./dep.ts", (), False, (), loc(0, 10)),),
+    )
+    files = [
+        source,
+        parsed("dep.js", language=ParsedLanguage.JAVASCRIPT),
+        parsed("dep.jsx", language=ParsedLanguage.JAVASCRIPT),
+        parsed("dep.ts", language=ParsedLanguage.TYPESCRIPT),
+        parsed("dep.tsx", language=ParsedLanguage.TSX),
+    ]
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
 
-    # Build a larger inventory to stress test the implementation
-    fi, pi = _create_synthetic_inventory(100, 5, 10)
+    result = resolve_import(index, source, source.imports[0]).resolution
 
-    # This should complete quickly if using indexed lookups
-    # If it used O(R*S) global scans, it would be noticeably slow
-    graph = build_code_graph(fi, pi)
+    assert result.target_node_id == file_node_id(NAMESPACE, "dep.ts")
 
-    # Verify graph builds successfully
-    assert len(graph.nodes) == 100 * (5 + 1)  # 100 files * (5 symbols + 1 file node)
 
-    # The key assertion: if this completes in reasonable time,
-    # it proves indexed lookups are being used, not global scans
+def test_ecmascript_candidate_resolution_never_scans_the_file_map():
+    """Resolving the eight candidate paths must not iterate a global map."""
+    source, files = _ecmascript_all_eight_paths()
+    index = build_graph_indexes(validate_inputs(*inventories(*files)))
+    counted, counters = counted_index(index)
+    item = source.imports[0]
+
+    for _ in range(10):
+        resolve_import(counted, source, item)
+
+    assert _iterations(counters) == 0
+
+
+# --------------------------------------------------------------------------
+# candidate/output accounting for repeated ambiguity sites
+# --------------------------------------------------------------------------
+
+
+def test_repeated_ambiguity_sites_emit_exactly_r_times_k_candidates():
+    """R ambiguity sites over K eligible targets emit R*K candidate ids."""
+    references = 6
+    targets = 5
+    symbols = [symbol("caller", start=0, end=400)]
+    for position in range(targets):
+        start = 1000 + position * 20
+        symbols.append(symbol("target", start=start, end=start + 10))
+    calls = tuple(
+        CallSite(
+            "caller",
+            "target",
+            CallKind.CALL,
+            loc(50 + 10 * position, 55 + 10 * position),
+        )
+        for position in range(references)
+    )
+    file = parsed("main.py", symbols=symbols, calls=calls)
+    index = build_graph_indexes(validate_inputs(*inventories(file)))
+    counted, counters = counted_index(index)
+    environment = ImportEnvironment({"main.py": ()})
+
+    results = [
+        resolve_reference(counted, environment, call_reference(index, file, item))
+        for item in calls
+    ]
+
+    assert _iterations(counters) == 0
+    assert all(
+        result.reason is ResolutionFailureReason.AMBIGUOUS for result in results
+    )
+    assert all(
+        len(result.candidate_node_ids) == targets for result in results
+    )
+    emitted = sum(len(result.candidate_node_ids) for result in results)
+    assert emitted == references * targets
+    graph = build_code_graph(*inventories(file))
+    assert len(graph.unresolved_references) == references
+    assert sum(
+        len(item.candidate_node_ids) for item in graph.unresolved_references
+    ) == references * targets
+    assert not [
+        edge
+        for edge in graph.edges
+        if edge.edge_kind is GraphEdgeKind.CALLS
+    ]
+
+
+def test_ambiguity_candidate_sets_are_disjoint_across_sites_but_stable():
+    """Distinct sites may share a candidate set; each set stays sorted."""
+    symbols = [symbol("caller", start=0, end=400)]
+    for position in range(4):
+        start = 1000 + position * 20
+        symbols.append(symbol("target", start=start, end=start + 10))
+    calls = tuple(
+        CallSite(
+            "caller",
+            "target",
+            CallKind.CALL,
+            loc(50 + 10 * position, 55 + 10 * position),
+        )
+        for position in range(3)
+    )
+    file = parsed("main.py", symbols=symbols, calls=calls)
+    graph = build_code_graph(*inventories(file))
+
+    candidates = {
+        item.candidate_node_ids for item in graph.unresolved_references
+    }
+    assert len(candidates) == 1
+    only = candidates.pop()
+    assert len(only) == 4
+    assert list(only) == sorted(only)
+    assert all(
+        item.reason is ResolutionFailureReason.AMBIGUOUS
+        and item.reference_kind is ReferenceKind.CALL
+        for item in graph.unresolved_references
+    )
