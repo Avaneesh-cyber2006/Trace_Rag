@@ -363,7 +363,11 @@ Invariants:
   `COPIED` change, only `new_path` (the destination). The copy source
   (`old_path` of a `COPIED` change) is lineage evidence and is NOT counted as
   touched by that commit. A commit touching one path contributes no co-change
-  entries for that path.
+  entries for that path. A co-change relationship between two distinct paths
+  is one unique unordered pair, normalized as `(min(A, B), max(A, B))`; the
+  same pair observed in multiple commits counts once toward the global
+  budget. The index is symmetric: B appears in `co_changed_paths[A]` if and
+  only if A appears in `co_changed_paths[B]`.
 - `commits_touching_path[path]` contains sorted unique commit IDs; it
   includes a commit only when `path` is genuinely touched by that commit
   (same rule as above). A copy source path is not added to
@@ -378,9 +382,12 @@ Invariants:
   observed). A path present in this tuple must NOT be interpreted as having
   no partners; its `co_changed_paths` entry (if present) is partial. A
   missing `co_changed_paths` key combined with absence from
-  `co_change_incomplete_paths` is complete absence (never touched in the
-  selected history); a missing key for a path IN this tuple is omitted
-  evidence, not proof of absence.
+  `co_change_incomplete_paths` is complete absence (never touched by any
+  successfully analyzed commit in the selected history); a missing key for a
+  path IN this tuple is omitted evidence, not proof of absence. Co-change
+  coverage is scoped to successfully analyzed evidence; missing baselines,
+  truncation, and commits NOT selected by `path_filter` require callers to
+  inspect `incomplete_reasons` and related completeness metadata.
 - `history_is_complete` is `True` only when `incomplete_reasons` is empty.
 
 ### 4.6 Exceptions
@@ -456,6 +463,8 @@ Allowed Git commands (read-only, local only):
 - `git rev-parse --is-shallow-repository`
 - `git rev-parse --git-dir` / `--git-common-dir`
 - `git rev-parse --verify --end-of-options <rev>^{commit}` / `<rev>^{tree}`
+  (including the first-parent form `<rev>^1^{tree}`; the commit's own tree is
+  never resolved by a command — it is read from the raw commit object, see 6.4)
 - `git symbolic-ref --quiet <revision>` (for detached-HEAD detection)
 - `git rev-list ...`
 - `git cat-file --batch` (optional, for commit metadata)
@@ -543,9 +552,12 @@ not truncated.
   true, shallow boundary commit IDs are read from the `shallow` file in the
   directory reported by `git rev-parse --git-common-dir` (one object ID per
   line), intersected with the reachable commit set. `--git-common-dir` is used
-  so linked worktrees share shallow metadata correctly. `SHALLOW_HISTORY` and
-  `PARENT_UNAVAILABLE` are recorded when any reachable commit has a missing
-  parent.
+  so linked worktrees share shallow metadata correctly. The reported directory
+  may be relative to the repository root or absolute; it is resolved against
+  the validated `repository_path` before the `shallow` file is read, because
+  commands run with `git -C <path>` and no cwd manipulation. `SHALLOW_HISTORY`
+  and `PARENT_UNAVAILABLE` are recorded when any reachable commit has a
+  missing parent.
 
 ### 6.3 Commit metadata
 
@@ -615,11 +627,14 @@ because the latter silently omits merge commits and can mix parents.
 
 Commands:
 
-1. Resolve trees (a single `git rev-parse` invocation accepts both
-   revision arguments, so a non-root commit needs only one resolution
-   command):
-   - commit tree: `git rev-parse --verify --end-of-options <commit>^{tree}`
-   - first-parent tree (non-root): `git rev-parse --verify --end-of-options <commit>^1^{tree}`
+1. Resolve trees:
+   - commit tree: the `tree <tree_id>` header parsed and validated from the
+     raw commit object fetched in 6.3 via `git cat-file --batch`. No Git
+     command is needed; the tree ID travels with the metadata batch.
+   - first-parent tree (non-root): one separate verified command,
+     `git rev-parse --verify --end-of-options <commit>^1^{tree}`. A
+     `rev-parse --verify` invocation must never receive more than one
+     revision argument.
    - root baseline: the well-known empty tree ID
      (`4b825dc642cb6eb9a060e54bf8d69288fbee4904` for SHA-1;
      `6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321`
@@ -662,9 +677,10 @@ Merge commits: only first-parent diff is recorded; `MERGE_SEMANTICS_PARTIAL`
 reason is added to `incomplete_reasons` when merges are present.
 
 Unavailable comparison baseline (shallow or otherwise):
-- If a non-root commit's first-parent tree cannot be resolved (shallow boundary
-  or missing parent object), no file-change records are fabricated for that
-  commit. `changes_by_commit[commit_id]` is an empty tuple. The commit is
+- The single first-parent-tree resolution command (`<commit>^1^{tree}`) fails
+  when the first parent's tree is unavailable (shallow boundary or missing
+  parent object). No file-change records are fabricated for that commit.
+  `changes_by_commit[commit_id]` is an empty tuple. The commit is
   retained in `commits` with its raw parent IDs and `is_root == False` (a
   shallow boundary has raw `parent` lines and is never reclassified as a
   root). `SHALLOW_HISTORY` and `PARENT_UNAVAILABLE` are added to
@@ -678,6 +694,13 @@ Unavailable comparison baseline (shallow or otherwise):
 - Missing historical change evidence is thus distinguishable from a genuinely
   unchanged commit: the latter has an empty change list and is absent from
   `commits_with_unavailable_baseline`.
+- Resolution failure is classified by exit status, never by stderr text: a
+  root commit, a shallow boundary, and an unknown object ID all produce the
+  identical `fatal: Needed a single revision` message. A `rev-parse --verify`
+  invocation that exits 128 for a commit ID known to exist is the documented
+  non-fatal "baseline unavailable" outcome. Every other failure (timeout,
+  oversize output, a different exit status, or termination by signal) raises
+  `GitCommandError` per 4.6/15.
 
 ### 6.5 Rename/copy similarity
 
@@ -843,7 +866,8 @@ threshold (50%) applies.
 - Timeouts per command.
 - Output size caps.
 - Path/revision validation prevents option injection.
-- Requires Git >= 2.29 (for `--end-of-options` and `--is-shallow-repository`);
+- Requires Git >= 2.29 (a conservative floor; `--end-of-options` landed in Git
+  2.24 and `--is-shallow-repository` in 2.15);
   older versions raise `GitUnavailableError`/`GitCommandError`.
 - Commit messages treated as untrusted data (stored, never executed or
   interpreted).
@@ -876,22 +900,43 @@ threshold (50%) applies.
   command; nothing raw is accumulated into the inventory).
 - Global co-change pair budget: total materialized co-change pairs across
   all commits are capped (fixed internal default 10,000,000, not
-  configurable). The per-commit cap below is insufficient on its own, because
-  many commits below that cap can still produce an enormous total number of
-  pairs. Commits are processed in inventory order (newest-first). For each
-  commit, if the number of pairs it would add fits in the remaining budget,
-  they are materialized; otherwise the commit's co-change pairs are omitted
-  entirely (atomic per commit) and all of its genuinely touched paths are
-  appended to `co_change_incomplete_paths`. `CO_CHANGE_LIMIT_EXCEEDED` is
-  added to `incomplete_reasons` if any commit was skipped. Ordinary
-  file-change and commit indexes are unaffected.
+  configurable). Accounting unit: a co-change relationship between two
+  distinct paths A and B is exactly one unique unordered pair, normalized
+  as `(min(A, B), max(A, B))`; the same pair observed in multiple commits
+  counts once. The `co_changed_paths` index exposes each relationship
+  symmetrically: B is a partner of A if and only if A is a partner of B.
+  The two symmetric index entries produced by one pair are a single budget
+  unit; the budget counts pairs, not index entries.
+  The per-commit cap below is insufficient on its own, because many commits
+  below that cap can still produce an enormous total number of pairs.
+  Commits are processed in inventory order (newest-first). For each commit,
+  its pair contribution is the number of NEW unique normalized pairs (not
+  already materialized from earlier-processed commits) it would introduce.
+  The whole contribution is tested against the remaining budget BEFORE any
+  mutation of the accumulated index; if it does not fit, the commit's
+  co-change pairs are omitted entirely (atomic per commit) and all of its
+  genuinely touched paths are appended to `co_change_incomplete_paths`.
+  `CO_CHANGE_LIMIT_EXCEEDED` is added to `incomplete_reasons` if any commit
+  was skipped. Ordinary file-change and commit indexes are unaffected.
+  Co-change coverage is scoped to successfully analyzed evidence. Commits
+  listed in `commits_with_unavailable_baseline` are not analyzed for changes
+  and contribute no co-change pairs; commits excluded by `max_commits`
+  truncation (inventory-level `truncated_by_limit` / `MAX_COMMITS_REACHED`)
+  and commits not selected by `path_filter`
+  (`PATH_FILTER_APPLIED`) are likewise not analyzed. Commits *selected* by
+  `path_filter` **are** analyzed in full — their complete first-parent change
+  sets and co-change pairs are materialized subject to the budget (see 6.2).
+  Callers must consult `incomplete_reasons` and related completeness metadata
+  rather than treat an empty or absent partner list as evidence about
+  unanalyzed commits.
 - Copy detection uses `--find-copies-harder`, whose cost is proportional to the
   number of files in the compared trees; this is the dominant per-commit cost
   when `detect_copies=True`.
 - Total subprocess invocations are bounded by a small constant plus O(commits):
   repository validation and revision resolution, one rev-list, one cat-file
   batch, one diff-tree per commit, and at most one tree-resolution command per
-  commit. No per-symbol or per-reference commands.
+  non-root commit (the commit tree itself comes from the raw commit object).
+  No per-symbol or per-reference commands.
 - `co_changed_paths` is built with a per-commit path-count cap (default
   1000 distinct touched paths). For a commit touching more than the cap, its
   co-change pairs are not materialized, all of its genuinely touched paths are
@@ -942,9 +987,20 @@ threshold (50%) applies.
 - Excluded merge scope (`include_merges=False`).
 - Path-filtered commit with unrelated file changes (commit selection only;
   changes list unfiltered; `PATH_FILTER_APPLIED` recorded).
-- Literal Git pathspec handling (paths with magic characters).
+- Literal Git pathspec handling (paths with bracket-style pathspec magic such
+  as `[a-z]`; `*` and `?` are illegal filename characters on Windows and are
+  covered by a POSIX-only test).
 - Copy source unchanged (source not modified/co-changed).
 - Huge single-commit co-change cardinality (co-change cap).
+- Single-revision `rev-parse --verify` invocations only (the adapter never
+  passes two revision arguments; the commit tree comes from the raw commit
+  object header).
+- Co-change pair accounting: unique unordered normalized pairs; the same pair
+  in multiple commits counts once toward the global budget; a commit's
+  contribution is its NEW unique pairs; the budget is checked before any
+  index mutation; overflow omission is atomic per commit.
+- Co-change coverage scoping: missing baselines, truncation, and commits
+  excluded by `path_filter` require callers to inspect completeness metadata.
 - Aggregate subprocess/output/time limits.
 - Many small commands whose combined output exceeds the cumulative output
   budget (global cap enforced; staying under the per-command cap does not
@@ -960,7 +1016,8 @@ threshold (50%) applies.
   `commits_with_unavailable_baseline` populated).
 - Detached HEAD.
 - Empty repository.
-- Shallow history (via `git clone --depth` locally).
+- Shallow history (via `git clone --depth 1 file:///<local-repo-path> <dir>`;
+  a plain local path ignores `--depth` and yields a full clone).
 - Many moderate-sized commits exhausting the global co-change pair budget
   (`CO_CHANGE_LIMIT_EXCEEDED`, deterministic `co_change_incomplete_paths`,
   `history_is_complete` is false).
