@@ -159,6 +159,13 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                 raise GitParseError("malformed header")
         if tree_id is None:
             raise GitParseError("missing tree")
+        # validate message decoding strictly
+        enc = encoding or "utf-8"
+        try:
+            message_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError) as e:
+            offset = getattr(e, "start", 0)
+            raise GitParseError(f"invalid message encoding at offset {offset}")
         if author_present:
             author_tz = normalize_timezone(author_tz_raw)
         else:
