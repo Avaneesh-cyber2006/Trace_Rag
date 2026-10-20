@@ -117,4 +117,3 @@ def test_published_index_lookup_is_a_direct_hit(git_repo):
     assert type(inv.commits_by_id).__name__ == "mappingproxy"
     with pytest.raises(KeyError):
         inv.commits_by_id["no-such-commit"]
-
