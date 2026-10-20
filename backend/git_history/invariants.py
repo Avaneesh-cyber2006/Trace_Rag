@@ -15,9 +15,9 @@ T = TypeVar("T")
 
 def require_object_id(value: str) -> str:
     if not isinstance(value, str) or OBJECT_ID_RE.fullmatch(value) is None:
-        from .exceptions import GitParseError
+        from .exceptions import GitRevisionError
 
-        raise GitParseError(f"invalid object id: {value!r}")
+        raise GitRevisionError(f"invalid object id: {value!r}")
     return value
 
 
@@ -31,9 +31,15 @@ def require_timezone(value: str) -> str:
 
 def require_tuple(value: Any, element_type: type = object) -> tuple:
     if not isinstance(value, tuple):
-        raise TypeError("expected tuple")
+        from .exceptions import GitParseError
+
+        raise GitParseError("expected tuple")
     return value
 
 
 def snapshot_mapping(mapping: Mapping[Any, Any]) -> MappingProxyType:
+    if not isinstance(mapping, Mapping):
+        from .exceptions import GitParseError
+
+        raise GitParseError("expected mapping")
     return MappingProxyType(dict(mapping))

@@ -31,9 +31,9 @@ CO_CHANGE_PAIR_BUDGET = 10_000_000
 CO_CHANGE_PER_COMMIT_PATH_CAP = 1000
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CoChangeResult:
-    index: dict
+    co_changed_paths: dict
     incomplete_paths: tuple
     limit_exceeded: bool
 
@@ -423,7 +423,7 @@ class GitHistoryAnalyzer:
             include_commit_messages=include_commit_messages,
         )
 
-        co_changed_paths = co_result.index
+        co_changed_paths = co_result.co_changed_paths
 
         inventory = GitHistoryInventory(
             repository_namespace=repository_namespace,

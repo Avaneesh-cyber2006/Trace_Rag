@@ -246,6 +246,8 @@ def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
             except UnicodeDecodeError as e:
                 offending = e.object[e.start:e.start + 4]
                 raise GitParseError(f"invalid utf-8 path at offset {e.start}: {offending.hex()}")
+            if old_path == "" or new_path == "":
+                raise GitParseError("empty path")
             ct = GitChangeType.RENAMED if status.startswith(b"R") else GitChangeType.COPIED
             result.append(RawFileChange(ct, old_path, new_path, score))
             i += 3
@@ -260,6 +262,8 @@ def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
             except UnicodeDecodeError as e:
                 offending = e.object[e.start:e.start + 4]
                 raise GitParseError(f"invalid utf-8 path at offset {e.start}: {offending.hex()}")
+            if path == "":
+                raise GitParseError("empty path")
             if status == b"X" or status not in status_map:
                 # unknown
                 old = None

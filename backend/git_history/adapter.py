@@ -14,7 +14,9 @@ from .exceptions import (
     GitCommandTimeoutError,
     GitConfigurationError,
     GitOutputTooLargeError,
+    GitParseError,
     GitRepositoryError,
+    GitRevisionError,
     GitUnavailableError,
 )
 
@@ -192,6 +194,15 @@ class GitAdapter:
         if include_merges is False:
             args.append("--no-merges")
         args.append(revision)
+        # validate path filter
+        for p in path_filter:
+            if not isinstance(p, str) or p == "" or "\\" in p or "\x00" in p:
+                raise GitParseError("invalid path filter")
+            if p.startswith("/"):
+                raise GitParseError("invalid path filter")
+            parts = p.split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                raise GitParseError("invalid path filter")
         # path filter
         if path_filter:
             args.append("--")
@@ -203,7 +214,7 @@ class GitAdapter:
         ids = [line.strip() for line in res.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
         truncated = len(ids) > effective
         if truncated:
-            ids = ids[:effective]
+            ids = ids[-effective:] if effective > 0 else []
         return CommitSelection(tuple(ids), truncated)
 
     def fetch_commit_objects(self, repository_path, commit_ids):
@@ -241,10 +252,10 @@ class GitAdapter:
         args = ["diff-tree", "--no-commit-id", "-r", "-z", "--no-ext-diff", "--no-textconv", "--no-color", "--name-status"]
         if detect_renames:
             args.append("--find-renames")
-        if detect_copies:
-            args.append("--find-copies-harder")
         if detect_copies and not detect_renames:
             args.append("--no-renames")
+        if detect_copies:
+            args.append("--find-copies-harder")
         args.append(baseline_tree)
         args.append(commit_tree)
         res = self.run_raw(args, rp)
@@ -253,12 +264,18 @@ class GitAdapter:
         from .parser import parse_name_status
         return parse_name_status(res.stdout)
 
-    def changes_for_commit(self, repository_path, commit_id, raw, *, detect_renames=True, detect_copies=False, is_shallow=False):
-        br = self.resolve_baseline(repository_path, commit_id, raw, is_shallow)
+    def changes_for_commit(self, repository_path, commit_id, *, detect_renames=True, detect_copies=False):
+        rp = Path(repository_path)
+        raw_map = self.fetch_commit_objects(rp, [commit_id])
+        raw = raw_map[commit_id]
+        br = self.resolve_baseline(rp, commit_id, raw)
         if br.unavailable or br.baseline_tree is None:
             return ()
-        return self.diff_trees(repository_path, br.baseline_tree, raw.tree_id,
+        return self.diff_trees(rp, br.baseline_tree, raw.tree_id,
                               detect_renames=detect_renames, detect_copies=detect_copies)
+
+    def build_diff_flags(self, find_renames: bool, find_copies: bool) -> list:
+        return build_diff_flags(find_renames, find_copies)
 
     def close(self):
         import shutil
@@ -488,8 +505,8 @@ def build_diff_flags(detect_renames: bool, detect_copies: bool) -> list[str]:
     flags = []
     if detect_renames:
         flags.append("--find-renames")
-    if detect_copies:
-        flags.append("--find-copies-harder")
     if detect_copies and not detect_renames:
         flags.append("--no-renames")
+    if detect_copies:
+        flags.append("--find-copies-harder")
     return flags

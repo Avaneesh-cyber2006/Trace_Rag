@@ -7,10 +7,12 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence, Tuple
 
 from .exceptions import GitParseError
+from .identities import compute_change_id
 from .invariants import (
     EMPTY_TREE_SHA1,
     OBJECT_ID_RE,
     TIMEZONE_RE,
+    require_object_id,
     snapshot_mapping,
 )
 
@@ -82,13 +84,11 @@ class GitCommit:
     is_root: bool
 
     def __post_init__(self):
-        if not isinstance(self.commit_id, str) or OBJECT_ID_RE.fullmatch(self.commit_id) is None:
-            raise GitParseError("invalid commit_id")
+        require_object_id(self.commit_id)
         if not isinstance(self.parent_ids, tuple):
             raise GitParseError("parent_ids must be tuple")
         for p in self.parent_ids:
-            if not isinstance(p, str) or OBJECT_ID_RE.fullmatch(p) is None:
-                raise GitParseError("invalid parent id")
+            require_object_id(p)
         if len(set(self.parent_ids)) != len(self.parent_ids):
             raise GitParseError("duplicate parent ids")
         if not _is_int(self.author_timestamp) or not _is_int(self.committer_timestamp):
@@ -121,8 +121,7 @@ class GitFileChange:
     def __post_init__(self):
         if not isinstance(self.change_id, str) or _HEX64.fullmatch(self.change_id) is None:
             raise GitParseError("invalid change_id")
-        if not isinstance(self.commit_id, str) or OBJECT_ID_RE.fullmatch(self.commit_id) is None:
-            raise GitParseError("invalid commit_id")
+        require_object_id(self.commit_id)
         if not isinstance(self.change_type, GitChangeType):
             # allow str
             try:
@@ -172,6 +171,11 @@ class GitFileChange:
             # modified, type_changed, unmerged, unknown: only new_path
             if self.old_path is not None or self.new_path is None:
                 raise GitParseError("modified path rule")
+
+        # recompute change_id canonically so callers cannot forge it
+        ct_val = ct.value if isinstance(ct, GitChangeType) else str(ct)
+        expected = compute_change_id(self.commit_id, ct_val, self.old_path, self.new_path)
+        object.__setattr__(self, "change_id", expected)
 
 
 @dataclass(frozen=True, slots=True)
