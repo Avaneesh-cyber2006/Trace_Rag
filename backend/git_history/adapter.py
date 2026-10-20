@@ -123,12 +123,10 @@ class GitAdapter:
         # extract numbers
         import re
         m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_str)
-        if m:
-            major = int(m.group(1))
-            minor = int(m.group(2))
-            if (major, minor) < MINIMUM_GIT_VERSION:
-                raise GitUnavailableError("git version too old")
-        # lazy floor check using module constant
+        if not m:
+            raise GitUnavailableError("cannot parse git version")
+        major = int(m.group(1))
+        minor = int(m.group(2))
         if (major, minor) < MINIMUM_GIT_VERSION:
             raise GitUnavailableError("git version too old")
         return version_str
@@ -212,6 +210,8 @@ class GitAdapter:
         rp = Path(repository_path)
         payload = "".join(f"{cid}\n" for cid in commit_ids).encode("utf-8")
         res = self.run_raw(["cat-file", "--batch"], rp, stdin_data=payload)
+        if res.returncode != 0:
+            raise GitCommandError(res.stderr.decode(errors="replace")[:500])
         from .parser import parse_batch_stream
         parsed = parse_batch_stream(res.stdout, list(commit_ids))
         return parsed
@@ -228,13 +228,12 @@ class GitAdapter:
                 et = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
             return BaselineResolution(et, False)
         # non-root: resolve first parent tree
-        try:
-            res = self.run_raw(["rev-parse", "--verify", "--end-of-options", f"{commit_id}^1^{{tree}}"], rp)
-        except Exception:
-            return BaselineResolution(None, True)
+        res = self.run_raw(["rev-parse", "--verify", "--end-of-options", f"{commit_id}^1^{{tree}}"], rp)
         if res.returncode != 0:
             return BaselineResolution(None, True)
         tree = res.stdout.decode().strip()
+        if not tree:
+            return BaselineResolution(None, True)
         return BaselineResolution(tree, False)
 
     def diff_trees(self, repository_path, baseline_tree, commit_tree, detect_renames=True, detect_copies=False):
@@ -249,6 +248,8 @@ class GitAdapter:
         args.append(baseline_tree)
         args.append(commit_tree)
         res = self.run_raw(args, rp)
+        if res.returncode != 0:
+            raise GitCommandError(res.stderr.decode(errors="replace")[:500])
         from .parser import parse_name_status
         return parse_name_status(res.stdout)
 

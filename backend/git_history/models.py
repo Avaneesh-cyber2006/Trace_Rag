@@ -193,7 +193,12 @@ class GitHistoryScope:
             if not _is_int(self.max_commits) or self.max_commits <= 0:
                 raise GitParseError("max_commits")
         for p in self.path_filter:
-            if not isinstance(p, str):
+            if not isinstance(p, str) or p == "" or "\\" in p or "\x00" in p:
+                raise GitParseError("path_filter entry")
+            if p.startswith("/"):
+                raise GitParseError("path_filter entry")
+            parts = p.split("/")
+            if any(part in ("", ".", "..") for part in parts):
                 raise GitParseError("path_filter entry")
         if not isinstance(self.include_merges, bool):
             raise GitParseError("include_merges")
@@ -271,6 +276,13 @@ class GitHistoryInventory:
         ):
             if not isinstance(f, tuple):
                 raise GitParseError("tuple field")
+        # validate mapping value types
+        for mname in ("changes_by_commit", "changes_by_path", "commits_touching_path", "co_changed_paths"):
+            mval = getattr(self, mname)
+            if isinstance(mval, Mapping):
+                for v in mval.values():
+                    if not isinstance(v, tuple):
+                        raise GitParseError(f"{mname} values must be tuples")
         # snapshot mappings
         object.__setattr__(self, "commits_by_id", _as_mapping_proxy(self.commits_by_id))
         object.__setattr__(self, "changes_by_commit", _as_mapping_proxy(self.changes_by_commit))

@@ -158,7 +158,7 @@ class GitHistoryAnalyzer:
             raise GitConfigurationError("max_output_bytes must be > 0")
         if not git_executable:
             raise GitConfigurationError("git_executable must be nonempty")
-        if max_commits is not None and (not isinstance(max_commits, int) or max_commits <= 0):
+        if max_commits is not None and (not isinstance(max_commits, int) or isinstance(max_commits, bool) or max_commits <= 0):
             raise GitConfigurationError("max_commits must be positive")
         self.git_executable = git_executable
         self.command_timeout_seconds = command_timeout_seconds
@@ -184,22 +184,35 @@ class GitHistoryAnalyzer:
         if not rp.exists() or not rp.is_dir():
             raise GitRepositoryError("not a repository")
         # namespace handling
-        if repository_namespace is not None and repository_namespace == "":
-            raise GitConfigurationError("empty namespace")
+        if repository_namespace is not None:
+            if not isinstance(repository_namespace, str) or repository_namespace == "":
+                raise GitConfigurationError("invalid namespace")
         if file_inventory is not None:
+            inv_ns = getattr(file_inventory, "repository_namespace", None)
             if repository_namespace is None:
-                repository_namespace = getattr(file_inventory, "repository_namespace", None)
+                repository_namespace = inv_ns
+            else:
+                if inv_ns is not None and inv_ns != repository_namespace:
+                    raise GitInventoryMismatchError("repository namespace mismatch")
             # validate repository_path
             inv_path = getattr(file_inventory, "repository_path", None)
             if inv_path is not None:
                 if Path(inv_path).resolve() != rp.resolve():
                     raise GitInventoryMismatchError("repository path mismatch")
-        if repository_namespace == "":
-            raise GitConfigurationError("empty namespace")
+        if repository_namespace is not None and (not isinstance(repository_namespace, str) or repository_namespace == ""):
+            raise GitConfigurationError("invalid namespace")
 
         # validate max_commits arg
-        if max_commits is not None and (not isinstance(max_commits, int) or max_commits <= 0):
+        if max_commits is not None and (not isinstance(max_commits, int) or isinstance(max_commits, bool) or max_commits <= 0):
             raise GitConfigurationError("max_commits must be positive")
+        for flag_name, flag_val in (
+            ("include_merges", include_merges),
+            ("detect_renames", detect_renames),
+            ("detect_copies", detect_copies),
+            ("include_commit_messages", include_commit_messages),
+        ):
+            if not isinstance(flag_val, bool):
+                raise GitConfigurationError(f"{flag_name} must be bool")
 
         # validate path_filter
         pf = list(path_filter)
@@ -339,14 +352,11 @@ class GitHistoryAnalyzer:
                 continue
             # diff
             commit_tree = raw.tree_id
-            diff_flags = []  # use build_diff_flags? import
-            from .adapter import build_diff_flags
-            flags = build_diff_flags(detect_renames, detect_copies)
-            # diff_trees doesn't accept flags param; call with detect params
             raw_changes = adapter.diff_trees(
                 rp, br.baseline_tree, commit_tree,
                 detect_renames=detect_renames, detect_copies=detect_copies,
             )
+            raw_changes = sorted(raw_changes, key=lambda rc: (rc.change_type.value, rc.new_path or rc.old_path or ""))
             for rc in raw_changes:
                 change_type = rc.change_type
                 old_path = rc.old_path
@@ -377,9 +387,10 @@ class GitHistoryAnalyzer:
 
         # incomplete reasons
         reasons = set()
+        if unavailable_baseline_ids:
+            reasons.add(GitIncompleteReason.PARENT_UNAVAILABLE)
         if is_shallow and unavailable_baseline_ids:
             reasons.add(GitIncompleteReason.SHALLOW_HISTORY)
-            reasons.add(GitIncompleteReason.PARENT_UNAVAILABLE)
         if truncated:
             reasons.add(GitIncompleteReason.MAX_COMMITS_REACHED)
         if has_merge:

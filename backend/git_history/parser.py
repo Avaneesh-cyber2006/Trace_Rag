@@ -118,8 +118,11 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                 gt = rest.find(b">", lt)
                 if lt == -1 or gt == -1:
                     raise GitParseError("malformed author")
-                name = rest[:lt].strip().decode("utf-8")
-                email = rest[lt + 1:gt].decode("utf-8")
+                try:
+                    name = rest[:lt].strip().decode("utf-8")
+                    email = rest[lt + 1:gt].decode("utf-8")
+                except UnicodeDecodeError as e:
+                    raise GitParseError(f"invalid utf-8 in header at offset {e.start}")
                 tail = rest[gt + 1:].strip().split()
                 if len(tail) != 2:
                     raise GitParseError("malformed author")
@@ -127,7 +130,10 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                     ts = int(tail[0])
                 except ValueError:
                     raise GitParseError("malformed author")
-                tz = tail[1].decode("ascii")
+                try:
+                    tz = tail[1].decode("ascii")
+                except UnicodeDecodeError as e:
+                    raise GitParseError(f"invalid timezone encoding at offset {e.start}")
                 author_name = name
                 author_email = email
                 author_timestamp = ts
@@ -139,8 +145,11 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                 gt = rest.find(b">", lt)
                 if lt == -1 or gt == -1:
                     raise GitParseError("malformed committer")
-                name = rest[:lt].strip().decode("utf-8")
-                email = rest[lt + 1:gt].decode("utf-8")
+                try:
+                    name = rest[:lt].strip().decode("utf-8")
+                    email = rest[lt + 1:gt].decode("utf-8")
+                except UnicodeDecodeError as e:
+                    raise GitParseError(f"invalid utf-8 in header at offset {e.start}")
                 tail = rest[gt + 1:].strip().split()
                 if len(tail) != 2:
                     raise GitParseError("malformed committer")
@@ -148,7 +157,10 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                     ts = int(tail[0])
                 except ValueError:
                     raise GitParseError("malformed committer")
-                tz = tail[1].decode("ascii")
+                try:
+                    tz = tail[1].decode("ascii")
+                except UnicodeDecodeError as e:
+                    raise GitParseError(f"invalid timezone encoding at offset {e.start}")
                 committer_name = name
                 committer_email = email
                 committer_timestamp = ts
@@ -228,8 +240,12 @@ def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
                 raise GitParseError("bad score")
             if i + 2 >= len(parts):
                 raise GitParseError("truncated record")
-            old_path = parts[i + 1].decode("utf-8")
-            new_path = parts[i + 2].decode("utf-8")
+            try:
+                old_path = parts[i + 1].decode("utf-8")
+                new_path = parts[i + 2].decode("utf-8")
+            except UnicodeDecodeError as e:
+                offending = e.object[e.start:e.start + 4]
+                raise GitParseError(f"invalid utf-8 path at offset {e.start}: {offending.hex()}")
             ct = GitChangeType.RENAMED if status.startswith(b"R") else GitChangeType.COPIED
             result.append(RawFileChange(ct, old_path, new_path, score))
             i += 3
@@ -239,7 +255,11 @@ def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
                 ct = GitChangeType.UNKNOWN
             if i + 1 >= len(parts):
                 raise GitParseError("truncated record")
-            path = parts[i + 1].decode("utf-8")
+            try:
+                path = parts[i + 1].decode("utf-8")
+            except UnicodeDecodeError as e:
+                offending = e.object[e.start:e.start + 4]
+                raise GitParseError(f"invalid utf-8 path at offset {e.start}: {offending.hex()}")
             if status == b"X" or status not in status_map:
                 # unknown
                 old = None
