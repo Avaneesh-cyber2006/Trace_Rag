@@ -301,4 +301,3 @@ def git_repo(tmp_path):
         return GitRepoBuilder(tmp_path, counter["n"])
 
     return factory
-PY
