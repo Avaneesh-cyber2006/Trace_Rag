@@ -175,6 +175,26 @@ class GitHistoryAnalyzer:
             max_output_bytes=self.max_output_bytes,
             max_commits=self.max_commits,
         )
+        try:
+            return self._analyze(
+                adapter,
+                repository_path,
+                repository_namespace=repository_namespace,
+                file_inventory=file_inventory,
+                revision=revision,
+                max_commits=max_commits,
+                include_merges=include_merges,
+                detect_renames=detect_renames,
+                detect_copies=detect_copies,
+                path_filter=path_filter,
+                include_commit_messages=include_commit_messages,
+            )
+        finally:
+            adapter.close()
+
+    def _analyze(self, adapter, repository_path, *, repository_namespace=None, file_inventory=None,
+                 revision="HEAD", max_commits=None, include_merges=True, detect_renames=True,
+                 detect_copies=False, path_filter=(), include_commit_messages=True):
         rp = Path(repository_path)
         if not rp.exists() or not rp.is_dir():
             raise GitRepositoryError("not a repository")
