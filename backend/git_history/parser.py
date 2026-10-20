@@ -1,22 +1,13 @@
 """Pure parser for git cat-file --batch output."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 from .exceptions import GitParseError
 from .invariants import require_object_id as _require_object_id
+from .models import GitChangeType
 
-
-def normalize_timezone(raw: str) -> str:
-    raw = raw.strip()
-    if len(raw) == 5 and raw[0] in "+-" and raw[1:3].isdigit() and raw[3:5].isdigit():
-        return f"{raw[0]}{raw[1:3]}:{raw[3:5]}"
-    if len(raw) == 6 and raw[0] in "+-" and raw[1:3].isdigit() and raw[3:5].isdigit() and raw[5] == ":":
-        # already? handle ±HH:MM? Actually length 6 for +HH:MM? +00:00 length 6
-        return raw
-    if len(raw) == 6 and raw[0] in "+-" and raw[1:3].isdigit() and raw[3] == ":" and raw[4:6].isdigit():
-        return raw
-    raise GitParseError(f"invalid timezone: {raw!r}")
+__all__ = ["RawCommitObject", "RawFileChange", "parse_batch_stream", "parse_name_status", "normalize_timezone"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,24 +29,31 @@ class RawCommitObject:
     encoding: "str | None"
 
 
-def _parse_header_line(line: bytes, header: str):
-    # returns (name, email, timestamp, tz, present)?? handled inline
-    pass
+@dataclass(frozen=True, slots=True)
+class RawFileChange:
+    change_type: GitChangeType
+    old_path: "str | None"
+    new_path: "str | None"
+    similarity: "int | None" = None
+
+
+def normalize_timezone(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) == 5 and raw[0] in "+-" and raw[1:3].isdigit() and raw[3:5].isdigit():
+        return f"{raw[0]}{raw[1:3]}:{raw[3:5]}"
+    if len(raw) == 6 and raw[0] in "+-" and raw[1:3].isdigit() and raw[3] == ":" and raw[4:6].isdigit():
+        return raw
+    raise GitParseError(f"invalid timezone: {raw!r}")
 
 
 def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, RawCommitObject]:
-    # parse frames
     pos = 0
     n = len(data)
     results: dict[str, RawCommitObject] = {}
-    seen: set[str] = set()
-    # We'll parse sequential frames until data exhausted
     while pos < n:
-        # skip trailing newline
         if data[pos:pos + 1] == b"\n":
             pos += 1
             continue
-        # frame header: "<oid> <type> <size>\n"
         nl = data.find(b"\n", pos)
         if nl == -1:
             raise GitParseError("truncated frame header")
@@ -74,7 +72,6 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
         if len(body) != size:
             raise GitParseError("truncated frame body")
         pos += size
-        # expect trailing newline
         if pos < n and data[pos:pos + 1] == b"\n":
             pos += 1
         if typ == b"missing":
@@ -82,10 +79,6 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
         if typ != b"commit":
             raise GitParseError("not a commit")
         _require_object_id(oid)
-        # parse body
-        # split headers/message on first blank line
-        # body bytes
-        # find blank line
         blank = body.find(b"\n\n")
         if blank == -1:
             headers_bytes = body
@@ -93,11 +86,6 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
         else:
             headers_bytes = body[:blank]
             message_bytes = body[blank + 2:]
-        # Actually message includes trailing? keep bytes as is (minus one newline?)
-        # Spec: message is bytes after blank line. We'll keep message_bytes including trailing newline? Tests use b"msg\n"? 
-        # The _batch helper: body + b"\n" frame. body ends with ... \n\nmsg\n? Let's keep message_bytes = body[blank+2:] 
-        # but if body ended with \n before frame trailing, message includes \n. Fine.
-
         lines = headers_bytes.split(b"\n") if headers_bytes else []
         tree_id = None
         parent_ids = []
@@ -125,11 +113,7 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                 parent_ids.append(pid)
             elif line.startswith(b"author "):
                 author_present = True
-                # parse Name <email> ts tz
                 rest = line[7:]
-                # find email
-                # format: name <email> timestamp tz
-                # name may contain spaces; email in <>
                 lt = rest.rfind(b"<")
                 gt = rest.find(b">", lt)
                 if lt == -1 or gt == -1:
@@ -171,30 +155,24 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
                 committer_tz_raw = tz
             elif line.startswith(b"encoding "):
                 encoding = line[9:].decode("ascii").strip()
-            elif line.startswith(b"gpgsig "):
-                pass
-            else:
-                # unknown header; ignore? Malformed? For required headers handled.
-                # If line has no space, malformed
-                if b" " not in line:
-                    raise GitParseError("malformed header")
+            elif b" " not in line:
+                raise GitParseError("malformed header")
         if tree_id is None:
             raise GitParseError("missing tree")
-        # normalize tz
-        author_tz = normalize_timezone(author_tz_raw) if author_present else "+00:00"
-        committer_tz = normalize_timezone(committer_tz_raw) if committer_present else "+00:00"
-        if not author_present:
+        if author_present:
+            author_tz = normalize_timezone(author_tz_raw)
+        else:
             author_name = ""
             author_email = ""
             author_timestamp = 0
             author_tz = "+00:00"
-        if not committer_present:
+        if committer_present:
+            committer_tz = normalize_timezone(committer_tz_raw)
+        else:
             committer_name = ""
             committer_email = ""
             committer_timestamp = 0
             committer_tz = "+00:00"
-        # decode strict handled by analyzer? store bytes; message_bytes remains bytes
-        # But test expects message_bytes bytes. Keep.
         obj = RawCommitObject(
             commit_id=oid,
             tree_id=tree_id,
@@ -213,11 +191,64 @@ def parse_batch_stream(data: bytes, expected_ids: Sequence[str]) -> dict[str, Ra
             encoding=encoding,
         )
         results[oid] = obj
-        seen.add(oid)
 
-    # verify expected
     for eid in expected_ids:
         if eid not in results:
             raise GitParseError("missing requested object")
-    # also verify no extra? not necessary
     return results
+
+
+def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
+    parts = data.split(b"\x00")
+    i = 0
+    result: list[RawFileChange] = []
+    status_map = {
+        b"A": GitChangeType.ADDED,
+        b"M": GitChangeType.MODIFIED,
+        b"D": GitChangeType.DELETED,
+        b"T": GitChangeType.TYPE_CHANGED,
+        b"U": GitChangeType.UNMERGED,
+    }
+    while i < len(parts):
+        if parts[i] == b"":
+            i += 1
+            continue
+        status = parts[i]
+        if status.startswith(b"R") or status.startswith(b"C"):
+            try:
+                score = int(status[1:])
+            except ValueError:
+                raise GitParseError("bad score")
+            if i + 2 >= len(parts):
+                raise GitParseError("truncated record")
+            old_path = parts[i + 1].decode("utf-8")
+            new_path = parts[i + 2].decode("utf-8")
+            ct = GitChangeType.RENAMED if status.startswith(b"R") else GitChangeType.COPIED
+            result.append(RawFileChange(ct, old_path, new_path, score))
+            i += 3
+        else:
+            ct = status_map.get(status)
+            if ct is None:
+                # unknown status byte like X? 
+                ct = GitChangeType.UNKNOWN
+                # but expect path
+            if i + 1 >= len(parts):
+                raise GitParseError("truncated record")
+            path = parts[i + 1].decode("utf-8")
+            if status == b"X" or status not in status_map:
+                # unknown
+                old = None
+                new = path
+                ct = GitChangeType.UNKNOWN
+            else:
+                if status == b"D":
+                    old = path
+                    new = None
+                else:
+                    old = None
+                    new = path
+                if status == b"D":
+                    ct = GitChangeType.DELETED
+            result.append(RawFileChange(ct, old, new, None))
+            i += 2
+    return tuple(result)
