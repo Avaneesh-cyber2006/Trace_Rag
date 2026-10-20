@@ -236,8 +236,7 @@ def parse_name_status(data: bytes) -> tuple[RawFileChange, ...]:
         else:
             ct = status_map.get(status)
             if ct is None:
-                # unknown status byte like X?                ct = GitChangeType.UNKNOWN
-                # but expect path
+                ct = GitChangeType.UNKNOWN
             if i + 1 >= len(parts):
                 raise GitParseError("truncated record")
             path = parts[i + 1].decode("utf-8")
