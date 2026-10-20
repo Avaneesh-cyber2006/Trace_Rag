@@ -252,6 +252,13 @@ class GitAdapter:
         from .parser import parse_name_status
         return parse_name_status(res.stdout)
 
+    def changes_for_commit(self, repository_path, commit_id, raw, *, detect_renames=True, detect_copies=False, is_shallow=False):
+        br = self.resolve_baseline(repository_path, commit_id, raw, is_shallow)
+        if br.unavailable or br.baseline_tree is None:
+            return ()
+        return self.diff_trees(repository_path, br.baseline_tree, raw.tree_id,
+                              detect_renames=detect_renames, detect_copies=detect_copies)
+
     def close(self):
         import shutil
         try:
