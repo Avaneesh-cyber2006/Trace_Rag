@@ -410,3 +410,173 @@ log, error, or stack-trace ingestion (Module 8); BM25, lexical/hybrid retrieval,
 graph expansion, relevance thresholds, fusion, or reranking (Module 9); or LLM
 context assembly, answering, causal reasoning, citation presentation, API, or
 frontend behavior (Module 10).
+
+## Module 7 - Git History Analyzer
+
+Module 7 converts a local Git repository's history into an immutable
+`GitHistoryInventory` of historical facts: commits and parents, author and
+committer metadata, first-parent file changes, rename/copy evidence, and bounded
+lookup and co-change indexes. It records evidence only. Co-change is temporal
+correlation, not proof of a dependency, and a rename is Git's heuristic lineage
+decision, not proof of semantic continuity. Module 7 does not provide
+symbol-level historical blame or causal inference.
+
+### Offline usage
+
+`analyze_git_history` is the convenience entry point. `GitHistoryAnalyzer` is the
+reusable analyzer and accepts the command timeout, output cap, Git executable,
+and default commit limit at construction time. Every `analyze()` call gets
+independent timeout, output-budget, and temporary-helper state.
+
+```python
+from backend.git_history import analyze_git_history
+
+history = analyze_git_history(
+    "workspace/example/repo",
+    revision="HEAD",
+    max_commits=500,
+    include_merges=True,
+    detect_renames=True,
+    detect_copies=False,
+    path_filter=("src/app.py",),
+    include_commit_messages=True,
+)
+
+print(history.commit_count, history.change_count)
+print(history.history_is_complete, history.incomplete_reasons)
+for commit in history.commits[:3]:
+    print(commit.commit_id, commit.committer_timestamp, commit.message)
+for change in history.changes[:5]:
+    print(change.change_type.value, change.old_path, change.new_path, change.similarity)
+```
+
+The analyzed path must be an existing local Git worktree or bare repository.
+`revision` defaults to `HEAD`; it must not begin with `-` or contain NUL, and an
+unresolvable revision raises `GitRevisionError`. An unborn symbolic ref, such as
+`HEAD` in an empty repository, returns an empty inventory with
+`history_is_complete=True`. A plain branch name is not treated as a symbolic ref
+merely because `HEAD` points at that branch.
+
+`max_commits` overrides the analyzer default. `None` means all reachable commits,
+subject to the internal 100,000-commit cap. `path_filter` contains repository-
+relative POSIX paths and selects commits touching at least one listed path; each
+selected commit retains its complete first-parent change set. Duplicate path
+filters are deduplicated and sorted. `include_commit_messages=False` replaces
+messages with `None` for privacy-sensitive callers.
+
+### Inventory outputs
+
+`GitHistoryInventory` is frozen and publishes tuple collections plus read-only
+mapping indexes:
+
+- `commits` is newest-first by `(committer_timestamp desc, commit_id asc)`;
+  `commit_ids`, `commits_by_id`, and `changes_by_commit` follow that ordering.
+- `changes` contains `GitFileChange` records. `change_id` is a canonical SHA-256
+  digest of the commit, change type, and paths; it is recomputed by the model and
+  cannot be forged by a caller.
+- `changes_by_path` includes both old and new paths, including copy sources.
+  `commits_touching_path` and `co_changed_paths` exclude a copy source because it
+  is lineage evidence, not a modification by the copying commit.
+- `co_change_incomplete_paths` lists paths whose co-change coverage may have been
+  omitted by the global pair budget. A missing `co_changed_paths` key is complete
+  absence only when the path is not listed there.
+- `scope` records the revision, path filter, limits, and detection flags used.
+  `git_version`, `detached_head`, and the commit and change counts are also
+  published.
+
+### Incomplete history
+
+`history_is_complete` is `True` only when `incomplete_reasons` is empty. Reasons
+include `SHALLOW_HISTORY`, `PARENT_UNAVAILABLE`, `MAX_COMMITS_REACHED`,
+`MERGE_SEMANTICS_PARTIAL`, `MERGES_EXCLUDED`, `MISSING_METADATA`,
+`PATH_FILTER_APPLIED`, and `CO_CHANGE_LIMIT_EXCEEDED`. A path filter therefore
+makes the result intentionally incomplete as a statement about the whole
+repository, even when every selected commit was analyzed.
+
+When a first-parent tree is unavailable, the commit is still recorded and listed
+in `commits_with_unavailable_baseline`; no file changes are fabricated. Its empty
+`changes_by_commit` entry must not be read as proof that the commit was unchanged.
+`shallow_boundary_commit_ids` identifies reachable shallow boundaries, and
+`truncated_by_limit` identifies a `max_commits` truncation. Inspect these fields
+and the incomplete reasons before treating the inventory as complete history.
+`detached_head` is repository state and is not itself an incomplete reason.
+
+### Merge and rename/copy semantics
+
+Merge commits are compared with their first parent only. Other parents' changes
+are not reported, and any merge commit adds `MERGE_SEMANTICS_PARTIAL`. Setting
+`include_merges=False` excludes merge commits and records `MERGES_EXCLUDED`.
+
+Rename detection is Git's heuristic with Git's default 50% similarity threshold;
+the reported `similarity` is the score from 0 to 100. `detect_renames=True` passes
+`--find-renames`. `detect_copies=True` passes `--find-copies-harder`; when copies
+are enabled but renames are disabled, `--no-renames` is also passed. With both
+disabled, Git reports delete/add records instead. A copy's `old_path` is the
+source lineage and `new_path` is the destination; only the destination is counted
+as touched by that commit.
+
+### Security and no-network boundary
+
+Analysis is read-only and local. Module 7 invokes only the allowed Git
+subcommands with argument lists and `shell=False`. It disables hooks, external
+diff, textconv, replacement objects, lazy fetching, prompts, paging, trace output,
+and inherited Git/proxy environment variables. It applies per-command and
+cumulative output caps plus per-command and aggregate timeouts, and never checks
+out, resets, merges, fetches, or modifies the analyzed repository. Commit messages
+and paths are untrusted data: they are stored and never executed or interpreted.
+The analyzer itself makes no network call and does not execute analyzed source.
+Secrets present in historical commits are not redacted.
+
+### Relationship to Modules 1, 2, and 6
+
+Module 1 supplies the local repository path and, optionally, the checked-out
+commit to use as `revision`. Module 2's `FileInventory` can be passed as
+`file_inventory`: it supplies `repository_namespace` when the caller does not,
+and its repository path must resolve to the analyzed root or
+`GitInventoryMismatchError` is raised. Changed paths are not required to appear in
+that inventory because deleted files will not.
+
+```python
+from backend.repository_loader import RepositoryLoader
+from backend.file_scanner import FileScanner
+from backend.git_history import analyze_git_history
+
+repository = RepositoryLoader().load("https://github.com/pallets/flask")
+namespace = "tracerag-repository-v1:github:" + repository.repo_url.casefold()
+files = FileScanner().scan(
+    repository.local_path,
+    repository_namespace=namespace,
+)
+history = analyze_git_history(
+    repository.local_path,
+    file_inventory=files,
+    revision=repository.current_commit or "HEAD",
+)
+```
+
+Module 6 has no production dependency on Module 7, and Module 7 does not import
+Modules 3, 4, 5, or 6. A caller can associate history with a Module 6 graph by
+matching relative paths at file level:
+
+```python
+from backend.code_graph import build_code_graph
+from backend.code_parser import CodeParser
+
+parsed = CodeParser().parse_inventory(files)
+graph = build_code_graph(files, parsed)
+changed_paths = {c.new_path for c in history.changes if c.new_path is not None}
+associated_paths = sorted(changed_paths & set(graph.nodes_by_file))
+```
+
+This is file-level association only. Module 7 does not attribute a change to a
+symbol or claim that a commit caused a defect or dependency.
+
+Run the offline Module 7 tests with:
+
+```bash
+python -m pytest tests -q -k git_history
+```
+
+Normal verification is offline and excludes both networked integration markers.
+Module 7 does not implement Module 8 runtime evidence, Module 9 retrieval or graph
+expansion, or Module 10 LLM answering, causal reasoning, or citation presentation.
