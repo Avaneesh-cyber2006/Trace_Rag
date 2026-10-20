@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -113,6 +113,144 @@ class GitAdapter:
         self._cumulative_bytes = 0
         self._cumulative_lock = threading.Lock()
         self._started_at = time.monotonic()
+
+    def git_version(self) -> str:
+        res = self.run_raw(["--version"])
+        out = res.stdout.decode("utf-8", errors="replace").strip()
+        # parse
+        # e.g. git version 2.55.0.windows.5
+        version_str = out
+        # extract numbers
+        import re
+        m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_str)
+        if m:
+            major = int(m.group(1))
+            minor = int(m.group(2))
+            if (major, minor) < MINIMUM_GIT_VERSION:
+                raise GitUnavailableError("git version too old")
+        # lazy floor check using module constant
+        if (major, minor) < MINIMUM_GIT_VERSION:
+            raise GitUnavailableError("git version too old")
+        return version_str
+
+    def inspect_repository(self, repository_path):
+        rp = Path(repository_path)
+        if not rp.exists() or not rp.is_dir():
+            raise GitRepositoryError("not a repository")
+        r1 = self.run_raw(["rev-parse", "--is-inside-work-tree"], rp)
+        if r1.returncode != 0:
+            raise GitRepositoryError("not a repository")
+        inside = r1.stdout.decode().strip() == "true"
+        r2 = self.run_raw(["rev-parse", "--is-bare-repository"], rp)
+        bare = r2.stdout.decode().strip() == "true" if r2.returncode == 0 else False
+        r3 = self.run_raw(["rev-parse", "--is-shallow-repository"], rp)
+        shallow = r3.stdout.decode().strip() == "true" if r3.returncode == 0 else False
+        r4 = self.run_raw(["rev-parse", "--git-common-dir"], rp)
+        common_dir_raw = r4.stdout.decode().strip() if r4.returncode == 0 else ".git"
+        common_dir = Path(common_dir_raw)
+        if not common_dir.is_absolute():
+            common_dir = (rp / common_dir).resolve()
+        else:
+            common_dir = common_dir.resolve()
+        gv = self.git_version()
+        return GitRepositoryContext(
+            is_bare=bare,
+            is_shallow=shallow,
+            git_common_dir=common_dir,
+            git_version=gv,
+            is_inside_work_tree=inside,
+        )
+
+    def resolve_revision(self, repository_path, revision):
+        rp = Path(repository_path)
+        if not isinstance(revision, str) or revision.startswith("-") or "\x00" in revision:
+            raise GitRevisionError("invalid revision")
+        res = self.run_raw(["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], rp)
+        if res.returncode != 0:
+            raise GitRevisionError("invalid revision")
+        return res.stdout.decode().strip()
+
+    def is_detached_head(self, repository_path):
+        rp = Path(repository_path)
+        res = self.run_raw(["symbolic-ref", "--quiet", "HEAD"], rp)
+        return res.returncode != 0
+
+    def is_unborn_head(self, repository_path):
+        rp = Path(repository_path)
+        r1 = self.run_raw(["symbolic-ref", "--quiet", "HEAD"], rp)
+        r2 = self.run_raw(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], rp)
+        return r1.returncode == 0 and r2.returncode != 0
+
+    def enumerate_commits(self, repository_path, revision, *, max_commits=None, include_merges=True, path_filter=()):
+        rp = Path(repository_path)
+        # resolve effective max
+        hard_cap = 100000
+        if max_commits is None:
+            effective = hard_cap
+        else:
+            effective = min(max_commits, hard_cap)
+        k = effective + 1
+        args = ["rev-list", "--topo-order", "--reverse", f"--max-count={k}"]
+        if include_merges is False:
+            args.append("--no-merges")
+        args.append(revision)
+        # path filter
+        if path_filter:
+            args.append("--")
+            for p in path_filter:
+                args.append(f":(literal){p}")
+        res = self.run_raw(args, rp)
+        if res.returncode != 0:
+            raise GitCommandError(res.stderr.decode(errors="replace"))
+        ids = [line.strip() for line in res.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
+        truncated = len(ids) > effective
+        if truncated:
+            ids = ids[:effective]
+        return CommitSelection(tuple(ids), truncated)
+
+    def fetch_commit_objects(self, repository_path, commit_ids):
+        rp = Path(repository_path)
+        payload = "".join(f"{cid}\n" for cid in commit_ids).encode("utf-8")
+        res = self.run_raw(["cat-file", "--batch"], rp, stdin_data=payload)
+        from .parser import parse_batch_stream
+        parsed = parse_batch_stream(res.stdout, list(commit_ids))
+        return parsed
+
+    def resolve_baseline(self, repository_path, commit_id, raw, is_shallow=False):
+        # returns BaselineResolution
+        rp = Path(repository_path)
+        # root?
+        if len(raw.parent_ids) == 0:
+            # empty tree based on id length
+            if len(commit_id) == 64:
+                et = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+            else:
+                et = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            return BaselineResolution(et, False)
+        # non-root: resolve first parent tree
+        try:
+            res = self.run_raw(["rev-parse", "--verify", "--end-of-options", f"{commit_id}^1^{{tree}}"], rp)
+        except Exception:
+            return BaselineResolution(None, True)
+        if res.returncode != 0:
+            return BaselineResolution(None, True)
+        tree = res.stdout.decode().strip()
+        return BaselineResolution(tree, False)
+
+    def diff_trees(self, repository_path, baseline_tree, commit_tree, detect_renames=True, detect_copies=False):
+        rp = Path(repository_path)
+        args = ["diff-tree", "--no-commit-id", "-r", "-z", "--no-ext-diff", "--no-textconv", "--no-color", "--name-status"]
+        if detect_renames:
+            args.append("--find-renames")
+        if detect_copies:
+            args.append("--find-copies-harder")
+        if detect_copies and not detect_renames:
+            args.append("--no-renames")
+        args.append(baseline_tree)
+        args.append(commit_tree)
+        res = self.run_raw(args, rp)
+        from .parser import parse_name_status
+        return parse_name_status(res.stdout)
 
     def close(self):
         import shutil
@@ -316,3 +454,34 @@ class GitAdapter:
             excerpt = stderr[:500]
             raise GitCommandError(f"git command failed: {excerpt}")
         return result.stdout
+from dataclasses import dataclass as _dc
+
+
+@_dc(frozen=True, slots=True)
+class GitRepositoryContext:
+    is_bare: bool
+    is_shallow: bool
+    git_common_dir: "Path"
+    git_version: str
+    is_inside_work_tree: bool = True
+
+
+@_dc(frozen=True, slots=True)
+class CommitSelection:
+    commit_ids: tuple[str, ...]
+    truncated: bool
+
+
+@_dc(frozen=True, slots=True)
+class BaselineResolution:
+    baseline_tree: "str | None"
+    unavailable: bool
+def build_diff_flags(detect_renames: bool, detect_copies: bool) -> list[str]:
+    flags = []
+    if detect_renames:
+        flags.append("--find-renames")
+    if detect_copies:
+        flags.append("--find-copies-harder")
+    if detect_copies and not detect_renames:
+        flags.append("--no-renames")
+    return flags
