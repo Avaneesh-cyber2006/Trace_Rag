@@ -175,14 +175,18 @@ class GitAdapter:
         res = self.run_raw(["symbolic-ref", "--quiet", "HEAD"], rp)
         return res.returncode != 0
 
-    def is_unborn_head(self, repository_path):
+    def is_unborn_head(self, repository_path, revision="HEAD"):
         rp = Path(repository_path)
-        r1 = self.run_raw(["symbolic-ref", "--quiet", "HEAD"], rp)
-        r2 = self.run_raw(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], rp)
+        if not isinstance(revision, str) or revision.startswith("-") or "\x00" in revision:
+            raise GitRevisionError("invalid revision")
+        r1 = self.run_raw(["symbolic-ref", "--quiet", revision], rp)
+        r2 = self.run_raw(["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], rp)
         return r1.returncode == 0 and r2.returncode != 0
 
     def enumerate_commits(self, repository_path, revision, *, max_commits=None, include_merges=True, path_filter=()):
         rp = Path(repository_path)
+        if not isinstance(revision, str) or revision.startswith("-") or "\x00" in revision:
+            raise GitRevisionError("invalid revision")
         # resolve effective max
         hard_cap = 100000
         if max_commits is None:
@@ -193,6 +197,7 @@ class GitAdapter:
         args = ["rev-list", "--topo-order", "--reverse", f"--max-count={k}"]
         if include_merges is False:
             args.append("--no-merges")
+        args.append("--end-of-options")
         args.append(revision)
         # validate path filter
         for p in path_filter:

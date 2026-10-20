@@ -632,3 +632,7 @@ def test_renames_disabled_yields_delete_and_add(git_repo):
     kinds = {c.change_type for c in changes}
     assert GitChangeType.RENAMED not in kinds
     assert {GitChangeType.DELETED, GitChangeType.ADDED} <= kinds
+def test_enumerate_commits_rejects_revision_starting_with_dash(git_repo):
+    repo = git_repo()
+    with pytest.raises(GitRevisionError):
+        adapter().enumerate_commits(repo.path, "--version")

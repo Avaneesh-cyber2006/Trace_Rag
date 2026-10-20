@@ -303,7 +303,7 @@ class GitHistoryInventory:
         ):
             if not isinstance(m, MappingProxyType):
                 raise GitParseError("mapping must be proxy")
-        if self.repository_namespace is not None and not isinstance(self.repository_namespace, str):
+        if self.repository_namespace is not None and (not isinstance(self.repository_namespace, str) or self.repository_namespace == ""):
             raise GitParseError("namespace")
         if not isinstance(self.scope, GitHistoryScope):
             raise GitParseError("scope")

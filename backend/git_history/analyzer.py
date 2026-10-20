@@ -68,19 +68,20 @@ def build_changes_by_commit(commits, changes):
 
 def build_changes_by_path(changes, commits_by_id):
     result = {}
-    for ch in changes:
+    for order, ch in enumerate(changes):
         for p in (ch.old_path, ch.new_path):
             if p is None:
                 continue
-            result.setdefault(p, []).append(ch)
+            result.setdefault(p, []).append((order, ch))
     # sort by committer timestamp desc, commit_id asc, then change order
     for p in result:
-        def key(ch):
+        def key(item):
+            order, ch = item
             c = commits_by_id.get(ch.commit_id)
             ts = c.committer_timestamp if c is not None else 0
-            return (-ts, ch.commit_id)
+            return (-ts, ch.commit_id, order)
         result[p].sort(key=key)
-        result[p] = tuple(result[p])
+        result[p] = tuple(ch for _order, ch in result[p])
     return result
 
 
@@ -152,34 +153,28 @@ def build_co_change_index(commits, changes_by_commit, *, per_commit_path_cap=Non
 class GitHistoryAnalyzer:
     def __init__(self, *, git_executable="git", command_timeout_seconds=30.0,
                  max_output_bytes=50 * 1024 * 1024, max_commits=None):
-        if command_timeout_seconds <= 0:
-            raise GitConfigurationError("command_timeout_seconds must be > 0")
-        if max_output_bytes <= 0:
-            raise GitConfigurationError("max_output_bytes must be > 0")
-        if not git_executable:
+        if not isinstance(git_executable, str) or not git_executable:
             raise GitConfigurationError("git_executable must be nonempty")
+        if not isinstance(command_timeout_seconds, (int, float)) or isinstance(command_timeout_seconds, bool) or command_timeout_seconds <= 0:
+            raise GitConfigurationError("command_timeout_seconds must be > 0")
+        if not isinstance(max_output_bytes, int) or isinstance(max_output_bytes, bool) or max_output_bytes <= 0:
+            raise GitConfigurationError("max_output_bytes must be > 0")
         if max_commits is not None and (not isinstance(max_commits, int) or isinstance(max_commits, bool) or max_commits <= 0):
             raise GitConfigurationError("max_commits must be positive")
         self.git_executable = git_executable
         self.command_timeout_seconds = command_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.max_commits = max_commits
-        self._adapter = None
-
-    def _adapter_instance(self):
-        if self._adapter is None:
-            self._adapter = GitAdapter(
-                git_executable=self.git_executable,
-                command_timeout_seconds=self.command_timeout_seconds,
-                max_output_bytes=self.max_output_bytes,
-                max_commits=self.max_commits,
-            )
-        return self._adapter
 
     def analyze(self, repository_path, *, repository_namespace=None, file_inventory=None,
                revision="HEAD", max_commits=None, include_merges=True, detect_renames=True,
                detect_copies=False, path_filter=(), include_commit_messages=True):
-        adapter = self._adapter_instance()
+        adapter = GitAdapter(
+            git_executable=self.git_executable,
+            command_timeout_seconds=self.command_timeout_seconds,
+            max_output_bytes=self.max_output_bytes,
+            max_commits=self.max_commits,
+        )
         rp = Path(repository_path)
         if not rp.exists() or not rp.is_dir():
             raise GitRepositoryError("not a repository")
@@ -232,8 +227,8 @@ class GitHistoryAnalyzer:
         ctx = adapter.inspect_repository(rp)
         git_version = ctx.git_version
 
-        # unborn head handling for default HEAD
-        is_unborn = adapter.is_unborn_head(rp) if revision == "HEAD" else False
+        # unborn symbolic-ref handling (any unborn symbolic ref)
+        is_unborn = adapter.is_unborn_head(rp, revision)
 
         # effective max_commits
         effective_max = max_commits if max_commits is not None else self.max_commits
@@ -372,9 +367,9 @@ class GitHistoryAnalyzer:
                     similarity=similarity,
                 )
                 changes_list.append(gfc)
-            # check change cap
-            if len(changes_list) > MAX_CHANGES:
-                raise GitOutputTooLargeError("too many changes")
+                # check change cap
+                if len(changes_list) > MAX_CHANGES:
+                    raise GitOutputTooLargeError("too many changes")
 
         changes_tuple = tuple(changes_list)
 
