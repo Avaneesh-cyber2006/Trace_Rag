@@ -1,9 +1,126 @@
+"""Shared fixtures for Module 7 tests."""
+
+from pathlib import PurePosixPath
+from pathlib import Path
+from types import SimpleNamespace
 import os
 import subprocess
 import tempfile
-from pathlib import Path
 
 import pytest
+
+from backend.code_parser.models import (
+    CodeParseInventory,
+    ParsedFile,
+    ParsedLanguage,
+    ParseStatus,
+    SourceLocation,
+    SymbolInfo,
+    SymbolKind,
+)
+from backend.file_scanner.models import FileCategory, FileInventory, ScannedFile
+
+
+@pytest.fixture
+def cg():
+    def loc(start=0, end=100):
+        return SourceLocation(start, end, 1, start, 1, end)
+
+    def symbol(
+        name,
+        *,
+        kind=SymbolKind.FUNCTION,
+        qualified_name=None,
+        parent=None,
+        start=0,
+        end=100,
+        parameters=(),
+        modifiers=(),
+        base_types=(),
+        implemented_types=(),
+    ):
+        return SymbolInfo(
+            name,
+            kind,
+            qualified_name or name,
+            parent,
+            loc(start, end),
+            parameters,
+            None,
+            modifiers,
+            base_types,
+            implemented_types,
+        )
+
+    def parsed(
+        path="a.py",
+        *,
+        language=ParsedLanguage.PYTHON,
+        status=ParseStatus.SUCCESS,
+        symbols=(),
+        imports=(),
+        calls=(),
+        issues=(),
+    ):
+        return ParsedFile(
+            path,
+            language,
+            status,
+            symbols,
+            imports,
+            calls,
+            issues,
+            "0" * 64,
+        )
+
+    def pair(*files, namespace="repo"):
+        scanned = []
+        for file in files:
+            path = PurePosixPath(file.relative_path)
+            locations = [
+                item.location
+                for item in (*file.symbols, *file.imports, *file.calls)
+            ]
+            size = max([4096, *(item.end_byte for item in locations)])
+            language = (
+                "typescript"
+                if file.language is ParsedLanguage.TSX
+                else file.language.value
+            )
+            scanned.append(
+                ScannedFile(
+                    file.relative_path,
+                    path.name,
+                    path.suffix,
+                    language,
+                    FileCategory.SOURCE,
+                    size,
+                )
+            )
+        fi = FileInventory(
+            "/inert/repo",
+            len(files),
+            len(files),
+            0,
+            tuple(scanned),
+            (),
+            (),
+            namespace,
+        )
+        pi = CodeParseInventory(
+            "/inert/repo",
+            len(files),
+            sum(f.status is ParseStatus.SUCCESS for f in files),
+            sum(f.status is ParseStatus.PARTIAL for f in files),
+            sum(f.status is ParseStatus.FAILED for f in files),
+            0,
+            tuple(files),
+            (),
+            namespace,
+        )
+        return fi, pi
+
+    return SimpleNamespace(loc=loc, symbol=symbol, parsed=parsed, pair=pair)
 
 
 def _run_git(args, cwd=None, input_data=None, check=True):
@@ -71,7 +188,6 @@ class GitRepoBuilder:
         return self.head
 
     def commit_empty(self, message="empty commit"):
-        # create empty commit
         _run_git(["commit", "--allow-empty", "-m", message], cwd=self.path)
         return self.head
 
@@ -94,10 +210,7 @@ class GitRepoBuilder:
         return self.head
 
     def head_timestamp(self):
-        res = _run_git(["log", "-1", "--format=%ct %tz"], cwd=self.path)
-        # %tz not standard; use %ci? Spec wants raw committer timestamp in "<epoch> <tz>"
-        res = _run_git(["log", "-1", "--format=%ct %C?".replace("?","")], cwd=self.path, check=False)
-        # fallback
+        res = _run_git(["log", "-1", "--format=%ct %tz"], cwd=self.path, check=False)
         res = _run_git(["log", "-1", "--format=%ct %z"], cwd=self.path)
         return res.stdout.decode().strip()
 
@@ -137,11 +250,7 @@ class GitRepoBuilder:
             import shutil
             shutil.rmtree(dest)
         url = "file:///" + str(self.path).replace("\\", "/")
-        # ensure leading slash for drive? file:///C:/...
-        if not url.startswith("file:///"):
-            url = "file:///" + str(self.path).lstrip("/").replace("\\", "/")
         _run_git(["clone", "--depth", str(depth), url, str(dest)])
-        # head
         res = _run_git(["rev-parse", "HEAD"], cwd=dest)
         head = res.stdout.decode().strip()
         sc = ShallowClone(dest, head)
@@ -158,21 +267,15 @@ class GitRepoBuilder:
         return r1.returncode == 0 and r2.returncode != 0
 
     def install_hook(self, name, body):
-        hooks = self.path / ".git" / "hooks"
-        # worktree .git may be file; resolve
-        if not hooks.exists():
-            # resolve git dir
-            res = _run_git(["rev-parse", "--git-dir"], cwd=self.path)
-            gd = Path(res.stdout.decode().strip())
-            if not gd.is_absolute():
-                gd = self.path / gd
-            hooks = gd / "hooks"
+        res = _run_git(["rev-parse", "--git-dir"], cwd=self.path)
+        gd = Path(res.stdout.decode().strip())
+        if not gd.is_absolute():
+            gd = self.path / gd
+        hooks = gd / "hooks"
         hooks.mkdir(parents=True, exist_ok=True)
         (hooks / name).write_text("#!/bin/sh\n" + body, encoding="utf-8")
 
     def add_replacement_for_head(self, message):
-        # create replacement commit with different message
-        # get current HEAD tree and parents
         res = _run_git(["rev-parse", "HEAD^{tree}"], cwd=self.path)
         tree = res.stdout.decode().strip()
         res = _run_git(["log", "-1", "--format=%P"], cwd=self.path)
@@ -180,9 +283,7 @@ class GitRepoBuilder:
         args = ["commit-tree", tree]
         for p in parents:
             args += ["-p", p]
-        env = dict(os.environ)
-        # message via stdin
-        r = subprocess.run(["git", *args], cwd=self.path, input=message.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        r = subprocess.run(["git", *args], cwd=self.path, input=message.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         new_commit = r.stdout.decode().strip()
         _run_git(["replace", self.head, new_commit], cwd=self.path)
 
@@ -200,3 +301,4 @@ def git_repo(tmp_path):
         return GitRepoBuilder(tmp_path, counter["n"])
 
     return factory
+PY
