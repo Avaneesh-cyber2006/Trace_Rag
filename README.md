@@ -448,6 +448,7 @@ for commit in history.commits[:3]:
     print(commit.commit_id, commit.committer_timestamp, commit.message)
 for change in history.changes[:5]:
     print(change.change_type.value, change.old_path, change.new_path, change.similarity)
+print(history.co_changed_paths.get("src/app.py", ()))
 ```
 
 The analyzed path must be an existing local Git worktree or bare repository.
@@ -478,8 +479,8 @@ mapping indexes:
   `commits_touching_path` and `co_changed_paths` exclude a copy source because it
   is lineage evidence, not a modification by the copying commit.
 - `co_change_incomplete_paths` lists paths whose co-change coverage may have been
-  omitted by the global pair budget. A missing `co_changed_paths` key is complete
-  absence only when the path is not listed there.
+  omitted by the global pair budget or the per-commit path cap. A missing
+  `co_changed_paths` key is complete absence only when the path is not listed there.
 - `scope` records the revision, path filter, limits, and detection flags used.
   `git_version`, `detached_head`, and the commit and change counts are also
   published.
@@ -497,7 +498,8 @@ When a first-parent tree is unavailable, the commit is still recorded and listed
 in `commits_with_unavailable_baseline`; no file changes are fabricated. Its empty
 `changes_by_commit` entry must not be read as proof that the commit was unchanged.
 `shallow_boundary_commit_ids` identifies reachable shallow boundaries, and
-`truncated_by_limit` identifies a `max_commits` truncation. Inspect these fields
+`truncated_by_limit` identifies a commit-limit truncation (the per-call or
+constructor limit, or the internal 100,000-commit cap). Inspect these fields
 and the incomplete reasons before treating the inventory as complete history.
 `detached_head` is repository state and is not itself an incomplete reason.
 
@@ -541,6 +543,7 @@ from backend.repository_loader import RepositoryLoader
 from backend.file_scanner import FileScanner
 from backend.git_history import analyze_git_history
 
+# Module 1 may clone over the network; the history analysis below is local.
 repository = RepositoryLoader().load("https://github.com/pallets/flask")
 namespace = "tracerag-repository-v1:github:" + repository.repo_url.casefold()
 files = FileScanner().scan(
