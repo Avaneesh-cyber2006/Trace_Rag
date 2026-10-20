@@ -636,3 +636,59 @@ def test_enumerate_commits_rejects_revision_starting_with_dash(git_repo):
     repo = git_repo()
     with pytest.raises(GitRevisionError):
         adapter().enumerate_commits(repo.path, "--version")
+
+
+def test_enumerate_commits_rejects_revision_containing_nul(git_repo):
+    repo = git_repo()
+    with pytest.raises(GitRevisionError):
+        adapter().enumerate_commits(repo.path, "HEAD\x00")
+
+
+def test_enumerate_commits_rejects_option_injection_before_running_git(git_repo, monkeypatch):
+    repo = git_repo()
+    calls = []
+    original = adapter_module.GitAdapter.run_raw
+
+    def spy(self, args, repository_path=None, **kw):
+        calls.append(list(args))
+        return original(self, args, repository_path, **kw)
+
+    monkeypatch.setattr(adapter_module.GitAdapter, "run_raw", spy)
+    with pytest.raises(GitRevisionError):
+        adapter().enumerate_commits(repo.path, "--upload-pack=evil")
+    assert calls == []
+
+
+def test_enumerate_commits_places_the_revision_after_end_of_options_and_paths_after_separator(
+    git_repo, monkeypatch
+):
+    repo = git_repo()
+    second = repo.commit({"a.txt": b"2\n"})
+    calls = []
+    original = adapter_module.GitAdapter.run_raw
+
+    def spy(self, args, repository_path=None, **kw):
+        calls.append(list(args))
+        return original(self, args, repository_path, **kw)
+
+    monkeypatch.setattr(adapter_module.GitAdapter, "run_raw", spy)
+    selected = adapter().enumerate_commits(
+        repo.path, second, max_commits=None, include_merges=True, path_filter=("a.txt",)
+    )
+    assert selected.commit_ids == (second,)
+    rev_list = [call for call in calls if call and call[0] == "rev-list"]
+    assert len(rev_list) == 1
+    args = rev_list[0]
+    assert args.index("--end-of-options") < args.index(second)
+    assert args.index("--") > args.index(second)
+    assert ":(literal)a.txt" in args[args.index("--") + 1:]
+
+
+def test_enumerate_commits_accepts_a_full_commit_id_and_revision_expression(git_repo):
+    repo = git_repo()
+    first = repo.commit({"a.txt": b"1\n"})
+    second = repo.commit({"a.txt": b"2\n"})
+    by_id = adapter().enumerate_commits(repo.path, second).commit_ids
+    by_expression = adapter().enumerate_commits(repo.path, f"{second}^").commit_ids
+    assert by_id == (first, second)
+    assert by_expression == (first,)

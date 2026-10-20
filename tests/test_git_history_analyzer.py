@@ -12,7 +12,11 @@ from backend.git_history.analyzer import (
     build_commits_touching_path,
     touched_paths,
 )
-from backend.git_history.exceptions import GitConfigurationError, GitOutputTooLargeError
+from backend.git_history.exceptions import (
+    GitConfigurationError,
+    GitOutputTooLargeError,
+    GitRevisionError,
+)
 from backend.git_history.models import GitChangeType, GitCommit, GitFileChange, GitIncompleteReason
 
 
@@ -434,3 +438,111 @@ def test_constructor_max_commits_precedence(git_repo):
     # per-call None uses constructor
     inv3 = analyzer.analyze(repo.path, max_commits=None)
     assert inv3.commit_count == 2
+
+
+def test_non_head_unborn_symbolic_ref_returns_the_empty_inventory(git_repo):
+    repo = git_repo()
+    # A genuine symbolic ref whose target is unborn.  A plain branch name
+    # such as "main" is not itself a symbolic ref and must not be treated as
+    # one merely because HEAD points at refs/heads/main.
+    repo.symbolic_ref("refs/heads/alias", "refs/heads/main")
+    inv = GitHistoryAnalyzer().analyze(repo.path, revision="refs/heads/alias")
+    assert inv.commits == ()
+    assert inv.changes == ()
+    assert inv.commit_count == 0
+    assert inv.change_count == 0
+    assert inv.history_is_complete is True
+    assert inv.incomplete_reasons == ()
+    assert inv.scope.revision == "refs/heads/alias"
+
+
+def test_plain_branch_names_are_not_treated_as_unborn_symbolic_refs(git_repo):
+    repo = git_repo()
+    repo.symbolic_ref("refs/heads/alias", "refs/heads/main")
+    for revision in ("main", "refs/heads/main", "alias"):
+        with pytest.raises(GitRevisionError):
+            GitHistoryAnalyzer().analyze(repo.path, revision=revision)
+
+
+def test_non_head_symbolic_ref_resolves_once_its_target_has_commits(git_repo):
+    repo = git_repo()
+    repo.commit({"a.txt": b"1\n"})
+    repo.symbolic_ref("refs/heads/alias", "refs/heads/main")
+    inv = GitHistoryAnalyzer().analyze(repo.path, revision="refs/heads/alias")
+    assert inv.commit_count == 1
+    assert inv.commits[0].commit_id == repo.head
+
+
+def test_invalid_revision_still_raises_after_unborn_handling(git_repo):
+    repo = git_repo()
+    repo.commit({"a.txt": b"1\n"})
+    with pytest.raises(GitRevisionError):
+        GitHistoryAnalyzer().analyze(repo.path, revision="no-such-revision")
+
+
+def test_reusing_one_analyzer_keeps_per_analysis_resource_state(git_repo, monkeypatch):
+    from backend.git_history import adapter as adapter_module
+
+    repo = git_repo()
+    repo.commit({"a.txt": b"1\n"})
+    instances = []
+    original_init = adapter_module.GitAdapter.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        instances.append(self)
+
+    monkeypatch.setattr(adapter_module.GitAdapter, "__init__", tracking_init)
+    analyzer = GitHistoryAnalyzer()
+    try:
+        first = analyzer.analyze(repo.path)
+        assert first.commit_count == 1
+        assert len(instances) == 1
+        first_adapter = instances[0]
+
+        # Simulate a first analysis that exhausted both per-analysis bounds.
+        # A cached adapter would immediately fail the second analysis.
+        first_adapter._started_at -= adapter_module.AGGREGATE_TIMEOUT_SECONDS + 60
+        first_adapter._cumulative_bytes = adapter_module.CUMULATIVE_OUTPUT_BUDGET_BYTES
+
+        second = analyzer.analyze(repo.path)
+        assert second.commit_count == 1
+        assert len(instances) == 2
+        second_adapter = instances[1]
+        assert second_adapter is not first_adapter
+        assert second_adapter._helper_dir != first_adapter._helper_dir
+        assert second_adapter.cumulative_output_bytes < adapter_module.CUMULATIVE_OUTPUT_BUDGET_BYTES
+    finally:
+        for instance in instances:
+            instance.close()
+    assert all(not instance._helper_dir.exists() for instance in instances)
+
+
+def test_failed_analysis_cleans_up_and_does_not_poison_reuse(git_repo, monkeypatch):
+    from backend.git_history import adapter as adapter_module
+
+    repo = git_repo()
+    repo.commit({"a.txt": b"1\n"})
+    helper_dirs = []
+    original_init = adapter_module.GitAdapter.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        helper_dirs.append(self._helper_dir)
+
+    monkeypatch.setattr(adapter_module.GitAdapter, "__init__", tracking_init)
+    analyzer = GitHistoryAnalyzer()
+
+    def run_failure():
+        with pytest.raises(GitRevisionError):
+            analyzer.analyze(repo.path, revision="no-such-revision")
+
+    run_failure()
+    assert len(helper_dirs) == 1
+    assert not helper_dirs[0].exists()
+
+    inv = analyzer.analyze(repo.path)
+    assert inv.commit_count == 1
+    assert len(helper_dirs) == 2
+    assert helper_dirs[1] != helper_dirs[0]
+    assert not helper_dirs[1].exists()

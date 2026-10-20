@@ -217,6 +217,9 @@ class GitRepoBuilder:
     def branch(self, name, at):
         _run_git(["branch", name, at], cwd=self.path)
 
+    def symbolic_ref(self, name, target):
+        _run_git(["symbolic-ref", name, target], cwd=self.path)
+
     def checkout(self, name):
         _run_git(["checkout", name], cwd=self.path)
 
