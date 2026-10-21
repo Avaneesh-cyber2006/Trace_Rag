@@ -197,9 +197,14 @@ Command:
 
 Result: **2565 passed, 5 skipped, 2 deselected, 1 warning in 530.40 s**, exit 0.
 
-The four expected Windows skips are the POSIX-fork test, two symlink tests,
-and the Windows filename test. The warning is the pre-existing ChromaDB
+The five runtime skips are the POSIX-fork test, three symlink-creation tests
+(two in `test_file_scanner.py` and one in `test_code_parser.py`), and the
+Module 7 Windows filename test. The warning is the pre-existing ChromaDB
 `legacy embedding function config` deprecation warning.
+
+The historical pre-Module-7 baseline was **2387 passed, 4 skipped,
+2 deselected**. The measured final count is **2565 passed, 5 skipped,
+2 deselected**; the additional Module 7 tests account for the difference.
 
 ### Static and repository gates
 
@@ -288,7 +293,7 @@ the approved public contract or block integration:
 
 | Severity | Finding | Status |
 | --- | --- | --- |
-| Minor | Rename/copy changes publish `similarity=None` even when Git reports a similarity score. | Remaining; contract permits `None`. |
+| Minor | `GitFileChange` permits `similarity=None` for manually constructed rename/copy records. Published analyzer inventories pass through Git’s reported similarity score; this is model-level permissiveness, not a published-data defect. | Remaining; contract permits `None`. |
 | Minor | Shallow-boundary commit IDs are not independently validated as 40-hex object IDs before publication. | Remaining. |
 | Minor | Baseline tree object validation is limited; an unexpected tree type is not separately rejected before diffing. | Remaining. |
 | Minor | Cleanup regressions could still pass if only `__del__` closed helpers; there is no direct assertion that `close()` was called. | Remaining; deterministic `finally: adapter.close()` is implemented. |
