@@ -360,3 +360,298 @@ compliance and implementation/test quality, with no Critical or Important
 findings. This module is ready for the user's separate integration approval.
 No merge or push has been performed; primary `main` remains at
 `1646c683ac1b0ccdfa8257b663188ebde3a687c8`.
+
+## Post-merge verification and upstream ChromaDB publication exception
+
+**Recorded:** 2026-10-22 (Asia/Kolkata).
+
+### Chronology and current repository state
+
+The independent audit above was completed before integration. Its statements
+that no merge or push had occurred were true at that time and are retained
+unchanged as historical evidence. After that audit, a separate user
+authorization permitted a local fast-forward-only integration of the audited
+feature.
+
+The primary repository reflog records the integration at
+`2026-10-21 20:24:28 +0530`:
+
+```text
+c9000ff HEAD@{2026-10-21 20:24:28 +0530}: merge c9000ff11b9af743b5021f609048952e04d74429: Fast-forward
+```
+
+`c9000ff11b9af743b5021f609048952e04d74429` has one parent,
+`3c96aadb76f00065fe2fad70029cdfec878db86b`. The integrated range contains no
+merge commit, squash, or rebase. The post-integration local `main`, the Module 7
+feature branch, and the Module 7 worktree were all at `c9000ff`.
+
+The publication audit recorded here did not fetch, pull, reset, clean, rebase,
+amend, or merge. It did not change production code, test code, `README.md`,
+requirements, or specifications. The only intended change is this
+documentation file. At the start of the audit, local `main` was 32 commits ahead
+of `origin/main`; `origin/main` was
+`159a2ee45aed6d11a07c846c3fc8982b4d207fdc`.
+
+### Post-merge gates that exited successfully
+
+These results were observed from the primary repository at local `main` =
+`c9000ff`, with fresh writable `--basetemp` directories outside the repository
+and `-p no:cacheprovider`.
+
+| Gate | Result | Exit |
+| --- | --- | ---: |
+| Full Module 7 (`-k "git_history"`) | **178 passed, 1 skipped** | 0 |
+| Module 7 integration | **5 passed** | 0 |
+| Module 7 security | **13 passed** | 0 |
+| Module 7 scaling | **8 passed** | 0 |
+| Module 1 repository loader | **48 passed, 1 deselected** | 0 |
+| Module 2 file scanner | **178 passed, 2 skipped** | 0 |
+| Module 3 and grammar gate | **214 passed, 1 skipped** | 0 |
+| Module 4 code chunker | **143 passed** | 0 |
+| Module 5/vector/search aggregate, clean isolated rerun | **1214 passed, 1 skipped** | 0 |
+| Module 6 graph aggregate | **564 passed** | 0 |
+| Module 6 integration | **26 passed** | 0 |
+| `python -m compileall -q backend tests` | clean | 0 |
+| `python -m pip check` | `No broken requirements found.` | 0 |
+| `git diff --check` and range diff check | clean | 0 |
+
+The single Module 7 skip is the expected Windows filename test: `*` and `?`
+are illegal filename characters on Windows. The Module 5 clean isolated rerun
+followed an earlier aggregate run with one failure, described below. A clean
+aggregate rerun is not a full-suite pass.
+
+### Latest full-suite status: not passing
+
+The latest full offline-suite attempts at `c9000ff` used:
+
+```text
+<python> -m pytest -q -m "not integration and not gemini_live" -rs -p no:cacheprovider --basetemp=<fresh-outside-repo>
+```
+
+Both recorded attempts exited `1` with **2 failed, 2563 passed, 5 skipped,
+2 deselected, 1 warning**:
+
+| Attempt | Result | Exit |
+| --- | --- | ---: |
+| Initial post-merge full suite | **2 failed, 2563 passed, 5 skipped, 2 deselected** | 1 |
+| Fresh-`basetemp` rerun | **2 failed, 2563 passed, 5 skipped, 2 deselected** | 1 |
+
+The two attempts produced four distinct failing node IDs:
+
+- `tests/test_chroma_vector_store.py::test_publication_requires_readable_unambiguous_pointer_after_replace[unreadable-True]`;
+- `tests/test_embedding_scaling.py::test_real_chroma_candidate_id_work_is_linear[True-257]`;
+- `tests/test_chroma_vector_store.py::test_committed_publication_survives_backend_read_outage[False-False]`;
+- `tests/test_chroma_vector_store.py::test_publication_requires_readable_unambiguous_pointer_after_replace[third-False]`.
+
+Two additional observations occurred at the same manifest-read call site:
+
+- the Module 5 aggregate run failed
+  `tests/test_chroma_integrity_deletion.py::test_delete_repository_index_removes_incomplete_abandoned_candidates[True-1]`;
+- the targeted-prefix diagnostic run failed the neighboring parametrization
+  `tests/test_chroma_vector_store.py::test_publication_requires_readable_unambiguous_pointer_after_replace[checksum-True]`.
+
+All six observations ended in
+`backend/embedding_vector_store/stores/chroma.py:1255` with
+`VectorStoreReadError: Vector store data could not be read.` The raw Chroma
+exception captured by the Phase B probe was:
+
+```text
+chromadb.errors.InternalError: Error executing plan: Internal error:
+Error creating hnsw segment reader: Nothing found on disk
+```
+
+The 2565-pass result in the pre-integration section was observed at the audited
+candidate `14840f1` before integration. It remains historical evidence for that
+candidate and time only. It is not a result for `c9000ff`, and it must not be
+presented as the current full-suite status.
+
+### Failure path and non-causation evidence
+
+The four full-suite failures, the Module 5 aggregate failure, and the Phase B
+failure all traverse:
+
+```text
+publish()
+  -> inspect_active()
+  -> _snapshot_for_collection()
+  -> _read_manifest_from_collection()
+  -> Collection.get(limit=..., offset=..., include=["documents", "embeddings", "metadatas"])
+  -> VectorStoreReadError at backend/embedding_vector_store/stores/chroma.py:1255
+
+delete_repository_index()
+  -> _repository_collection_names()
+  -> _read_manifest_from_collection()
+  -> Collection.get(limit=..., offset=..., include=["documents", "embeddings", "metadatas"])
+  -> VectorStoreReadError at backend/embedding_vector_store/stores/chroma.py:1255
+```
+
+In the publication tests, the failure occurs during the first
+`inspect_active()` call inside `publish()`, before the active-pointer
+replacement is attempted. The test's `committed` flag is therefore still
+`False`. This is important because:
+
+- the simulated pointer-read outage in
+  `test_publication_requires_readable_unambiguous_pointer_after_replace` is
+  guarded by `committed`;
+- the simulated backend outage in
+  `test_committed_publication_survives_backend_read_outage` is guarded by
+  `committed`;
+- the failure therefore occurs before either simulated outage path can run;
+- `test_real_chroma_candidate_id_work_is_linear` does not simulate a backend
+  outage.
+
+All four full-suite failures are in unchanged Module 5 test files. No Module 7
+test runs before them in the session collection order: the failing positions
+are 87, 92, 95, and 1269, while the first `test_git_history` node is at position
+2160. The four failures are not evidence that Module 7's production path was
+executed.
+
+### Evidence, mechanism, and dependency versions
+
+The observed environment was:
+
+- Python `3.12.14`;
+- ChromaDB `1.5.9`;
+- Foyer `0.17.4` (the crate version locked by the inspected Chroma source);
+- SQLite `3.53.1`;
+- Windows `_getmaxstdio()` = `512`.
+
+ChromaDB's Rust binding computes:
+
+```text
+hnsw_cache_size = _getmaxstdio() // 5 = 512 // 5 = 102
+```
+
+The Foyer default configuration uses 64 shards. In `foyer-memory` 0.17.4,
+`shard_capacity = capacity / shards`, so the default 102-entry capacity becomes
+64 shards of one entry each. HNSW indexes are keyed by vector-segment UUID.
+When a live client needs an index whose cache entry was evicted and whose
+on-disk `index_metadata.pickle` was never written, the reader returns
+`UninitializedSegment` (`Nothing found on disk`).
+
+ChromaDB's default `sync_threshold` is 1000. The small Module 5 collections
+contain far fewer than 1000 records and therefore do not reach the normal
+persist threshold. Chroma's local executor also records collections it has
+backfilled and suppresses a second backfill for the same live client. Source
+inspection of the inspected 1.5.9 source supports this sequence; the exact live
+shard assignment was not introspected.
+
+The preserved failing roots corroborate the unpersisted-index condition. For
+each of the four full-suite failing roots, the HNSW segment directories
+contained HNSW data files but no `index_metadata.pickle`. The same was true of
+the preserved Module 5 aggregate failing root. This is strong diagnostic
+evidence, although the raw Chroma exception was captured directly only by the
+Phase B probe; the other observed nodes were wrapped at line 1255 before their
+raw Chroma exception was recorded.
+
+### Controlled reproductions
+
+The following diagnostic scripts were run outside the repository and made no
+production or test changes.
+
+| Reproduction | Default result | Forced larger cache result |
+| --- | --- | --- |
+| Two collections, 320 fresh roots; force both indexes into the cache | **1 failure / 320**, exact `Nothing found on disk` | 1024: **0 failures / 320** |
+| Load one old collection plus 128 other collections | **failed**, exact `Nothing found on disk` | 1024: **passed** |
+| Load one old collection plus 512 other collections | **failed**, exact `Nothing found on disk` | 8192: **passed** |
+| Two-record collection with `hnsw:sync_threshold=2`, then load 128 or 512 other collections | **passed**; an `index_metadata.pickle` was present | not applicable |
+
+The two-collection result is intermittent, as expected from a probabilistic
+shard collision. An earlier 320-round run passed with zero failures; a later
+run failed once. The deterministic 128- and 512-collection overflow runs both
+failed at the default capacity and passed when the effective cache was
+enlarged. The `sync_threshold=2` runs preserved the index and passed under the
+same overflow pressure. `sync_threshold=1` was rejected as an invalid
+configuration and is not part of the root-cause claim.
+
+### Diagnostic reruns and limits
+
+Phase A reran each of the four full-suite failing node IDs three times in fresh
+processes: **12/12 passed**. These reruns characterized nondeterminism; they are
+not a substitute for a passing full suite and do not convert the latest suite
+result into a pass.
+
+Phase B ran the targeted prefix group three times: **1 of 3 runs failed**, with
+the neighboring `checksum-True` parametrization and the raw Chroma exception
+above. Phase C ran an isolated `159a2ee` baseline three times: **3/3 passed,
+218 passed, 1 skipped** each time. With an assumed true 1/3 failure rate, three
+passing baseline runs have probability about 29.6%; Phase C therefore does not
+prove that the baseline is immune.
+
+The evidence supports a narrow upstream publication exception, not a finding
+that every observed failure has an identical internal state. The shared
+observable failure mode is the manifest/collection read at line 1255, the same
+publish/inspection call chain, the pre-commit timing, and missing
+`index_metadata.pickle` in the preserved failing roots. The precise live shard
+mapping remains unobserved.
+
+### Shared fixture and repository-scope audit
+
+`tests/conftest.py` changed by adding the Module 7 `GitRepoBuilder`,
+`ShallowClone`, `_run_git`, and `git_repo` fixtures, the imports they need, and
+a replacement of the module docstring. The diff contains no `autouse` fixture,
+no `pytest_configure` or session hook, and no module-level environment mutation.
+The `os.environ` assignment is inside the per-call `commit_with_timestamp`
+helper. Neither the fixture addition nor the docstring replacement installs a
+global Chroma or process-state side effect.
+
+`backend/git_history/` imports only the Python standard library and its own
+package modules. It does not import ChromaDB or the Module 5 embedding store.
+The integration range from `1646c68` contains only the eight new
+`backend/git_history/` modules, the ten `tests/test_git_history_*.py` files,
+the shared `tests/conftest.py` fixture addition and module-docstring
+replacement, `README.md`, and this verification document. The wider publication
+range from `159a2ee` also carries
+the approved Module 7 plan and specification documents. The range changes no
+Module 1–6 production file, no Module 5 test file, and no Module 8–10 content.
+
+At the start and end of the diagnostic work, the four registered worktrees were
+preserved, and the 22 pre-existing untracked repository paths (127 files) were
+covered by an identical SHA-256 manifest before and after. No untracked artifact
+was removed or modified by the diagnostic work.
+
+### Publication exception
+
+This exception is for GitHub **source publication** of the Module 7 range only.
+It is not a full-suite verification, not a Module 5 regression waiver, and not a
+production-readiness certification. It does not authorize changing Module 5,
+adding a retry or suppression, skipping/xfail, weakening an assertion, or
+declaring the failing full suite clean. Diagnostic isolated reruns were used
+only to characterize the nondeterministic upstream failure; they are not offered
+as a passing verification result.
+
+A fresh-context independent reviewer in OpenCode `general` subagent session
+`ses_e9d93633effevphOQ9VB5SMlDa` reviewed this exception and the evidence above.
+It returned the exact verdict `PUBLICATION EXCEPTION APPROVED`, with 0 Critical
+findings, 0 Important findings, and 3 Minor documentation findings: the
+`tests/conftest.py` description omitted the module-docstring replacement, the
+publication-state paragraph used present-tense wording before the documentation
+commit existed, and this verdict record was absent. The three Minor corrections
+were applied, and the reviewer confirmed the corrected text still carries
+`PUBLICATION EXCEPTION APPROVED`.
+
+The exception is therefore accepted, subject to the scope and limits stated in
+this section.
+
+The exception is limited to the observed intermittent unchanged Module 5
+manifest/collection-read failures at `chroma.py:1255` whose evidence matches the
+investigated `Nothing found on disk` upstream ChromaDB/Foyer cache-eviction
+condition or its directly corroborated unpersisted-index variant. A failure
+that cannot be linked to this condition is outside the exception and requires a
+stop, not broader acceptance of `VectorStoreReadError`.
+
+The required publication disclosure is:
+
+An explicit, narrowly scoped upstream-dependency verification exception was accepted for GitHub source publication. The latest full offline-suite runs did not pass. The ChromaDB cache-eviction/read-recovery defect remains unresolved and may affect real small-collection reads on Windows. This exception does not constitute production-readiness approval.
+
+### Publication state
+
+At the time this section was written, this document was the only intended change
+in a single documentation commit to be directly parented by
+`c9000ff11b9af743b5021f609048952e04d74429`, the commit that contains this
+section. Local `main` was 32 commits ahead of `origin/main`; adding the
+documentation commit makes the outgoing publication range 33 commits. The
+preceding 32 commits are unchanged. No push has been performed as part of this
+work. The remote main tip must be checked again immediately before the separate
+single push, and only a non-force `refs/heads/main:refs/heads/main` update is
+permitted.
