@@ -2105,3 +2105,269 @@ def test_validate_inventory_rejects_forged_records_only_in_indexes():
     )
     with pytest.raises(RuntimeEvidenceInvariantError):
         validate_inventory(frame_inventory)
+
+
+_PRIVACY_SENTINEL = "CP1-PRIVACY"
+_PRIVACY_CONTENT = b"CP1-PRIVACY-ARTIFACT-CONTENT\x00\xff"
+_PRIVACY_SOURCE = "CP1-PRIVACY-SOURCE-NAME.log"
+_PRIVACY_NAMESPACE = "CP1-PRIVACY-NAMESPACE"
+_PRIVACY_REVISION = "CP1-PRIVACY-REVISION"
+_PRIVACY_CAPTURED = "CP1-PRIVACY-CAPTURED"
+_PRIVACY_TAG_KEY = "CP1-PRIVACY-TAG-KEY"
+_PRIVACY_TAG_VALUE = "CP1-PRIVACY-TAG-VALUE"
+_PRIVACY_FUNCTION = "CP1-PRIVACY-FUNCTION"
+_PRIVACY_PATH = "CP1-PRIVACY-PATH"
+_PRIVACY_NODE = "CP1-PRIVACY-NODE"
+_PRIVACY_TRACE = "CP1-PRIVACY-TRACE"
+_PRIVACY_SPAN = "CP1-PRIVACY-SPAN"
+_PRIVACY_TIMESTAMP = "CP1-PRIVACY-TIMESTAMP"
+_PRIVACY_LEVEL = "CP1-PRIVACY-LEVEL"
+_PRIVACY_MESSAGE = "CP1-PRIVACY-MESSAGE"
+_PRIVACY_LOGGER = "CP1-PRIVACY-LOGGER"
+_PRIVACY_OPERATION = "CP1-PRIVACY-OPERATION"
+_PRIVACY_STATUS = "CP1-PRIVACY-STATUS"
+_PRIVACY_ERROR = "CP1-PRIVACY-ERROR"
+_PRIVACY_FINGERPRINT = "7" * 64
+_PRIVACY_CONTENT_SHA = "8" * 64
+_PRIVACY_ISSUE_MESSAGE = "line is not valid UTF-8"
+
+
+def _privacy_models():
+    content = _PRIVACY_CONTENT
+    artifact = RuntimeArtifact(
+        _PRIVACY_SOURCE,
+        RuntimeArtifactFormat.TEXT_LOG,
+        content,
+        RuntimeFrameLanguage.PYTHON,
+    )
+    request = RuntimeEvidenceRequest(
+        _PRIVACY_NAMESPACE,
+        (artifact,),
+        declared_revision=_PRIVACY_REVISION,
+        declared_captured_at=_PRIVACY_CAPTURED,
+        declared_capture_completeness=CaptureCompleteness.PARTIAL,
+    )
+    tag = RuntimeTag(_PRIVACY_TAG_KEY, _PRIVACY_TAG_VALUE)
+    frame = _file_frame(
+        event_id=A,
+        ordinal=0,
+        function_text=_PRIVACY_FUNCTION,
+        relative_path=f"pkg/{_PRIVACY_PATH}.py",
+        line=44,
+        column=7,
+        primary_node_id=f"{_PRIVACY_NODE}-PRIMARY",
+        candidate_node_ids=(f"{_PRIVACY_NODE}-PRIMARY",),
+    )
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint=_PRIVACY_FINGERPRINT,
+        source_line=12,
+        kind=RuntimeEventKind.ERROR,
+        timestamp_text=_PRIVACY_TIMESTAMP,
+        level=_PRIVACY_LEVEL,
+        message=_PRIVACY_MESSAGE,
+        logger=_PRIVACY_LOGGER,
+        operation=_PRIVACY_OPERATION,
+        trace_id=_PRIVACY_TRACE,
+        span_id=_PRIVACY_SPAN,
+        parent_span_id=f"{_PRIVACY_SPAN}-PARENT",
+        duration_ms_text="12.5",
+        status=_PRIVACY_STATUS,
+        error_type=f"{_PRIVACY_ERROR}-TYPE",
+        error_message=f"{_PRIVACY_ERROR}-MESSAGE",
+        tags=(tag,),
+        frames=(frame,),
+    )
+    issue = _issue(
+        code=RuntimeIssueCode.INVALID_UTF8,
+        message=_PRIVACY_ISSUE_MESSAGE,
+        artifact_id=A,
+        event_sequence=0,
+        source_line=12,
+    )
+    record = _artifact_record(
+        artifact_id=A,
+        source_names=(_PRIVACY_SOURCE,),
+        content_sha256=_PRIVACY_CONTENT_SHA,
+        size_bytes=len(content),
+        event_count=1,
+        frame_count=1,
+        issue_count=1,
+    )
+    inventory = _inventory(
+        artifacts=(record,),
+        events=(event,),
+        frames=(frame,),
+        issues=(issue,),
+        repository_namespace=_PRIVACY_NAMESPACE,
+        declared_revision=_PRIVACY_REVISION,
+        declared_captured_at=_PRIVACY_CAPTURED,
+        declared_capture_completeness=CaptureCompleteness.PARTIAL,
+    )
+    return artifact, request, tag, frame, event, issue, record, inventory
+
+
+def _privacy_forbidden_values():
+    return (
+        _PRIVACY_SENTINEL,
+        _PRIVACY_CONTENT.decode("latin-1"),
+        _PRIVACY_SOURCE,
+        _PRIVACY_NAMESPACE,
+        _PRIVACY_REVISION,
+        _PRIVACY_CAPTURED,
+        _PRIVACY_TAG_KEY,
+        _PRIVACY_TAG_VALUE,
+        _PRIVACY_FUNCTION,
+        _PRIVACY_PATH,
+        _PRIVACY_NODE,
+        _PRIVACY_TRACE,
+        _PRIVACY_SPAN,
+        _PRIVACY_TIMESTAMP,
+        _PRIVACY_LEVEL,
+        _PRIVACY_MESSAGE,
+        _PRIVACY_LOGGER,
+        _PRIVACY_OPERATION,
+        _PRIVACY_STATUS,
+        _PRIVACY_ERROR,
+        _PRIVACY_FINGERPRINT,
+        _PRIVACY_CONTENT_SHA,
+        _PRIVACY_ISSUE_MESSAGE,
+        "pkg/",
+        "b'",
+        'b"',
+    )
+
+
+def test_public_data_model_reprs_use_only_the_redacted_allowlist():
+    artifact, request, tag, frame, event, issue, record, inventory = (
+        _privacy_models()
+    )
+    values = (artifact, request, tag, frame, event, issue, record, inventory)
+    for value in values:
+        assert "__repr__" in type(value).__dict__, type(value).__name__
+    assert repr(tag) == "RuntimeTag()"
+    assert repr(artifact) == (
+        "RuntimeArtifact(format=text_log, declared_language=python, "
+        f"size_bytes={len(_PRIVACY_CONTENT)})"
+    )
+    assert repr(request) == "RuntimeEvidenceRequest(artifact_count=1)"
+    assert repr(frame) == (
+        f"RuntimeStackFrame(frame_id={A}, event_id={A}, ordinal=0, "
+        "language=unknown, line=44, column=7, "
+        "path_match_basis=exact_relative_path, association=file, "
+        "candidate_count=1)"
+    )
+    assert repr(event) == (
+        f"RuntimeEvent(event_id={A}, artifact_id={A}, sequence=0, "
+        "source_line=12, kind=error, frame_count=1, "
+        "text_truncated=False, frames_truncated=False)"
+    )
+    assert repr(issue) == (
+        f"RuntimeEvidenceIssue(code=invalid_utf8, artifact_id={A}, "
+        "event_sequence=0, source_line=12)"
+    )
+    assert repr(record) == (
+        f"RuntimeArtifactRecord(artifact_id={A}, format=text_log, "
+        "declared_language=None, "
+        f"size_bytes={len(_PRIVACY_CONTENT)}, status=complete, "
+        "event_count=1, frame_count=1, duplicate_count=0, "
+        "text_truncated=False, frames_truncated=False, issue_count=1)"
+    )
+    assert repr(inventory) == (
+        "RuntimeEvidenceInventory(artifact_count=1, event_count=1, "
+        "frame_count=1, issue_count=1, "
+        f"total_input_bytes={len(_PRIVACY_CONTENT)}, "
+        "submitted_artifacts=1, duplicate_artifacts=0, "
+        "graph_binding=not_provided, event_text_retained=True, "
+        "ingestion_complete=True, text_truncated=False, "
+        "events_truncated=False, frames_truncated=False, "
+        "issues_truncated=False, incomplete_reason_count=0)"
+    )
+    for value in values:
+        text = repr(value)
+        for forbidden in _privacy_forbidden_values():
+            assert forbidden not in text, (type(value).__name__, forbidden)
+
+
+def test_public_data_model_reprs_and_strs_never_expose_sensitive_values():
+    for value in _privacy_models():
+        representation = repr(value)
+        string = str(value)
+        assert string == representation
+        for forbidden in _privacy_forbidden_values():
+            assert forbidden not in representation, (
+                type(value).__name__, "repr", forbidden)
+            assert forbidden not in string, (
+                type(value).__name__, "str", forbidden)
+
+
+def test_redacted_reprs_do_not_recurse_into_nested_records_or_indexes():
+    _, request, _, _, event, _, _, inventory = _privacy_models()
+    request_text = repr(request)
+    event_text = repr(event)
+    inventory_text = repr(inventory)
+    assert "RuntimeArtifact(" not in request_text
+    assert "RuntimeTag(" not in event_text
+    assert "RuntimeStackFrame(" not in event_text
+    for marker in (
+        "RuntimeArtifactRecord(",
+        "RuntimeEvent(",
+        "RuntimeStackFrame(",
+        "RuntimeEvidenceIssue(",
+        "events_by_",
+        "frames_by_",
+        "{",
+        "}",
+    ):
+        assert marker not in inventory_text, marker
+
+
+def test_runtime_artifact_large_binary_repr_omits_content_and_source_name():
+    body = (b"CP1-PRIVACY-LARGE-CONTENT" + bytes(range(256))) * 5_000
+    artifact = RuntimeArtifact(
+        "CP1-PRIVACY-LARGE-SOURCE.log",
+        RuntimeArtifactFormat.TEXT_LOG,
+        body,
+    )
+    text = repr(artifact)
+    expected = (
+        "RuntimeArtifact(format=text_log, declared_language=None, "
+        f"size_bytes={len(body)})"
+    )
+    assert len(text) == len(expected)
+    assert text == expected
+    for forbidden in (
+        "CP1-PRIVACY-LARGE-CONTENT",
+        "CP1-PRIVACY-LARGE-SOURCE",
+        "b'",
+        'b"',
+    ):
+        assert forbidden not in text
+
+
+def test_redacted_reprs_contain_no_raw_or_escaped_hostile_text():
+    hostile = "CP1-PRIVACY-HOSTILE-\x1b[31m\u202e"
+    tag = RuntimeTag(hostile, hostile)
+    frame = _file_frame(
+        event_id=A,
+        ordinal=0,
+        function_text=hostile,
+    )
+    event = _event(
+        message=hostile,
+        logger=hostile,
+        operation=hostile,
+        trace_id=hostile,
+        tags=(tag,),
+        frames=(frame,),
+    )
+    for value in (tag, frame, event):
+        text = repr(value)
+        assert hostile not in text
+        assert "CP1-PRIVACY-HOSTILE" not in text
+        assert "\x1b" not in text
+        assert "\u202e" not in text
+        assert "\\x1b" not in text
+        assert "\\u202e" not in text

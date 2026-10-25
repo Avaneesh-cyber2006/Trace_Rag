@@ -304,6 +304,9 @@ class RuntimeTag:
     key: str
     value: str
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
     def __post_init__(self) -> None:
         require_scalar_text(
             self.key, "key", RuntimeEvidenceValidationError
@@ -319,6 +322,18 @@ class RuntimeArtifact:
     format: RuntimeArtifactFormat
     content: bytes
     declared_language: RuntimeFrameLanguage | None = None
+
+    def __repr__(self) -> str:
+        declared_language = (
+            self.declared_language.value
+            if self.declared_language is not None
+            else None
+        )
+        return (
+            f"{type(self).__name__}(format={self.format.value}, "
+            f"declared_language={declared_language}, "
+            f"size_bytes={len(self.content)})"
+        )
 
     def __post_init__(self) -> None:
         _require_source_name(self.source_name)
@@ -356,6 +371,11 @@ class RuntimeEvidenceRequest:
     declared_capture_completeness: CaptureCompleteness = (
         CaptureCompleteness.UNKNOWN
     )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(artifact_count={len(self.artifacts)})"
+        )
 
     def __post_init__(self) -> None:
         _require_namespace(self.repository_namespace)
@@ -402,6 +422,17 @@ class RuntimeStackFrame:
     association: FrameAssociation
     primary_node_id: str | None
     candidate_node_ids: tuple[str, ...]
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(frame_id={self.frame_id}, "
+            f"event_id={self.event_id}, ordinal={self.ordinal}, "
+            f"language={self.language.value}, line={self.line}, "
+            f"column={self.column}, "
+            f"path_match_basis={self.path_match_basis.value}, "
+            f"association={self.association.value}, "
+            f"candidate_count={len(self.candidate_node_ids)})"
+        )
 
     def __post_init__(self) -> None:
         _validate_stack_frame_record(self)
@@ -673,6 +704,16 @@ class RuntimeEvent:
     text_truncated: bool
     frames_truncated: bool
 
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(event_id={self.event_id}, "
+            f"artifact_id={self.artifact_id}, sequence={self.sequence}, "
+            f"source_line={self.source_line}, kind={self.kind.value}, "
+            f"frame_count={len(self.frames)}, "
+            f"text_truncated={self.text_truncated}, "
+            f"frames_truncated={self.frames_truncated})"
+        )
+
     def __post_init__(self) -> None:
         require_sha256_digest(
             self.event_id, "event_id", RuntimeEvidenceInvariantError
@@ -766,6 +807,14 @@ class RuntimeEvidenceIssue:
     event_sequence: int | None
     source_line: int | None
 
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(code={self.code.value}, "
+            f"artifact_id={self.artifact_id}, "
+            f"event_sequence={self.event_sequence}, "
+            f"source_line={self.source_line})"
+        )
+
     def __post_init__(self) -> None:
         _require_exact_enum(
             self.code,
@@ -804,6 +853,25 @@ class RuntimeArtifactRecord:
     text_truncated: bool
     frames_truncated: bool
     issue_count: int
+
+    def __repr__(self) -> str:
+        declared_language = (
+            self.declared_language.value
+            if self.declared_language is not None
+            else None
+        )
+        return (
+            f"{type(self).__name__}(artifact_id={self.artifact_id}, "
+            f"format={self.format.value}, "
+            f"declared_language={declared_language}, "
+            f"size_bytes={self.size_bytes}, status={self.status.value}, "
+            f"event_count={self.event_count}, "
+            f"frame_count={self.frame_count}, "
+            f"duplicate_count={self.duplicate_count}, "
+            f"text_truncated={self.text_truncated}, "
+            f"frames_truncated={self.frames_truncated}, "
+            f"issue_count={self.issue_count})"
+        )
 
     def __post_init__(self) -> None:
         require_sha256_digest(
@@ -916,6 +984,26 @@ class RuntimeEvidenceInventory:
     frames_by_node: Mapping[str, tuple[RuntimeStackFrame, ...]]
 
     SCHEMA_VERSION: ClassVar[str] = "tracerag-runtime-evidence-v1"
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"artifact_count={len(self.artifacts)}, "
+            f"event_count={len(self.events)}, "
+            f"frame_count={len(self.frames)}, "
+            f"issue_count={len(self.issues)}, "
+            f"total_input_bytes={self.total_input_bytes}, "
+            f"submitted_artifacts={self.submitted_artifacts}, "
+            f"duplicate_artifacts={self.duplicate_artifacts}, "
+            f"graph_binding={self.graph_binding.value}, "
+            f"event_text_retained={self.event_text_retained}, "
+            f"ingestion_complete={self.ingestion_complete}, "
+            f"text_truncated={self.text_truncated}, "
+            f"events_truncated={self.events_truncated}, "
+            f"frames_truncated={self.frames_truncated}, "
+            f"issues_truncated={self.issues_truncated}, "
+            f"incomplete_reason_count={len(self.incomplete_reasons)})"
+        )
 
     def __post_init__(self) -> None:
         from backend.runtime_evidence.indexes import (
