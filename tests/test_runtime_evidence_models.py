@@ -10,10 +10,12 @@ from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceValidationError,
 )
 from backend.runtime_evidence.models import (
-    CaptureCompleteness, FrameAssociation, GraphBinding, PathMatchBasis,
-    RuntimeArtifact, RuntimeArtifactFormat, RuntimeArtifactStatus,
-    RuntimeEventKind, RuntimeEvidenceRequest, RuntimeFrameLanguage,
-    RuntimeIncompleteReason, RuntimeIssueCode, RuntimeTag,
+    CaptureCompleteness, FrameAssociation, GraphBinding, ISSUE_MESSAGES,
+    PathMatchBasis, RuntimeArtifact, RuntimeArtifactFormat,
+    RuntimeArtifactRecord, RuntimeArtifactStatus, RuntimeEvent,
+    RuntimeEventKind, RuntimeEvidenceIssue, RuntimeEvidenceRequest,
+    RuntimeFrameLanguage, RuntimeIncompleteReason, RuntimeIssueCode,
+    RuntimeStackFrame, RuntimeTag, issue_message,
 )
 
 
@@ -282,3 +284,594 @@ def test_tag_is_scalar_only():
                        ("k\x00", "v"), ("k", "v\x00")):
         with pytest.raises(RuntimeEvidenceValidationError):
             RuntimeTag(key, value)
+
+
+A = "a" * 64
+
+_BAD_SHA256 = (None, 1, "A" * 64, "a" * 63, "a" * 64 + "\x00", "\ud800")
+_BAD_POSITIVE_INT = (0, -1, True, 1.0, "\ud800", "a\x00b")
+_BAD_NONNEGATIVE_INT = (-1, True, 0.0, "\ud800", "a\x00b")
+_BAD_REQUIRED_NONNEGATIVE_INT = (None, *_BAD_NONNEGATIVE_INT)
+_BAD_TEXT = (1, b"x", "a\ud800", "a\x00b")
+
+
+class _TupleSubclass(tuple):
+    pass
+
+
+def _frame(**kw):
+    values = dict(frame_id=A, event_id="b" * 64, ordinal=0,
+                  language=RuntimeFrameLanguage.UNKNOWN, function_text=None,
+                  relative_path=None, line=None, column=None,
+                  source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.UNMATCHED,
+                  association=FrameAssociation.UNASSOCIATED,
+                  primary_node_id=None, candidate_node_ids=())
+    values.update(kw)
+    return RuntimeStackFrame(**values)
+
+
+def _verified_frame(**kw):
+    values = dict(relative_path="pkg/a.py", source_reference_sha256=A,
+                  path_match_basis=PathMatchBasis.EXACT_RELATIVE_PATH)
+    values.update(kw)
+    return _frame(**values)
+
+
+def _file_frame(**kw):
+    values = dict(association=FrameAssociation.FILE,
+                  primary_node_id="f", candidate_node_ids=("f",))
+    values.update(kw)
+    return _verified_frame(**values)
+
+
+def _event(**kw):
+    values = dict(event_id=A, event_fingerprint="c" * 64, artifact_id="d" * 64,
+                  sequence=0, source_line=1, kind=RuntimeEventKind.LOG,
+                  timestamp_text=None, level="INFO", message="hello",
+                  logger=None, operation=None, trace_id=None, span_id=None,
+                  parent_span_id=None, duration_ms_text=None, status=None,
+                  error_type=None, error_message=None, tags=(), frames=(),
+                  text_truncated=False, frames_truncated=False)
+    values.update(kw)
+    return RuntimeEvent(**values)
+
+
+def _issue(**kw):
+    values = dict(code=RuntimeIssueCode.INVALID_UTF8,
+                  message=ISSUE_MESSAGES[RuntimeIssueCode.INVALID_UTF8],
+                  artifact_id=A, event_sequence=None, source_line=1)
+    values.update(kw)
+    return RuntimeEvidenceIssue(**values)
+
+
+def _artifact_record(**kw):
+    values = dict(artifact_id=A, source_names=("ci.log",),
+                  format=RuntimeArtifactFormat.TEXT_LOG,
+                  declared_language=None, content_sha256="e" * 64,
+                  size_bytes=6, status=RuntimeArtifactStatus.COMPLETE,
+                  event_count=0, frame_count=0, duplicate_count=0,
+                  text_truncated=False, frames_truncated=False, issue_count=0)
+    values.update(kw)
+    return RuntimeArtifactRecord(**values)
+
+
+def test_output_model_field_order_and_frozen_slotted():
+    assert [field.name for field in fields(RuntimeStackFrame)] == [
+        "frame_id", "event_id", "ordinal", "language", "function_text",
+        "relative_path", "line", "column", "source_reference_sha256",
+        "path_match_basis", "association", "primary_node_id",
+        "candidate_node_ids"]
+    assert [field.name for field in fields(RuntimeEvent)] == [
+        "event_id", "event_fingerprint", "artifact_id", "sequence",
+        "source_line", "kind", "timestamp_text", "level", "message", "logger",
+        "operation", "trace_id", "span_id", "parent_span_id",
+        "duration_ms_text", "status", "error_type", "error_message", "tags",
+        "frames", "text_truncated", "frames_truncated"]
+    assert [field.name for field in fields(RuntimeEvidenceIssue)] == [
+        "code", "message", "artifact_id", "event_sequence", "source_line"]
+    assert [field.name for field in fields(RuntimeArtifactRecord)] == [
+        "artifact_id", "source_names", "format", "declared_language",
+        "content_sha256", "size_bytes", "status", "event_count",
+        "frame_count", "duplicate_count", "text_truncated",
+        "frames_truncated", "issue_count"]
+    issue = RuntimeEvidenceIssue(
+        RuntimeIssueCode.INVALID_UTF8,
+        ISSUE_MESSAGES[RuntimeIssueCode.INVALID_UTF8], A, None, 1)
+    for record, field_name in ((_frame(), "frame_id"), (_event(), "event_id"),
+                               (issue, "code"),
+                               (_artifact_record(), "artifact_id")):
+        assert not hasattr(record, "__dict__")
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, field_name, None)
+
+
+def test_issue_messages_are_exact_and_issue_validates_them():
+    expected = {
+        RuntimeIssueCode.ARTIFACT_TOO_LARGE:
+            "artifact exceeds the configured byte limit",
+        RuntimeIssueCode.INVALID_UTF8: "line is not valid UTF-8",
+        RuntimeIssueCode.NUL_BYTE: "NUL byte is not allowed",
+        RuntimeIssueCode.LINE_TOO_LONG:
+            "line exceeds the configured byte limit",
+        RuntimeIssueCode.MALFORMED_JSON:
+            "line or document is not valid JSON",
+        RuntimeIssueCode.DUPLICATE_JSON_KEY:
+            "JSON object contains a duplicate key",
+        RuntimeIssueCode.INVALID_EVENT_SCHEMA:
+            "event does not match the supported schema",
+        RuntimeIssueCode.STACK_LANGUAGE_MISSING:
+            "stack cannot be parsed without a known language",
+        RuntimeIssueCode.STACK_TOO_LARGE:
+            "stack exceeds the configured byte limit",
+        RuntimeIssueCode.STACK_UNPARSEABLE:
+            "stack contains no recognized frame",
+        RuntimeIssueCode.INVALID_SOURCE_LOCATION:
+            "source location is invalid",
+        RuntimeIssueCode.TEXT_TRUNCATED:
+            "text was truncated to the configured limit",
+        RuntimeIssueCode.FRAME_LIMIT_REACHED: "frame limit was reached",
+        RuntimeIssueCode.EVENT_LIMIT_REACHED: "event limit was reached",
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED:
+            "additional issues were omitted",
+    }
+    assert dict(ISSUE_MESSAGES) == expected
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        RuntimeEvidenceIssue(RuntimeIssueCode.INVALID_UTF8, "wrong", A, None, 1)
+
+
+def test_issue_message_helper_matches_the_fixed_mapping():
+    for code in RuntimeIssueCode:
+        assert issue_message(code) == ISSUE_MESSAGES[code]
+        assert _issue(code=code, message=ISSUE_MESSAGES[code]).message == (
+            ISSUE_MESSAGES[code]
+        )
+    for bad in (None, "invalid_utf8", 1):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            issue_message(bad)
+
+
+def test_optional_output_values_accept_valid_boundaries():
+    frame = _frame(line=1, column=0)
+    assert frame.line == 1
+    assert frame.column == 0
+    assert _event(source_line=None).source_line is None
+    issue = _issue(event_sequence=0, source_line=None)
+    assert issue.event_sequence == 0
+    assert issue.source_line is None
+    assert _artifact_record(size_bytes=0).size_bytes == 0
+
+
+def test_output_text_fields_are_retained_verbatim():
+    assert _event(message="  hi\x01  ").message == "  hi\x01  "
+    assert _frame(function_text="  fn\x01  ").function_text == "  fn\x01  "
+    assert _artifact_record(source_names=("A.log",)).source_names == (
+        "A.log",
+    )
+
+
+def test_frame_shape_and_path_hash_pairing():
+    assert _verified_frame(association=FrameAssociation.FILE,
+                           candidate_node_ids=("f",), primary_node_id="f")
+    assert _frame(line=1, column=0)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(line=0)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(column=-1)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.FILE,
+                        candidate_node_ids=("",), primary_node_id="")
+    assert _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+                  path_match_basis=PathMatchBasis.UNMATCHED,
+                  association=FrameAssociation.UNASSOCIATED)
+    assert _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+                  path_match_basis=PathMatchBasis.AMBIGUOUS,
+                  association=FrameAssociation.UNASSOCIATED)
+    assert _frame(relative_path=None, source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.UNMATCHED,
+                  association=FrameAssociation.UNASSOCIATED)
+    assert _frame(relative_path=None, source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.AMBIGUOUS,
+                  association=FrameAssociation.UNASSOCIATED)
+    assert _frame(relative_path=None, source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.EXTERNAL_OR_NON_FILE,
+                  association=FrameAssociation.UNASSOCIATED)
+    assert _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+                  path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+                  association=FrameAssociation.NOT_EVALUATED)
+    assert _frame(relative_path=None, source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.UNMATCHED,
+                  association=FrameAssociation.NOT_EVALUATED)
+    assert _frame(relative_path=None, source_reference_sha256=None,
+                  path_match_basis=PathMatchBasis.EXTERNAL_OR_NON_FILE,
+                  association=FrameAssociation.NOT_EVALUATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.FILE, candidate_node_ids=(),
+                        primary_node_id=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(association=FrameAssociation.FILE,
+               candidate_node_ids=("f",), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(association=FrameAssociation.SYMBOL,
+               candidate_node_ids=("a", "f"), primary_node_id="a")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(association=FrameAssociation.AMBIGUOUS_SYMBOL,
+               candidate_node_ids=("a", "b", "f"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.FILE,
+               candidate_node_ids=("f",), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.EXACT_RELATIVE_PATH,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNIQUE_PATH_SUFFIX,
+               association=FrameAssociation.NOT_EVALUATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=None,
+               path_match_basis=PathMatchBasis.EXACT_RELATIVE_PATH,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path=None, source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNMATCHED,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path=None, source_reference_sha256=None,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.EXTERNAL_OR_NON_FILE,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.UNASSOCIATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNMATCHED,
+               association=FrameAssociation.NOT_EVALUATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.AMBIGUOUS,
+               association=FrameAssociation.NOT_EVALUATED)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path=None, source_reference_sha256=None,
+               path_match_basis=PathMatchBasis.AMBIGUOUS,
+               association=FrameAssociation.NOT_EVALUATED)
+
+
+def test_frame_candidate_order_and_primary_containment():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.SYMBOL,
+                        candidate_node_ids=("z", "a"), primary_node_id="z")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.SYMBOL,
+                        candidate_node_ids=("a", "z"), primary_node_id="x")
+    assert _verified_frame(association=FrameAssociation.SYMBOL,
+                           candidate_node_ids=("a", "z"), primary_node_id="z")
+
+
+def test_verified_association_candidate_shapes():
+    assert _verified_frame(association=FrameAssociation.AMBIGUOUS_SYMBOL,
+                           candidate_node_ids=("a", "b", "f"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.AMBIGUOUS_SYMBOL,
+                        candidate_node_ids=("a", "f"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.AMBIGUOUS_SYMBOL,
+                        candidate_node_ids=("a", "b", "f"),
+                        primary_node_id="a")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.FILE,
+                        candidate_node_ids=("a", "f"), primary_node_id="a")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.FILE,
+                        candidate_node_ids=("f",), primary_node_id=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.SYMBOL,
+                        candidate_node_ids=("f",), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.SYMBOL,
+                        candidate_node_ids=("a", "b", "f"), primary_node_id="a")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _verified_frame(association=FrameAssociation.SYMBOL,
+                        candidate_node_ids=("a", "z"), primary_node_id=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.NOT_EVALUATED,
+               candidate_node_ids=("f",), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.NOT_EVALUATED,
+               candidate_node_ids=("f",), primary_node_id=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+               association=FrameAssociation.NOT_EVALUATED,
+               candidate_node_ids=(), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNMATCHED,
+               association=FrameAssociation.UNASSOCIATED,
+               candidate_node_ids=("f",), primary_node_id="f")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNMATCHED,
+               association=FrameAssociation.UNASSOCIATED,
+               candidate_node_ids=("f",), primary_node_id=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(relative_path="pkg/a.py", source_reference_sha256=A,
+               path_match_basis=PathMatchBasis.UNMATCHED,
+               association=FrameAssociation.UNASSOCIATED,
+               candidate_node_ids=(), primary_node_id="f")
+
+
+def test_frame_association_path_basis_matrix():
+    verified_bases = (
+        PathMatchBasis.EXACT_RELATIVE_PATH,
+        PathMatchBasis.UNIQUE_PATH_SUFFIX,
+        PathMatchBasis.UNIQUE_BASENAME,
+    )
+    shapes = {
+        FrameAssociation.NOT_EVALUATED: ((), None),
+        FrameAssociation.UNASSOCIATED: ((), None),
+        FrameAssociation.FILE: (("f",), "f"),
+        FrameAssociation.SYMBOL: (("a", "z"), "z"),
+        FrameAssociation.AMBIGUOUS_SYMBOL: (("a", "b", "f"), None),
+    }
+    allowed = {
+        (FrameAssociation.NOT_EVALUATED,
+         PathMatchBasis.UNVERIFIED_RELATIVE_PATH, True),
+        (FrameAssociation.NOT_EVALUATED, PathMatchBasis.UNMATCHED, False),
+        (FrameAssociation.NOT_EVALUATED,
+         PathMatchBasis.EXTERNAL_OR_NON_FILE, False),
+        (FrameAssociation.UNASSOCIATED, PathMatchBasis.UNMATCHED, True),
+        (FrameAssociation.UNASSOCIATED, PathMatchBasis.UNMATCHED, False),
+        (FrameAssociation.UNASSOCIATED, PathMatchBasis.AMBIGUOUS, True),
+        (FrameAssociation.UNASSOCIATED, PathMatchBasis.AMBIGUOUS, False),
+        (FrameAssociation.UNASSOCIATED,
+         PathMatchBasis.EXTERNAL_OR_NON_FILE, False),
+    }
+    for association in (
+        FrameAssociation.FILE,
+        FrameAssociation.SYMBOL,
+        FrameAssociation.AMBIGUOUS_SYMBOL,
+    ):
+        for basis in verified_bases:
+            allowed.add((association, basis, True))
+    for association in FrameAssociation:
+        for basis in PathMatchBasis:
+            for has_path in (False, True):
+                candidates, primary = shapes[association]
+                values = dict(
+                    association=association,
+                    path_match_basis=basis,
+                    candidate_node_ids=candidates,
+                    primary_node_id=primary,
+                    relative_path="pkg/a.py" if has_path else None,
+                    source_reference_sha256=A if has_path else None,
+                )
+                if (association, basis, has_path) in allowed:
+                    assert _frame(**values)
+                else:
+                    with pytest.raises(RuntimeEvidenceInvariantError):
+                        _frame(**values)
+
+
+def test_event_forbids_duplicate_or_unsorted_tags_and_bad_frame_ordinals():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(tags=(RuntimeTag("b", "1"), RuntimeTag("a", "2")))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(tags=(RuntimeTag("a", "1"), RuntimeTag("a", "2")))
+    bad = _frame(ordinal=1, event_id=A)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(frames=(bad,))
+
+
+def test_event_frames_must_match_event_and_positions():
+    assert _event(frames=(_frame(event_id=A, ordinal=0),
+                          _frame(event_id=A, ordinal=1)))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(frames=(_frame(event_id="b" * 64, ordinal=0),))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(frames=(_frame(event_id=A, ordinal=1),))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(frames=(_frame(event_id=A, ordinal=0),
+                       _frame(event_id=A, ordinal=2)))
+
+
+def test_event_tags_require_sorted_unique_keys():
+    assert _event(tags=(RuntimeTag("a", "1"), RuntimeTag("b", "2")))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(tags=(RuntimeTag("b", "1"), RuntimeTag("a", "2")))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(tags=(RuntimeTag("a", "1"), RuntimeTag("a", "2")))
+
+
+def test_output_tuple_fields_require_exact_tuples():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(tags=list(_event().tags))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(frames=list(_event().frames))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=list(_artifact_record().source_names))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _frame(candidate_node_ids=list(_frame().candidate_node_ids))
+
+
+@pytest.mark.parametrize("duration", ["-1", "1.", ".1", "01", "1e3", " 1", "1 "])
+def test_event_duration_is_a_nonnegative_decimal_string(duration):
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(duration_ms_text=duration)
+
+
+@pytest.mark.parametrize("duration", ["0", "0.0", "1", "10.25", "999"])
+def test_event_duration_accepts_valid_decimal_strings(duration):
+    assert _event(duration_ms_text=duration).duration_ms_text == duration
+
+
+def test_artifact_record_source_name_order_and_language_rule():
+    record = _artifact_record(source_names=("A.log", "a.log"))
+    assert record.source_names == ("A.log", "a.log")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=("b.log", "a.log"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=("a.log", "A.log"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=("ci.log", "ci.log"))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=())
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(format=RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                         declared_language=None)
+    assert _artifact_record(source_names=("a" * 128,))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=("a" * 129,))
+    assert _artifact_record(source_names=("é" * 64,))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(source_names=("é" * 64 + "a",))
+    for bad in ("", " ci.log", "ci.log ", "a/b", r"a\b", "a:b",
+                "a\x00b", "a\x01b", "a\tb", "a\ud800b"):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _artifact_record(source_names=(bad,))
+
+
+def test_artifact_record_language_compatibility():
+    assert _artifact_record(format=RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            declared_language=RuntimeFrameLanguage.PYTHON)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(format=RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                         declared_language=RuntimeFrameLanguage.UNKNOWN)
+    assert _artifact_record(format=RuntimeArtifactFormat.JSON_EVENTS,
+                            declared_language=RuntimeFrameLanguage.UNKNOWN)
+
+
+@pytest.mark.parametrize("field,bad", [
+    (field, bad)
+    for field, values in {
+        "frame_id": _BAD_SHA256,
+        "event_id": _BAD_SHA256,
+        "ordinal": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "language": (None, "unknown", 1),
+        "function_text": _BAD_TEXT,
+        "relative_path": (None, 1, "/abs/a.py", r"pkg\a.py", "pkg/../a.py",
+                          "pkg//a.py", "pkg/", ".", "a/./b", "C:/x",
+                          "pkg/\x00a.py", "pkg/\ud800.py"),
+        "line": _BAD_POSITIVE_INT,
+        "column": _BAD_NONNEGATIVE_INT,
+        "source_reference_sha256": _BAD_SHA256,
+        "path_match_basis": (None, "unmatched", 1),
+        "association": (None, "unassociated", 1),
+        "primary_node_id": (None, 1, "", "x\x00", "x\ud800"),
+        "candidate_node_ids": (None, ["f"], _TupleSubclass(("f",)),
+                               ("f", 1), ("",), ("f", "f"), ("z", "a"),
+                               ("a\x00b",), ("a\ud800b",)),
+    }.items()
+    for bad in values
+])
+def test_frame_fields_are_validated_locally(field, bad):
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _file_frame(**{field: bad})
+
+
+@pytest.mark.parametrize("field,bad", [
+    (field, bad)
+    for field, values in {
+        "event_id": _BAD_SHA256,
+        "event_fingerprint": _BAD_SHA256,
+        "artifact_id": _BAD_SHA256,
+        "sequence": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "source_line": _BAD_POSITIVE_INT,
+        "kind": (None, "log", 1),
+        "duration_ms_text": ("-1", "1.", ".1", "01", "1e3", " 1", "1 ",
+                             1, "a\ud800", "a\x00b"),
+        "tags": (None, [], ["a"], ("a",),
+                 (RuntimeTag("a", "1"), object()),
+                 _TupleSubclass((RuntimeTag("a", "1"),))),
+        "frames": (None, [], ("a",), (object(),), _TupleSubclass(())),
+        "text_truncated": (None, 0, 1, "false"),
+        "frames_truncated": (None, 0, 1, "false"),
+    }.items()
+    for bad in values
+] + [
+    (field, bad)
+    for field in (
+        "timestamp_text", "level", "message", "logger", "operation",
+        "trace_id", "span_id", "parent_span_id", "status", "error_type",
+        "error_message",
+    )
+    for bad in _BAD_TEXT
+])
+def test_event_fields_are_validated_locally(field, bad):
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _event(**{field: bad})
+
+
+@pytest.mark.parametrize("field,bad", [
+    (field, bad)
+    for field, values in {
+        "code": (None, "invalid_utf8", 1),
+        "message": (None, 1, "wrong", "line is not valid UTF-8\x00"),
+        "artifact_id": _BAD_SHA256,
+        "event_sequence": _BAD_NONNEGATIVE_INT,
+        "source_line": _BAD_POSITIVE_INT,
+    }.items()
+    for bad in values
+])
+def test_issue_fields_are_validated_locally(field, bad):
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _issue(**{field: bad})
+
+
+@pytest.mark.parametrize("field,bad", [
+    (field, bad)
+    for field, values in {
+        "artifact_id": _BAD_SHA256,
+        "source_names": (None, [], _TupleSubclass(()), (),
+                         ("ci.log", "ci.log"), ("b.log", "a.log"),
+                         (1,), ("",), ("a/b",), ("a\x00b",), ("a\ud800b",)),
+        "format": (None, "text_log", 1),
+        "declared_language": ("python", 1, object()),
+        "content_sha256": _BAD_SHA256,
+        "size_bytes": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "status": (None, "complete", 1),
+        "event_count": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "frame_count": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "duplicate_count": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "issue_count": _BAD_REQUIRED_NONNEGATIVE_INT,
+        "text_truncated": (None, 0, 1, "false"),
+        "frames_truncated": (None, 0, 1, "false"),
+    }.items()
+    for bad in values
+])
+def test_artifact_record_fields_are_validated_locally(field, bad):
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _artifact_record(**{field: bad})
+
+
+def test_output_models_do_not_apply_config_dependent_maxima():
+    long_text = "x" * 20_000
+    assert _event(message=long_text).message == long_text
+    assert _frame(function_text=long_text).function_text == long_text
+    assert _event(tags=(RuntimeTag("k", "v" * 600),)).tags[0].value == "v" * 600
+
+
+def test_invariant_messages_never_echo_rejected_values():
+    secret = "SECRET_VALUE"
+    cases = (
+        lambda: _frame(function_text=secret + "\ud800"),
+        lambda: _event(message=secret + "\x00"),
+        lambda: _artifact_record(source_names=(secret + "/x",)),
+        lambda: _issue(message=secret),
+        lambda: _frame(frame_id=secret.upper() * 5),
+    )
+    for build in cases:
+        with pytest.raises(RuntimeEvidenceInvariantError) as excinfo:
+            build()
+        assert secret not in str(excinfo.value)
