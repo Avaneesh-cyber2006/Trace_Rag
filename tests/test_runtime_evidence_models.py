@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, fields
+from types import MappingProxyType
 
 import pytest
 
@@ -9,13 +10,16 @@ from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceInvariantError, RuntimeEvidenceLimitError,
     RuntimeEvidenceValidationError,
 )
+from backend.runtime_evidence.indexes import (
+    InventoryIndexes, build_inventory_indexes, validate_inventory,
+)
 from backend.runtime_evidence.models import (
     CaptureCompleteness, FrameAssociation, GraphBinding, ISSUE_MESSAGES,
     PathMatchBasis, RuntimeArtifact, RuntimeArtifactFormat,
     RuntimeArtifactRecord, RuntimeArtifactStatus, RuntimeEvent,
-    RuntimeEventKind, RuntimeEvidenceIssue, RuntimeEvidenceRequest,
-    RuntimeFrameLanguage, RuntimeIncompleteReason, RuntimeIssueCode,
-    RuntimeStackFrame, RuntimeTag, issue_message,
+    RuntimeEventKind, RuntimeEvidenceInventory, RuntimeEvidenceIssue,
+    RuntimeEvidenceRequest, RuntimeFrameLanguage, RuntimeIncompleteReason,
+    RuntimeIssueCode, RuntimeStackFrame, RuntimeTag, issue_message,
 )
 
 
@@ -875,3 +879,1229 @@ def test_invariant_messages_never_echo_rejected_values():
         with pytest.raises(RuntimeEvidenceInvariantError) as excinfo:
             build()
         assert secret not in str(excinfo.value)
+
+
+_INVENTORY_INDEX_FIELDS = (
+    "events_by_artifact",
+    "events_by_trace_id",
+    "events_by_fingerprint",
+    "frames_by_file",
+    "frames_by_node",
+)
+
+
+def _default_inventory_parts():
+    frame = _file_frame(event_id=A, ordinal=0)
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        trace_id="trace-1",
+        frames=(frame,),
+    )
+    artifact = _artifact_record(event_count=1, frame_count=1)
+    return artifact, event, frame
+
+
+def _empty_indexes():
+    return InventoryIndexes(
+        events_by_artifact=MappingProxyType({}),
+        events_by_trace_id=MappingProxyType({}),
+        events_by_fingerprint=MappingProxyType({}),
+        frames_by_file=MappingProxyType({}),
+        frames_by_node=MappingProxyType({}),
+    )
+
+
+def _indexes_or_empty(artifacts, events, frames):
+    if (
+        type(artifacts) is tuple
+        and type(events) is tuple
+        and type(frames) is tuple
+        and all(type(item) is RuntimeArtifactRecord for item in artifacts)
+        and all(type(item) is RuntimeEvent for item in events)
+        and all(type(item) is RuntimeStackFrame for item in frames)
+    ):
+        return build_inventory_indexes(artifacts, events, frames)
+    return _empty_indexes()
+
+
+def _inventory(**kw):
+    default_artifact, default_event, default_frame = _default_inventory_parts()
+    artifacts = kw.get("artifacts", (default_artifact,))
+    events = kw.get("events", (default_event,))
+    frames = kw.get("frames", (default_frame,))
+    indexes = _indexes_or_empty(artifacts, events, frames)
+    values = dict(
+        repository_namespace="repo",
+        declared_revision=None,
+        declared_captured_at=None,
+        declared_capture_completeness=CaptureCompleteness.UNKNOWN,
+        graph_binding=GraphBinding.NOT_PROVIDED,
+        event_text_retained=True,
+        artifacts=artifacts,
+        events=events,
+        frames=frames,
+        issues=(),
+        submitted_artifacts=1,
+        duplicate_artifacts=0,
+        total_input_bytes=6,
+        total_events=1,
+        total_frames=1,
+        text_truncated=False,
+        events_truncated=False,
+        frames_truncated=False,
+        issues_truncated=False,
+        ingestion_complete=True,
+        incomplete_reasons=(),
+    )
+    for name in _INVENTORY_INDEX_FIELDS:
+        values[name] = getattr(indexes, name)
+    values.update(kw)
+    if "submitted_artifacts" not in kw:
+        values["submitted_artifacts"] = (
+            len(artifacts) + values["duplicate_artifacts"]
+        )
+    if "total_input_bytes" not in kw:
+        values["total_input_bytes"] = sum(
+            artifact.size_bytes for artifact in artifacts
+        )
+    if "total_events" not in kw:
+        values["total_events"] = len(events)
+    if "total_frames" not in kw:
+        values["total_frames"] = len(frames)
+    return RuntimeEvidenceInventory(**values)
+
+
+def _inventory_with_forged_frame(**overrides):
+    base = _inventory()
+    valid_frame = base.frames[0]
+    forged = object.__new__(RuntimeStackFrame)
+    for field in fields(RuntimeStackFrame):
+        object.__setattr__(
+            forged, field.name, getattr(valid_frame, field.name)
+        )
+    for name, value in overrides.items():
+        object.__setattr__(forged, name, value)
+    forged_event = object.__new__(RuntimeEvent)
+    for field in fields(RuntimeEvent):
+        object.__setattr__(
+            forged_event,
+            field.name,
+            getattr(base.events[0], field.name),
+        )
+    object.__setattr__(forged_event, "frames", (forged,))
+    indexes = build_inventory_indexes(
+        base.artifacts, (forged_event,), (forged,)
+    )
+    inventory = object.__new__(RuntimeEvidenceInventory)
+    for field in fields(RuntimeEvidenceInventory):
+        value = getattr(base, field.name)
+        if field.name == "events":
+            value = (forged_event,)
+        elif field.name == "frames":
+            value = (forged,)
+        elif field.name in _INVENTORY_INDEX_FIELDS:
+            value = getattr(indexes, field.name)
+        object.__setattr__(inventory, field.name, value)
+    return inventory
+
+
+def _inventory_with_bypassed_frame(
+    association,
+    candidates,
+    primary,
+    *,
+    basis=PathMatchBasis.EXACT_RELATIVE_PATH,
+):
+    return _inventory_with_forged_frame(
+        event_id=A,
+        relative_path="pkg/a.py",
+        source_reference_sha256=A,
+        path_match_basis=basis,
+        line=1,
+        association=association,
+        candidate_node_ids=candidates,
+        primary_node_id=primary,
+    )
+
+
+def _forged_event(**overrides):
+    base = _inventory()
+    forged = object.__new__(RuntimeEvent)
+    for field in fields(RuntimeEvent):
+        object.__setattr__(
+            forged, field.name, getattr(base.events[0], field.name)
+        )
+    for name, value in overrides.items():
+        object.__setattr__(forged, name, value)
+    return forged
+
+
+def test_inventory_field_order_schema_and_frozen_slotted():
+    inventory = _inventory()
+    inventory_type = type(inventory)
+    assert inventory_type.SCHEMA_VERSION == "tracerag-runtime-evidence-v1"
+    assert [field.name for field in fields(inventory_type)] == [
+        "repository_namespace", "declared_revision", "declared_captured_at",
+        "declared_capture_completeness", "graph_binding", "event_text_retained",
+        "artifacts", "events", "frames", "issues", "submitted_artifacts",
+        "duplicate_artifacts", "total_input_bytes", "total_events",
+        "total_frames", "text_truncated", "events_truncated",
+        "frames_truncated", "issues_truncated", "ingestion_complete",
+        "incomplete_reasons", "events_by_artifact", "events_by_trace_id",
+        "events_by_fingerprint", "frames_by_file", "frames_by_node"]
+    assert not hasattr(inventory, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        inventory.repository_namespace = "x"
+
+
+def test_inventory_index_fields_are_exact_and_immutable():
+    assert [field.name for field in fields(InventoryIndexes)] == list(
+        _INVENTORY_INDEX_FIELDS
+    )
+    artifact, event, frame = _default_inventory_parts()
+    indexes = build_inventory_indexes((artifact,), (event,), (frame,))
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(indexes, name)
+        assert isinstance(mapping, MappingProxyType)
+        with pytest.raises(TypeError):
+            mapping["x"] = ()
+    with pytest.raises(FrozenInstanceError):
+        indexes.events_by_artifact = MappingProxyType({})
+
+
+def test_inventory_indexes_are_exact_filters_and_read_only():
+    inv = _inventory()
+    assert isinstance(inv.events_by_artifact, MappingProxyType)
+    assert inv.events_by_artifact == {
+        _artifact_record().artifact_id: (inv.events[0],)
+    }
+    assert inv.events_by_trace_id == {"trace-1": (inv.events[0],)}
+    assert inv.events_by_fingerprint == {"c" * 64: (inv.events[0],)}
+    assert inv.frames_by_file == {"pkg/a.py": (inv.frames[0],)}
+    assert inv.frames_by_node == {"f": (inv.frames[0],)}
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(inv, name)
+        assert isinstance(mapping, MappingProxyType)
+        assert list(mapping) == sorted(mapping)
+        for value in mapping.values():
+            assert type(value) is tuple
+        with pytest.raises(TypeError):
+            mapping["x"] = ()
+    assert validate_inventory(inv) is None
+
+
+def test_inventory_copies_caller_supplied_index_dicts():
+    artifact, event, frame = _default_inventory_parts()
+    expected = build_inventory_indexes((artifact,), (event,), (frame,))
+    caller_mappings = {
+        name: dict(getattr(expected, name))
+        for name in _INVENTORY_INDEX_FIELDS
+    }
+    inv = _inventory(
+        artifacts=(artifact,),
+        events=(event,),
+        frames=(frame,),
+        **caller_mappings,
+    )
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(inv, name)
+        assert isinstance(mapping, MappingProxyType)
+        assert dict(mapping) == dict(getattr(expected, name))
+        assert mapping is not caller_mappings[name]
+    for mapping in caller_mappings.values():
+        mapping.clear()
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(inv, name)
+        assert isinstance(mapping, MappingProxyType)
+        assert dict(mapping) == dict(getattr(expected, name))
+        assert mapping is not caller_mappings[name]
+        assert caller_mappings[name] == {}
+
+
+def test_inventory_indexes_preserve_repeats_and_empty_artifact_keys():
+    first_artifact = _artifact_record(
+        event_count=2, frame_count=1, source_names=("a.log",)
+    )
+    second_artifact = _artifact_record(
+        artifact_id="b" * 64,
+        source_names=("b.log",),
+        event_count=0,
+        frame_count=0,
+    )
+    frame = _file_frame(event_id=A, ordinal=0)
+    first_event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="1" * 64,
+        trace_id="t",
+        frames=(frame,),
+    )
+    second_event = _event(
+        event_id="2" * 64,
+        artifact_id=A,
+        sequence=1,
+        event_fingerprint="1" * 64,
+        trace_id="t",
+        frames=(),
+    )
+    inv = _inventory(
+        artifacts=(first_artifact, second_artifact),
+        events=(first_event, second_event),
+        frames=(frame,),
+        total_input_bytes=12,
+    )
+    assert inv.events_by_artifact == {
+        A: (first_event, second_event),
+        "b" * 64: (),
+    }
+    assert inv.events_by_trace_id == {"t": (first_event, second_event)}
+    assert inv.events_by_fingerprint == {
+        "1" * 64: (first_event, second_event)
+    }
+    assert inv.frames_by_file == {"pkg/a.py": (frame,)}
+    assert inv.frames_by_node == {"f": (frame,)}
+
+
+def test_inventory_frames_by_file_and_node_filters():
+    verified_suffix = _verified_frame(
+        event_id=A,
+        ordinal=0,
+        relative_path="pkg/a.py",
+        path_match_basis=PathMatchBasis.UNIQUE_PATH_SUFFIX,
+        association=FrameAssociation.FILE,
+        candidate_node_ids=("f",),
+        primary_node_id="f",
+    )
+    unverified = _frame(
+        frame_id="2" * 64,
+        event_id=A,
+        ordinal=1,
+        relative_path="pkg/b.py",
+        source_reference_sha256=A,
+        path_match_basis=PathMatchBasis.UNVERIFIED_RELATIVE_PATH,
+        association=FrameAssociation.NOT_EVALUATED,
+    )
+    ambiguous = _frame(
+        frame_id="3" * 64,
+        event_id=A,
+        ordinal=2,
+        relative_path="pkg/c.py",
+        source_reference_sha256=A,
+        path_match_basis=PathMatchBasis.AMBIGUOUS,
+        association=FrameAssociation.UNASSOCIATED,
+    )
+    unmatched = _frame(
+        frame_id="4" * 64,
+        event_id=A,
+        ordinal=3,
+        relative_path="pkg/d.py",
+        source_reference_sha256=A,
+        path_match_basis=PathMatchBasis.UNMATCHED,
+        association=FrameAssociation.UNASSOCIATED,
+    )
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(verified_suffix, unverified, ambiguous, unmatched),
+    )
+    inv = _inventory(
+        artifacts=(_artifact_record(event_count=1, frame_count=4),),
+        events=(event,),
+        frames=(verified_suffix, unverified, ambiguous, unmatched),
+    )
+    assert list(inv.frames_by_file) == [
+        "pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py"
+    ]
+    assert inv.frames_by_file == {
+        "pkg/a.py": (verified_suffix,),
+        "pkg/b.py": (unverified,),
+        "pkg/c.py": (ambiguous,),
+        "pkg/d.py": (unmatched,),
+    }
+    assert inv.frames_by_node == {"f": (verified_suffix,)}
+
+
+def test_inventory_symbol_frame_is_indexed_only_by_primary_node():
+    symbol = _verified_frame(
+        event_id=A,
+        ordinal=0,
+        association=FrameAssociation.SYMBOL,
+        candidate_node_ids=("a", "z"),
+        primary_node_id="z",
+    )
+    ambiguous = _verified_frame(
+        frame_id="2" * 64,
+        event_id=A,
+        ordinal=1,
+        association=FrameAssociation.AMBIGUOUS_SYMBOL,
+        candidate_node_ids=("a", "b", "z"),
+        primary_node_id=None,
+    )
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(symbol, ambiguous),
+    )
+    inv = _inventory(
+        artifacts=(_artifact_record(event_count=1, frame_count=2),),
+        events=(event,),
+        frames=(symbol, ambiguous),
+    )
+    assert inv.frames_by_file == {
+        "pkg/a.py": (symbol, ambiguous)
+    }
+    assert inv.frames_by_node == {"z": (symbol,)}
+    assert "a" not in inv.frames_by_node
+
+
+def test_inventory_counter_formulas_and_derived_completeness():
+    inv = _inventory()
+    assert inv.submitted_artifacts == (
+        len(inv.artifacts) + inv.duplicate_artifacts
+    )
+    assert inv.total_input_bytes == sum(
+        artifact.size_bytes for artifact in inv.artifacts
+    )
+    assert inv.total_events == len(inv.events) == sum(
+        artifact.event_count for artifact in inv.artifacts
+    )
+    assert inv.total_frames == len(inv.frames) == sum(
+        artifact.frame_count for artifact in inv.artifacts
+    ) == sum(len(event.frames) for event in inv.events)
+    assert sum(artifact.issue_count for artifact in inv.artifacts) == len(
+        inv.issues
+    )
+    assert inv.ingestion_complete == (inv.incomplete_reasons == ())
+
+
+def test_inventory_rejects_wrong_count_and_index_snapshot():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(total_events=2)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_artifact={})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("submitted_artifacts", 2),
+        ("duplicate_artifacts", 1),
+        ("total_input_bytes", 7),
+        ("total_events", 2),
+        ("total_frames", 2),
+    ],
+)
+def test_inventory_rejects_each_wrong_counter(field, value):
+    extra = {}
+    if field == "duplicate_artifacts":
+        extra["submitted_artifacts"] = 1
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(**{field: value, **extra})
+
+
+def test_inventory_authoritative_tuples_are_exact_tuples():
+    inventory = _inventory()
+    for field in ("artifacts", "events", "frames", "issues",
+                  "incomplete_reasons"):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(**{field: list(getattr(inventory, field))})
+
+
+def test_inventory_authoritative_tuples_require_exact_element_types():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(object(),),
+            events=(),
+            frames=(),
+            submitted_artifacts=1,
+            total_input_bytes=0,
+            total_events=0,
+            total_frames=0,
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events=(object(),), total_events=1)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(frames=(object(),), total_frames=1)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(issues=(object(),))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(incomplete_reasons=(object(),))
+
+
+def test_inventory_rejects_surrogate_index_key_or_value():
+    event = _event()
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={"\ud800": (event,)})
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={"trace\x00id": (event,)})
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events=(_forged_event(message="secret\ud800"),),
+                   total_events=1)
+
+
+def test_inventory_requires_derived_incomplete_reasons_and_flags():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            incomplete_reasons=(RuntimeIncompleteReason.TEXT_TRUNCATED,)
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(text_truncated=True, incomplete_reasons=())
+
+
+def test_inventory_rejects_invalid_top_level_scalars_enums_bools_and_counts():
+    for bad in ("", "\ud800"):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(repository_namespace=bad)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(repository_namespace=None)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(declared_revision="rev\x00")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(declared_revision=1)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(declared_captured_at="\ud800")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(declared_captured_at=object())
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(declared_capture_completeness="unknown")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(graph_binding="not_provided")
+    for field in ("event_text_retained", "text_truncated", "events_truncated",
+                  "frames_truncated", "issues_truncated", "ingestion_complete"):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(**{field: 1})
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(**{field: "false"})
+    for field in ("submitted_artifacts", "duplicate_artifacts",
+                  "total_input_bytes", "total_events", "total_frames"):
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(**{field: True})
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            _inventory(**{field: -1})
+
+
+def test_inventory_rejects_unsorted_duplicate_or_wrong_reasons():
+    partial = _artifact_record(
+        event_count=1, frame_count=1,
+        status=RuntimeArtifactStatus.PARTIAL,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(artifacts=(partial,))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(partial,),
+            events_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(
+                RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+                RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+            ),
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(partial,),
+            events_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(
+                RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+                RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+                RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+            ),
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(partial,),
+            ingestion_complete=False,
+            incomplete_reasons=("artifact_partial",),
+        )
+
+
+def test_inventory_accepts_sorted_derived_incomplete_reasons():
+    partial = _artifact_record(
+        event_count=1,
+        frame_count=1,
+        status=RuntimeArtifactStatus.PARTIAL,
+        text_truncated=True,
+        frames_truncated=True,
+        issue_count=1,
+    )
+    frame = _file_frame(event_id=A, ordinal=0)
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(frame,),
+        text_truncated=True,
+        frames_truncated=True,
+    )
+    sentinel = _issue(
+        code=RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+        message=ISSUE_MESSAGES[RuntimeIssueCode.ISSUE_LIMIT_REACHED],
+        artifact_id=A,
+        event_sequence=None,
+        source_line=None,
+    )
+    reasons = (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+        RuntimeIncompleteReason.FRAME_LIMIT_REACHED,
+        RuntimeIncompleteReason.ISSUE_LIMIT_REACHED,
+        RuntimeIncompleteReason.TEXT_TRUNCATED,
+    )
+    inv = _inventory(
+        artifacts=(partial,),
+        events=(event,),
+        frames=(frame,),
+        issues=(sentinel,),
+        text_truncated=True,
+        events_truncated=True,
+        frames_truncated=True,
+        issues_truncated=True,
+        ingestion_complete=False,
+        incomplete_reasons=reasons,
+    )
+    assert inv.incomplete_reasons == reasons
+    assert inv.ingestion_complete is False
+
+
+def test_inventory_requires_ingestion_complete_to_match_reasons():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(ingestion_complete=False)
+    partial = _artifact_record(
+        event_count=1, frame_count=1,
+        status=RuntimeArtifactStatus.PARTIAL,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(partial,),
+            ingestion_complete=True,
+            incomplete_reasons=(RuntimeIncompleteReason.ARTIFACT_PARTIAL,),
+        )
+
+
+def test_inventory_truncation_flags_must_match_event_and_artifact_flags():
+    frame = _file_frame(event_id=A, ordinal=0)
+    truncated_event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(frame,),
+        text_truncated=True,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(event_count=1, frame_count=1),),
+            events=(truncated_event,),
+            frames=(frame,),
+            text_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(RuntimeIncompleteReason.TEXT_TRUNCATED,),
+        )
+    truncated_artifact = _artifact_record(
+        event_count=1,
+        frame_count=1,
+        text_truncated=True,
+        status=RuntimeArtifactStatus.COMPLETE,
+    )
+    with pytest.raises(
+        RuntimeEvidenceInvariantError,
+        match="artifact text_truncated must match its events",
+    ):
+        _inventory(
+            artifacts=(truncated_artifact,),
+            events=(_event(
+                event_id=A,
+                artifact_id=A,
+                sequence=0,
+                event_fingerprint="c" * 64,
+                frames=(frame,),
+                text_truncated=False,
+                frames_truncated=False,
+            ),),
+            frames=(frame,),
+            text_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(RuntimeIncompleteReason.TEXT_TRUNCATED,),
+        )
+    frames_truncated_artifact = _artifact_record(
+        event_count=1,
+        frame_count=1,
+        frames_truncated=True,
+        status=RuntimeArtifactStatus.COMPLETE,
+    )
+    with pytest.raises(
+        RuntimeEvidenceInvariantError,
+        match="artifact frames_truncated must match its events",
+    ):
+        _inventory(
+            artifacts=(frames_truncated_artifact,),
+            events=(_event(
+                event_id=A,
+                artifact_id=A,
+                sequence=0,
+                event_fingerprint="c" * 64,
+                frames=(frame,),
+                text_truncated=False,
+                frames_truncated=False,
+            ),),
+            frames=(frame,),
+            frames_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(
+                RuntimeIncompleteReason.FRAME_LIMIT_REACHED,
+            ),
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            text_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(RuntimeIncompleteReason.TEXT_TRUNCATED,),
+        )
+    frame_truncated_event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(frame,),
+        frames_truncated=True,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(event_count=1, frame_count=1),),
+            events=(frame_truncated_event,),
+            frames=(frame,),
+            frames_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(RuntimeIncompleteReason.FRAME_LIMIT_REACHED,),
+        )
+
+
+def test_inventory_rejects_bad_artifact_order_and_conflicts():
+    first = _artifact_record(
+        artifact_id="a" * 64,
+        source_names=("b.log",),
+        event_count=0,
+        frame_count=0,
+    )
+    second = _artifact_record(
+        artifact_id="b" * 64,
+        source_names=("a.log",),
+        event_count=0,
+        frame_count=0,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(first, second),
+            events=(),
+            frames=(),
+            total_events=0,
+            total_frames=0,
+            total_input_bytes=12,
+        )
+    duplicate_id = _artifact_record(
+        artifact_id="a" * 64,
+        source_names=("c.log",),
+        event_count=0,
+        frame_count=0,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(first, duplicate_id),
+            events=(),
+            frames=(),
+            total_events=0,
+            total_frames=0,
+            total_input_bytes=12,
+        )
+    conflicting = _artifact_record(
+        artifact_id="b" * 64,
+        source_names=("b.log",),
+        event_count=0,
+        frame_count=0,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(first, conflicting),
+            events=(),
+            frames=(),
+            total_events=0,
+            total_frames=0,
+            total_input_bytes=12,
+        )
+
+
+def test_inventory_rejects_event_order_gaps_and_duplicate_ids():
+    artifact = _artifact_record(event_count=2, frame_count=0)
+    first = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=1,
+        event_fingerprint="c" * 64,
+        frames=(),
+    )
+    second = _event(
+        event_id="2" * 64,
+        artifact_id=A,
+        sequence=2,
+        event_fingerprint="c" * 64,
+        frames=(),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(first, second),
+            frames=(),
+            total_events=2,
+            total_frames=0,
+        )
+    duplicate_id = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=1,
+        event_fingerprint="c" * 64,
+        frames=(),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(_event(
+                event_id=A,
+                artifact_id=A,
+                sequence=0,
+                event_fingerprint="c" * 64,
+                frames=(),
+            ), duplicate_id),
+            frames=(),
+            total_events=2,
+            total_frames=0,
+        )
+
+
+def test_inventory_rejects_unknown_event_artifact_and_per_artifact_counts():
+    artifact = _artifact_record(event_count=0, frame_count=0)
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(_event(
+                event_id=A,
+                artifact_id="b" * 64,
+                sequence=0,
+                event_fingerprint="c" * 64,
+                frames=(),
+            ),),
+            frames=(),
+            total_events=1,
+            total_frames=0,
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(artifacts=(_artifact_record(event_count=2),))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(artifacts=(_artifact_record(frame_count=2),))
+
+
+def test_inventory_rejects_frame_flattening_and_mismatches():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(_inventory_with_forged_frame(ordinal=1))
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(_inventory_with_forged_frame(event_id="b" * 64))
+    frame = _file_frame(event_id=A, ordinal=0)
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(frame,),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(event_count=1, frame_count=1),),
+            events=(event,),
+            frames=(),
+            total_frames=0,
+        )
+
+
+def test_inventory_rejects_duplicate_frame_ids():
+    artifact = _artifact_record(event_count=1, frame_count=2)
+    first = _file_frame(event_id=A, ordinal=0)
+    second = _file_frame(event_id=A, ordinal=1)
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(first, second),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(event,),
+            frames=(first, second),
+            total_frames=2,
+        )
+
+
+def test_inventory_rejects_issue_order_duplicates_and_artifact_counts():
+    artifact = _artifact_record(
+        event_count=0, frame_count=0, issue_count=2
+    )
+    absent = _issue(
+        code=RuntimeIssueCode.INVALID_UTF8,
+        message=ISSUE_MESSAGES[RuntimeIssueCode.INVALID_UTF8],
+        artifact_id=A,
+        event_sequence=None,
+        source_line=1,
+    )
+    present = _issue(
+        code=RuntimeIssueCode.NUL_BYTE,
+        message=ISSUE_MESSAGES[RuntimeIssueCode.NUL_BYTE],
+        artifact_id=A,
+        event_sequence=0,
+        source_line=1,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(),
+            frames=(),
+            issues=(absent, present),
+            total_events=0,
+            total_frames=0,
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(),
+            frames=(),
+            issues=(present, present),
+            total_events=0,
+            total_frames=0,
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(
+                event_count=0, frame_count=0, issue_count=2
+            ),),
+            events=(),
+            frames=(),
+            issues=(present,),
+            total_events=0,
+            total_frames=0,
+        )
+
+
+def test_inventory_accepts_canonical_issue_order():
+    first_artifact = _artifact_record(
+        source_names=("a.log",),
+        event_count=0,
+        frame_count=0,
+        issue_count=2,
+    )
+    second_artifact = _artifact_record(
+        artifact_id="b" * 64,
+        source_names=("b.log",),
+        event_count=0,
+        frame_count=0,
+        issue_count=1,
+    )
+    issues = (
+        _issue(
+            code=RuntimeIssueCode.INVALID_UTF8,
+            message=ISSUE_MESSAGES[RuntimeIssueCode.INVALID_UTF8],
+            artifact_id=A,
+            event_sequence=0,
+            source_line=1,
+        ),
+        _issue(
+            code=RuntimeIssueCode.NUL_BYTE,
+            message=ISSUE_MESSAGES[RuntimeIssueCode.NUL_BYTE],
+            artifact_id=A,
+            event_sequence=None,
+            source_line=2,
+        ),
+        _issue(
+            code=RuntimeIssueCode.INVALID_UTF8,
+            message=ISSUE_MESSAGES[RuntimeIssueCode.INVALID_UTF8],
+            artifact_id="b" * 64,
+            event_sequence=None,
+            source_line=None,
+        ),
+    )
+    inv = _inventory(
+        artifacts=(first_artifact, second_artifact),
+        events=(),
+        frames=(),
+        issues=issues,
+        total_events=0,
+        total_frames=0,
+        total_input_bytes=12,
+    )
+    assert inv.issues == issues
+
+
+def test_inventory_requires_exactly_one_sentinel_when_truncated():
+    sentinel = _issue(
+        code=RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+        message=ISSUE_MESSAGES[RuntimeIssueCode.ISSUE_LIMIT_REACHED],
+        artifact_id=A,
+        event_sequence=None,
+        source_line=None,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            issues_truncated=True,
+            ingestion_complete=False,
+            incomplete_reasons=(
+                RuntimeIncompleteReason.ISSUE_LIMIT_REACHED,
+            ),
+        )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(
+                event_count=1, frame_count=1, issue_count=1
+            ),),
+            issues=(sentinel,),
+        )
+
+
+def test_inventory_rejects_invalid_index_snapshots():
+    event = _event()
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_artifact=())
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={1: (event,)})
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={"trace-1": (event,)},
+                   events_by_artifact={A: [event]})
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={"extraneous": (event,)})
+    extra_event = _event(
+        event_id="9" * 64,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        trace_id="other",
+        frames=(),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={
+            "other": (extra_event,),
+            "trace-1": (event,),
+        })
+
+
+def test_inventory_rejects_non_tuple_index_values_and_reordering():
+    event = _event()
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={"trace-1": [event]})
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(events_by_trace_id={
+            "trace-1": _TupleSubclass((event,))
+        })
+    artifact = _artifact_record(event_count=2, frame_count=0)
+    first = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        trace_id="t",
+        frames=(),
+    )
+    second = _event(
+        event_id="2" * 64,
+        artifact_id=A,
+        sequence=1,
+        event_fingerprint="c" * 64,
+        trace_id="t",
+        frames=(),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(artifact,),
+            events=(first, second),
+            frames=(),
+            total_events=2,
+            total_frames=0,
+            events_by_trace_id={"t": (second, first)},
+        )
+
+
+def test_inventory_rejects_unsorted_index_keys():
+    first = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        trace_id="b",
+        frames=(),
+    )
+    second = _event(
+        event_id="2" * 64,
+        artifact_id=A,
+        sequence=1,
+        event_fingerprint="c" * 64,
+        trace_id="a",
+        frames=(),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(event_count=2, frame_count=0),),
+            events=(first, second),
+            frames=(),
+            total_events=2,
+            total_frames=0,
+            events_by_trace_id={
+                "b": (first,),
+                "a": (second,),
+            },
+        )
+
+
+def test_inventory_frames_by_node_must_not_use_symbol_file_candidate():
+    symbol = _verified_frame(
+        event_id=A,
+        ordinal=0,
+        association=FrameAssociation.SYMBOL,
+        candidate_node_ids=("a", "z"),
+        primary_node_id="z",
+    )
+    event = _event(
+        event_id=A,
+        artifact_id=A,
+        sequence=0,
+        event_fingerprint="c" * 64,
+        frames=(symbol,),
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        _inventory(
+            artifacts=(_artifact_record(event_count=1, frame_count=1),),
+            events=(event,),
+            frames=(symbol,),
+            frames_by_node={"a": (symbol,)},
+        )
+
+
+def test_inventory_rejects_duplicate_candidates():
+    inventory = _inventory_with_forged_frame(
+        association=FrameAssociation.AMBIGUOUS_SYMBOL,
+        candidate_node_ids=("a", "a", "b"),
+        primary_node_id=None,
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(inventory)
+
+
+def test_validate_inventory_rejects_bypassed_frame_shapes():
+    for association, candidates, primary in (
+        (FrameAssociation.AMBIGUOUS_SYMBOL, ("a", "f"), None),
+        (FrameAssociation.FILE, ("a", "f"), "a"),
+        (FrameAssociation.SYMBOL, ("a", "z"), "x"),
+    ):
+        inventory = _inventory_with_bypassed_frame(
+            association, candidates, primary
+        )
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            validate_inventory(inventory)
+    for association, basis in (
+        (FrameAssociation.UNASSOCIATED,
+         PathMatchBasis.UNVERIFIED_RELATIVE_PATH),
+        (FrameAssociation.NOT_EVALUATED, PathMatchBasis.UNMATCHED),
+    ):
+        inventory = _inventory_with_bypassed_frame(
+            association, (), None, basis=basis
+        )
+        with pytest.raises(RuntimeEvidenceInvariantError):
+            validate_inventory(inventory)
+
+
+def test_inventory_is_immutable_after_attempted_mutation():
+    inv = _inventory()
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(inv, name)
+        with pytest.raises(TypeError):
+            mapping["x"] = ()
+    with pytest.raises(FrozenInstanceError):
+        inv.frames = ()
+    with pytest.raises(TypeError):
+        inv.frames[0].candidate_node_ids[0] = "x"
+    with pytest.raises(FrozenInstanceError):
+        inv.events[0].message = "x"
+    with pytest.raises(FrozenInstanceError):
+        inv.frames[0].function_text = "x"
+    with pytest.raises(FrozenInstanceError):
+        inv.issues = ()
+
+
+def test_inventory_retains_no_graph_reference_or_content():
+    inventory = _inventory()
+    field_names = {field.name for field in fields(RuntimeEvidenceInventory)}
+    for forbidden in ("graph", "code_graph", "graph_inventory",
+                      "graph_nodes", "nodes"):
+        assert forbidden not in field_names
+    assert not hasattr(inventory, "graph")
+    assert inventory.graph_binding is GraphBinding.NOT_PROVIDED
+
+
+def test_validate_inventory_requires_an_inventory_instance():
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(object())
+
+
+def test_validate_inventory_rejects_incomplete_bypassed_inventory():
+    inventory = object.__new__(RuntimeEvidenceInventory)
+    with pytest.raises(RuntimeEvidenceInvariantError) as excinfo:
+        validate_inventory(inventory)
+    assert str(excinfo.value) == (
+        "RuntimeEvidenceInventory is missing required fields"
+    )
+    object.__setattr__(inventory, "repository_namespace", "repo")
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(inventory)
+
+
+def _bypassed_inventory_from(base):
+    inventory = object.__new__(RuntimeEvidenceInventory)
+    for field in fields(RuntimeEvidenceInventory):
+        object.__setattr__(
+            inventory, field.name, getattr(base, field.name)
+        )
+    return inventory
+
+
+def test_validate_inventory_rejects_forged_records_only_in_indexes():
+    base = _inventory()
+    forged_event = object.__new__(RuntimeEvent)
+    for field in fields(RuntimeEvent):
+        object.__setattr__(
+            forged_event, field.name, getattr(base.events[0], field.name)
+        )
+    object.__delattr__(forged_event, "message")
+    event_inventory = _bypassed_inventory_from(base)
+    object.__setattr__(
+        event_inventory, "events_by_artifact", {A: (forged_event,)}
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(event_inventory)
+
+    forged_frame = object.__new__(RuntimeStackFrame)
+    for field in fields(RuntimeStackFrame):
+        object.__setattr__(
+            forged_frame, field.name, getattr(base.frames[0], field.name)
+        )
+    object.__delattr__(forged_frame, "function_text")
+    frame_inventory = _bypassed_inventory_from(base)
+    object.__setattr__(
+        frame_inventory, "frames_by_file", {"pkg/a.py": (forged_frame,)}
+    )
+    with pytest.raises(RuntimeEvidenceInvariantError):
+        validate_inventory(frame_inventory)

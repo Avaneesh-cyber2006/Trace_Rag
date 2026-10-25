@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
+from typing import ClassVar
 
 from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceInvariantError,
@@ -403,168 +404,248 @@ class RuntimeStackFrame:
     candidate_node_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        require_sha256_digest(
-            self.frame_id, "frame_id", RuntimeEvidenceInvariantError
-        )
-        require_sha256_digest(
-            self.event_id, "event_id", RuntimeEvidenceInvariantError
-        )
-        require_nonnegative_int(
-            self.ordinal, "ordinal", RuntimeEvidenceInvariantError
-        )
-        _require_exact_enum(
-            self.language,
-            RuntimeFrameLanguage,
-            "language",
-            RuntimeEvidenceInvariantError,
-        )
-        _require_optional_text(self.function_text, "function_text")
-        if self.relative_path is not None:
-            require_relative_posix_path(
-                self.relative_path,
-                "relative_path",
-                RuntimeEvidenceInvariantError,
-            )
-        _require_optional_positive_int(self.line, "line")
-        _require_optional_nonnegative_int(self.column, "column")
-        self._validate_source_reference()
-        _require_exact_enum(
-            self.path_match_basis,
-            PathMatchBasis,
-            "path_match_basis",
-            RuntimeEvidenceInvariantError,
-        )
-        _require_exact_enum(
-            self.association,
-            FrameAssociation,
-            "association",
-            RuntimeEvidenceInvariantError,
-        )
-        self._validate_path_basis()
-        self._validate_candidates()
-        self._validate_association_shape()
+        _validate_stack_frame_record(self)
 
-    def _validate_source_reference(self) -> None:
-        if self.relative_path is None:
-            if self.source_reference_sha256 is not None:
-                raise RuntimeEvidenceInvariantError(
-                    "source_reference_sha256 must be absent when "
-                    "relative_path is absent"
-                )
-            return
-        require_sha256_digest(
-            self.source_reference_sha256,
-            "source_reference_sha256",
-            RuntimeEvidenceInvariantError,
-        )
 
-    def _validate_path_basis(self) -> None:
-        has_path = self.relative_path is not None
-        if has_path:
-            if self.path_match_basis not in _PATH_BASES_WITH_PATH:
-                raise RuntimeEvidenceInvariantError(
-                    "path_match_basis is invalid when relative_path is present"
-                )
-        elif self.path_match_basis not in _PATH_BASES_WITHOUT_PATH:
+_FRAME_FIELD_NAMES = (
+    "frame_id",
+    "event_id",
+    "ordinal",
+    "language",
+    "function_text",
+    "relative_path",
+    "line",
+    "column",
+    "source_reference_sha256",
+    "path_match_basis",
+    "association",
+    "primary_node_id",
+    "candidate_node_ids",
+)
+
+_MISSING = object()
+
+
+def _read_record_fields(
+    record: object,
+    field_names: tuple[str, ...],
+    record_name: str,
+) -> tuple:
+    values = []
+    for field_name in field_names:
+        value = getattr(record, field_name, _MISSING)
+        if value is _MISSING:
             raise RuntimeEvidenceInvariantError(
-                "path_match_basis is invalid when relative_path is absent"
+                f"{record_name} is missing required fields"
             )
-        if self.association is FrameAssociation.NOT_EVALUATED:
-            allowed = (
-                (
-                    self.path_match_basis
-                    is PathMatchBasis.UNVERIFIED_RELATIVE_PATH
-                    and has_path
-                )
-                or (
-                    self.path_match_basis is PathMatchBasis.UNMATCHED
-                    and not has_path
-                )
-                or (
-                    self.path_match_basis
-                    is PathMatchBasis.EXTERNAL_OR_NON_FILE
-                    and not has_path
-                )
-            )
-        elif self.association is FrameAssociation.UNASSOCIATED:
-            allowed = (
-                self.path_match_basis
-                in (PathMatchBasis.UNMATCHED, PathMatchBasis.AMBIGUOUS)
-                or (
-                    self.path_match_basis
-                    is PathMatchBasis.EXTERNAL_OR_NON_FILE
-                    and not has_path
-                )
-            )
-        else:
-            allowed = (
-                has_path
-                and self.path_match_basis in _VERIFIED_PATH_BASES
-            )
-        if not allowed:
-            raise RuntimeEvidenceInvariantError(
-                "association and path_match_basis are incompatible"
-            )
+        values.append(value)
+    return tuple(values)
 
-    def _validate_candidates(self) -> None:
-        candidates = _require_exact_tuple(
-            self.candidate_node_ids, "candidate_node_ids"
+
+def _validate_stack_frame_record(frame: object) -> None:
+    (
+        frame_id,
+        event_id,
+        ordinal,
+        language,
+        function_text,
+        relative_path,
+        line,
+        column,
+        source_reference_sha256,
+        path_match_basis,
+        association,
+        primary_node_id,
+        candidate_node_ids,
+    ) = _read_record_fields(
+        frame, _FRAME_FIELD_NAMES, "RuntimeStackFrame"
+    )
+    require_sha256_digest(
+        frame_id, "frame_id", RuntimeEvidenceInvariantError
+    )
+    require_sha256_digest(
+        event_id, "event_id", RuntimeEvidenceInvariantError
+    )
+    require_nonnegative_int(
+        ordinal, "ordinal", RuntimeEvidenceInvariantError
+    )
+    _require_exact_enum(
+        language,
+        RuntimeFrameLanguage,
+        "language",
+        RuntimeEvidenceInvariantError,
+    )
+    _require_optional_text(function_text, "function_text")
+    if relative_path is not None:
+        require_relative_posix_path(
+            relative_path,
+            "relative_path",
+            RuntimeEvidenceInvariantError,
         )
-        previous: str | None = None
-        for candidate in candidates:
-            current = _require_nonempty_node_id(
-                candidate, "candidate_node_ids"
-            )
-            if previous is not None and previous >= current:
-                raise RuntimeEvidenceInvariantError(
-                    "candidate_node_ids must be sorted and unique"
-                )
-            previous = current
-        if self.primary_node_id is not None:
-            _require_nonempty_node_id(
-                self.primary_node_id, "primary_node_id"
-            )
-            if self.primary_node_id not in candidates:
-                raise RuntimeEvidenceInvariantError(
-                    "primary_node_id must be contained in "
-                    "candidate_node_ids"
-                )
+    _require_optional_positive_int(line, "line")
+    _require_optional_nonnegative_int(column, "column")
+    _validate_frame_source_reference(
+        relative_path, source_reference_sha256
+    )
+    _require_exact_enum(
+        path_match_basis,
+        PathMatchBasis,
+        "path_match_basis",
+        RuntimeEvidenceInvariantError,
+    )
+    _require_exact_enum(
+        association,
+        FrameAssociation,
+        "association",
+        RuntimeEvidenceInvariantError,
+    )
+    has_path = relative_path is not None
+    _validate_frame_path_basis(
+        association, path_match_basis, has_path
+    )
+    candidates = _validate_frame_candidates(
+        candidate_node_ids, primary_node_id
+    )
+    _validate_frame_association_shape(
+        association, candidates, primary_node_id
+    )
 
-    def _validate_association_shape(self) -> None:
-        if self.association in (
-            FrameAssociation.NOT_EVALUATED,
-            FrameAssociation.UNASSOCIATED,
+
+def _validate_frame_source_reference(
+    relative_path: object,
+    source_reference_sha256: object,
+) -> None:
+    if relative_path is None:
+        if source_reference_sha256 is not None:
+            raise RuntimeEvidenceInvariantError(
+                "source_reference_sha256 must be absent when "
+                "relative_path is absent"
+            )
+        return
+    require_sha256_digest(
+        source_reference_sha256,
+        "source_reference_sha256",
+        RuntimeEvidenceInvariantError,
+    )
+
+
+def _validate_frame_path_basis(
+    association: FrameAssociation,
+    path_match_basis: PathMatchBasis,
+    has_path: bool,
+) -> None:
+    if has_path:
+        if path_match_basis not in _PATH_BASES_WITH_PATH:
+            raise RuntimeEvidenceInvariantError(
+                "path_match_basis is invalid when relative_path is present"
+            )
+    elif path_match_basis not in _PATH_BASES_WITHOUT_PATH:
+        raise RuntimeEvidenceInvariantError(
+            "path_match_basis is invalid when relative_path is absent"
+        )
+    if association is FrameAssociation.NOT_EVALUATED:
+        allowed = (
+            (
+                path_match_basis is PathMatchBasis.UNVERIFIED_RELATIVE_PATH
+                and has_path
+            )
+            or (
+                path_match_basis is PathMatchBasis.UNMATCHED
+                and not has_path
+            )
+            or (
+                path_match_basis is PathMatchBasis.EXTERNAL_OR_NON_FILE
+                and not has_path
+            )
+        )
+    elif association is FrameAssociation.UNASSOCIATED:
+        allowed = (
+            path_match_basis
+            in (PathMatchBasis.UNMATCHED, PathMatchBasis.AMBIGUOUS)
+            or (
+                path_match_basis is PathMatchBasis.EXTERNAL_OR_NON_FILE
+                and not has_path
+            )
+        )
+    else:
+        allowed = (
+            has_path
+            and path_match_basis in _VERIFIED_PATH_BASES
+        )
+    if not allowed:
+        raise RuntimeEvidenceInvariantError(
+            "association and path_match_basis are incompatible"
+        )
+
+
+def _validate_frame_candidates(
+    candidate_node_ids: object,
+    primary_node_id: object,
+) -> tuple[str, ...]:
+    candidates = _require_exact_tuple(
+        candidate_node_ids, "candidate_node_ids"
+    )
+    previous: str | None = None
+    for candidate in candidates:
+        current = _require_nonempty_node_id(
+            candidate, "candidate_node_ids"
+        )
+        if previous is not None and previous >= current:
+            raise RuntimeEvidenceInvariantError(
+                "candidate_node_ids must be sorted and unique"
+            )
+        previous = current
+    if primary_node_id is not None:
+        _require_nonempty_node_id(
+            primary_node_id, "primary_node_id"
+        )
+        if primary_node_id not in candidates:
+            raise RuntimeEvidenceInvariantError(
+                "primary_node_id must be contained in "
+                "candidate_node_ids"
+            )
+    return candidates
+
+
+def _validate_frame_association_shape(
+    association: FrameAssociation,
+    candidate_node_ids: tuple[str, ...],
+    primary_node_id: object,
+) -> None:
+    if association in (
+        FrameAssociation.NOT_EVALUATED,
+        FrameAssociation.UNASSOCIATED,
+    ):
+        if candidate_node_ids or primary_node_id is not None:
+            raise RuntimeEvidenceInvariantError(
+                "association must not carry candidates or a primary node"
+            )
+    elif association is FrameAssociation.FILE:
+        if (
+            len(candidate_node_ids) != 1
+            or primary_node_id != candidate_node_ids[0]
         ):
-            if self.candidate_node_ids or self.primary_node_id is not None:
-                raise RuntimeEvidenceInvariantError(
-                    "association must not carry candidates or a primary node"
-                )
-        elif self.association is FrameAssociation.FILE:
-            if (
-                len(self.candidate_node_ids) != 1
-                or self.primary_node_id != self.candidate_node_ids[0]
-            ):
-                raise RuntimeEvidenceInvariantError(
-                    "FILE association requires exactly one candidate, "
-                    "which must be the primary"
-                )
-        elif self.association is FrameAssociation.SYMBOL:
-            if (
-                len(self.candidate_node_ids) != 2
-                or self.primary_node_id not in self.candidate_node_ids
-            ):
-                raise RuntimeEvidenceInvariantError(
-                    "SYMBOL association requires exactly two candidates "
-                    "and one primary"
-                )
-        elif (
-            len(self.candidate_node_ids) < 3
-            or self.primary_node_id is not None
+            raise RuntimeEvidenceInvariantError(
+                "FILE association requires exactly one candidate, "
+                "which must be the primary"
+            )
+    elif association is FrameAssociation.SYMBOL:
+        if (
+            len(candidate_node_ids) != 2
+            or primary_node_id not in candidate_node_ids
         ):
             raise RuntimeEvidenceInvariantError(
-                "AMBIGUOUS_SYMBOL association requires at least three "
-                "candidates and no primary"
+                "SYMBOL association requires exactly two candidates "
+                "and one primary"
             )
+    elif (
+        len(candidate_node_ids) < 3
+        or primary_node_id is not None
+    ):
+        raise RuntimeEvidenceInvariantError(
+            "AMBIGUOUS_SYMBOL association requires at least three "
+            "candidates and no primary"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,3 +884,49 @@ class RuntimeArtifactRecord:
                     "and contain no duplicates"
                 )
             previous_key = current_key
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeEvidenceInventory:
+    repository_namespace: str
+    declared_revision: str | None
+    declared_captured_at: str | None
+    declared_capture_completeness: CaptureCompleteness
+    graph_binding: GraphBinding
+    event_text_retained: bool
+    artifacts: tuple[RuntimeArtifactRecord, ...]
+    events: tuple[RuntimeEvent, ...]
+    frames: tuple[RuntimeStackFrame, ...]
+    issues: tuple[RuntimeEvidenceIssue, ...]
+    submitted_artifacts: int
+    duplicate_artifacts: int
+    total_input_bytes: int
+    total_events: int
+    total_frames: int
+    text_truncated: bool
+    events_truncated: bool
+    frames_truncated: bool
+    issues_truncated: bool
+    ingestion_complete: bool
+    incomplete_reasons: tuple[RuntimeIncompleteReason, ...]
+    events_by_artifact: Mapping[str, tuple[RuntimeEvent, ...]]
+    events_by_trace_id: Mapping[str, tuple[RuntimeEvent, ...]]
+    events_by_fingerprint: Mapping[str, tuple[RuntimeEvent, ...]]
+    frames_by_file: Mapping[str, tuple[RuntimeStackFrame, ...]]
+    frames_by_node: Mapping[str, tuple[RuntimeStackFrame, ...]]
+
+    SCHEMA_VERSION: ClassVar[str] = "tracerag-runtime-evidence-v1"
+
+    def __post_init__(self) -> None:
+        from backend.runtime_evidence.indexes import (
+            _INVENTORY_INDEX_FIELDS,
+            build_inventory_indexes,
+            validate_inventory,
+        )
+
+        validate_inventory(self)
+        canonical = build_inventory_indexes(
+            self.artifacts, self.events, self.frames
+        )
+        for name in _INVENTORY_INDEX_FIELDS:
+            object.__setattr__(self, name, getattr(canonical, name))
