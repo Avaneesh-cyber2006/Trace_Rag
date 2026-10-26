@@ -25,6 +25,13 @@ def _is_blank(raw: bytes) -> bool:
     return all(byte in _BLANK_BYTES for byte in raw)
 
 
+def strip_utf8_bom(content: bytes) -> bytes:
+    """Remove at most one leading UTF-8 BOM."""
+    if content.startswith(_UTF8_BOM):
+        return content[len(_UTF8_BOM):]
+    return content
+
+
 def split_physical_lines(content: bytes) -> tuple[PhysicalLine, ...]:
     """Split artifact bytes into normalized one-based physical lines."""
     if not content:

@@ -1,9 +1,26 @@
 """Bounded JSON event schema normalization for runtime evidence."""
 
+import json
 from dataclasses import dataclass, replace
 
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
-from backend.runtime_evidence.drafts import EventDraft, FrameDraft, IssueDraft
+from backend.runtime_evidence.drafts import (
+    ArtifactParseResult,
+    EventDraft,
+    FrameDraft,
+    IssueDraft,
+)
+from backend.runtime_evidence.json_scanner import (
+    JsonScanError,
+    JsonScanResult,
+    scan_json_structure,
+)
+from backend.runtime_evidence.lines import (
+    PhysicalLine,
+    decode_physical_line,
+    split_physical_lines,
+    strip_utf8_bom,
+)
 from backend.runtime_evidence.models import (
     RuntimeEventKind,
     RuntimeFrameLanguage,
@@ -575,3 +592,266 @@ def normalize_event_object(
                 ),
             ),
         )
+
+
+class _DuplicateJsonKey(Exception):
+    """Internal duplicate-key marker carrying no diagnostic text."""
+
+
+class _RejectedJsonConstant(Exception):
+    """Internal non-standard constant marker carrying no diagnostic text."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Materialized:
+    ok: bool
+    value: object
+    issue: RuntimeIssueCode | None
+
+
+def _guarded_object_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonKey
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(_text: str) -> None:
+    raise _RejectedJsonConstant
+
+
+def _materialize(text: str) -> _Materialized:
+    """Materialize one already-scanned, budgeted JSON value."""
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_guarded_object_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateJsonKey:
+        return _Materialized(
+            ok=False,
+            value=None,
+            issue=RuntimeIssueCode.DUPLICATE_JSON_KEY,
+        )
+    except _RejectedJsonConstant:
+        return _Materialized(
+            ok=False,
+            value=None,
+            issue=RuntimeIssueCode.MALFORMED_JSON,
+        )
+    except (json.JSONDecodeError, ValueError, OverflowError, RecursionError):
+        return _Materialized(
+            ok=False,
+            value=None,
+            issue=RuntimeIssueCode.MALFORMED_JSON,
+        )
+    return _Materialized(ok=True, value=value, issue=None)
+
+
+def _emit_normalized(
+    normalized: NormalizedEvent,
+    events: list[EventDraft],
+    issues: list[IssueDraft],
+    max_new_events: int,
+) -> tuple[bool, bool, bool]:
+    """Append one normalized event within capacity.
+
+    Returns ``(limit_hit, text_truncated, frames_truncated)``. Invalid
+    events still contribute their diagnostics while capacity is full.
+    """
+    if normalized.draft is None:
+        issues.extend(normalized.issues)
+        return (False, False, False)
+    if len(events) >= max_new_events:
+        return (True, False, False)
+    events.append(normalized.draft)
+    issues.extend(normalized.issues)
+    return (
+        False,
+        normalized.draft.text_truncated,
+        normalized.draft.frames_truncated,
+    )
+
+
+def _failed_document(code: RuntimeIssueCode) -> ArtifactParseResult:
+    return ArtifactParseResult(
+        events=(),
+        issues=(_issue(code, None, None),),
+        text_truncated=False,
+        frames_truncated=False,
+        empty_input=False,
+        event_limit_hit=False,
+    )
+
+
+def _parse_document(
+    text: str,
+    scan: JsonScanResult,
+    config: RuntimeEvidenceConfig,
+    declared_language: RuntimeFrameLanguage | None,
+    max_new_events: int,
+) -> ArtifactParseResult:
+    if (
+        scan.node_count > config.max_json_nodes
+        or scan.max_number_token_bytes > config.max_json_number_bytes
+    ):
+        return _failed_document(RuntimeIssueCode.MALFORMED_JSON)
+
+    materialized = _materialize(text)
+    if not materialized.ok:
+        return _failed_document(materialized.issue)
+
+    value = materialized.value
+    if type(value) is dict:
+        elements = (value,)
+    elif type(value) is list:
+        elements = value
+    else:
+        return _failed_document(RuntimeIssueCode.MALFORMED_JSON)
+
+    events: list[EventDraft] = []
+    issues: list[IssueDraft] = []
+    text_truncated = False
+    frames_truncated = False
+    event_limit_hit = False
+
+    for element in elements:
+        normalized = normalize_event_object(
+            element,
+            sequence=len(events),
+            source_line=None,
+            config=config,
+            declared_language=declared_language,
+        )
+        limit_hit, element_text, element_frames = _emit_normalized(
+            normalized, events, issues, max_new_events
+        )
+        text_truncated = text_truncated or element_text
+        frames_truncated = frames_truncated or element_frames
+        if limit_hit:
+            event_limit_hit = True
+            break
+
+    return ArtifactParseResult(
+        events=tuple(events),
+        issues=tuple(issues),
+        text_truncated=text_truncated,
+        frames_truncated=frames_truncated,
+        empty_input=False,
+        event_limit_hit=event_limit_hit,
+    )
+
+
+def _parse_jsonl(
+    lines: tuple[PhysicalLine, ...],
+    config: RuntimeEvidenceConfig,
+    declared_language: RuntimeFrameLanguage | None,
+    max_new_events: int,
+) -> ArtifactParseResult:
+    events: list[EventDraft] = []
+    issues: list[IssueDraft] = []
+    text_truncated = False
+    frames_truncated = False
+    event_limit_hit = False
+
+    for line in lines:
+        if line.blank:
+            continue
+        decoded = decode_physical_line(line, config.max_line_bytes)
+        if decoded.issue is not None:
+            issues.append(_issue(decoded.issue, None, line.number))
+            continue
+        text = decoded.text
+        try:
+            scan = scan_json_structure(text)
+        except JsonScanError:
+            issues.append(
+                _issue(RuntimeIssueCode.MALFORMED_JSON, None, line.number)
+            )
+            continue
+        if (
+            scan.node_count > config.max_json_nodes
+            or scan.max_number_token_bytes > config.max_json_number_bytes
+        ):
+            issues.append(
+                _issue(RuntimeIssueCode.MALFORMED_JSON, None, line.number)
+            )
+            continue
+
+        materialized = _materialize(text)
+        if not materialized.ok:
+            issues.append(_issue(materialized.issue, None, line.number))
+            continue
+
+        normalized = normalize_event_object(
+            materialized.value,
+            sequence=len(events),
+            source_line=line.number,
+            config=config,
+            declared_language=declared_language,
+        )
+        limit_hit, event_text, event_frames = _emit_normalized(
+            normalized, events, issues, max_new_events
+        )
+        text_truncated = text_truncated or event_text
+        frames_truncated = frames_truncated or event_frames
+        if limit_hit:
+            event_limit_hit = True
+            break
+
+    # Every line is diagnosed here. When no line qualifies as an object this
+    # is the deferred diagnostic scan: scalar/array lines keep
+    # INVALID_EVENT_SCHEMA and malformed lines keep MALFORMED_JSON.
+    return ArtifactParseResult(
+        events=tuple(events),
+        issues=tuple(issues),
+        text_truncated=text_truncated,
+        frames_truncated=frames_truncated,
+        empty_input=False,
+        event_limit_hit=event_limit_hit,
+    )
+
+
+def parse_json_events(
+    content: bytes,
+    config: RuntimeEvidenceConfig,
+    declared_language: RuntimeFrameLanguage | None,
+    max_new_events: int,
+) -> ArtifactParseResult:
+    """Parse one JSON_EVENTS artifact into events and issues."""
+    lines = split_physical_lines(content)
+    if not any(not line.blank for line in lines):
+        return ArtifactParseResult(
+            events=(),
+            issues=(),
+            text_truncated=False,
+            frames_truncated=False,
+            empty_input=True,
+            event_limit_hit=False,
+        )
+
+    document = strip_utf8_bom(content)
+    try:
+        document_text = document.decode("utf-8")
+    except UnicodeDecodeError:
+        return _parse_jsonl(
+            lines, config, declared_language, max_new_events
+        )
+
+    try:
+        scan = scan_json_structure(document_text)
+    except JsonScanError:
+        return _parse_jsonl(
+            lines, config, declared_language, max_new_events
+        )
+
+    if scan.top_level_kind not in ("object", "array"):
+        return _parse_jsonl(lines, config, declared_language, max_new_events)
+    return _parse_document(
+        document_text, scan, config, declared_language, max_new_events
+    )

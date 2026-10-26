@@ -10,12 +10,14 @@ from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.json_adapter import (
     NormalizedEvent,
     normalize_event_object,
+    parse_json_events,
 )
 from backend.runtime_evidence.json_scanner import (
     JsonScanError,
     JsonScanResult,
     scan_json_structure,
 )
+from backend.runtime_evidence.lines import strip_utf8_bom
 from backend.runtime_evidence.models import (
     RuntimeEventKind,
     RuntimeFrameLanguage,
@@ -1046,3 +1048,528 @@ def test_structural_budget_messages_are_fixed():
         "stack exceeds the configured byte limit")
     assert "200" not in issue_message(
         RuntimeIssueCode.STACK_TOO_LARGE)
+
+
+def _parse(content, max_new_events=10, declared_language=None, **kw):
+    return parse_json_events(
+        content, _config(**kw), declared_language, max_new_events
+    )
+
+
+def test_single_line_object_is_document_mode_with_no_line_provenance():
+    result = _parse(b'{"kind":"log","message":"x"}')
+    assert len(result.events) == 1
+    assert result.events[0].source_line is None
+    assert result.empty_input is False
+
+
+def test_complete_valid_documents_select_document_mode():
+    obj = _parse(b'{"kind":"log","message":"x"}')
+    arr = _parse(
+        b'[{"kind":"log","message":"a"},'
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert obj.events[0].source_line is None
+    assert [event.source_line for event in arr.events] == [None, None]
+    assert [event.sequence for event in arr.events] == [0, 1]
+
+
+def test_pretty_printed_document_is_still_document_mode():
+    content = (b'{\n  "kind": "log",\n  "message": "x"\n}\n')
+    result = _parse(content)
+    assert len(result.events) == 1
+    assert result.events[0].source_line is None
+
+
+def test_document_array_empty_array_and_non_object_elements():
+    result = _parse(
+        b'[{"kind":"log","message":"a"}, 3, '
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert [e.message for e in result.events] == ["a", "b"]
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+    empty = _parse(b"[]")
+    assert empty.events == () and empty.empty_input is False
+
+
+def test_document_array_issues_remain_document_scoped():
+    result = _parse(
+        b'[3, null, {"kind":"bogus"}, '
+        b'{"kind":"log","message":"a"}, '
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert [(event.sequence, event.message) for event in result.events] == [
+        (0, "a"), (1, "b")]
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)] * 3
+
+
+def test_all_invalid_document_object_has_no_event():
+    result = _parse(b"{}")
+    assert result.events == ()
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+
+
+def test_empty_and_blank_only_jsonl_are_complete_shaped():
+    for content in (b"", b"\n \t\n", b"\xef\xbb\xbf", b" " * 40 + b"\n"):
+        result = _parse(content, max_line_bytes=32)
+        assert result.events == () and result.empty_input is True
+        assert result.issues == ()
+        assert result.text_truncated is False
+        assert result.frames_truncated is False
+        assert result.event_limit_hit is False
+
+
+def test_blank_whitespace_is_not_blankness():
+    result = _parse(b"\x0b\n")
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_malformed_balanced_documents_fall_back_to_jsonl():
+    for bad in (b'{"kind":"log","message":"ok","x":"\\x"}\n',
+                b'{"kind":"log","message":"ok" "x":1}\n',
+                b'{"kind":"log","message":"ok",}\n'):
+        result = _parse(bad)
+        assert result.events == ()
+        assert [(i.code, i.source_line) for i in result.issues] == [
+            (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_balanced_invalid_document_with_recoverable_object_line():
+    content = (b'{"kind":"log","message":"ok",}\n'
+               b'{"kind":"log","message":"saved"}\n')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b'{"kind":"log","message":"ok","x":"\\x"}',
+        b'{"kind":"log","message":"ok" "x":1}',
+        b'{"kind":"log","message":"ok",}',
+        b'{"kind":"log","message":"ok"} trailing',
+    ],
+)
+def test_malformed_whole_candidates_recover_later_objects(bad):
+    result = _parse(bad + b'\n{"kind":"log","message":"saved"}')
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_invalid_jsonl_line_does_not_discard_later_valid_line():
+    result = _parse(
+        b'{"kind":"log"\n{"kind":"log","message":"saved"}'
+    )
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_valid_jsonl_object_lines_keep_one_based_physical_lines():
+    content = (b'{"kind":"log","message":"a"}\n'
+               b'\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 1), ("b", 3)]
+
+
+def test_invalid_utf8_whole_candidate_recovers_valid_object_line():
+    content = b'\xff\n{"kind":"log","message":"saved"}\n'
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+    no_recovery = _parse(b'\xff\n')
+    assert no_recovery.events == ()
+    assert no_recovery.empty_input is False
+    assert [(i.code, i.source_line) for i in no_recovery.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+
+def test_invalid_utf8_cannot_select_document_mode():
+    result = _parse(b'{"kind":"log","message":"\xff"}')
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+
+def test_over_budget_document_fails_whole_and_does_not_fall_back():
+    content = b'[' + b",".join([b"0"] * 8) + b"]"
+    result = _parse(content, max_json_nodes=5)
+    assert result.events == ()
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+
+def test_over_budget_document_is_not_materialized(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("document was materialized")
+
+    monkeypatch.setattr(json_adapter.json, "loads", fail)
+    content = b'[' + b",".join([b"0"] * 8) + b"]"
+    result = _parse(content, max_json_nodes=5)
+    assert result.events == ()
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+
+def test_document_materializes_once_through_guarded_hooks(monkeypatch):
+    calls = []
+    real_loads = json_adapter.json.loads
+
+    def counting_loads(text, **kwargs):
+        calls.append(kwargs)
+        return real_loads(text, **kwargs)
+
+    monkeypatch.setattr(json_adapter.json, "loads", counting_loads)
+    result = _parse(b'{"kind":"log","message":"x"}')
+    assert len(result.events) == 1
+    assert len(calls) == 1
+    assert "object_pairs_hook" in calls[0]
+    assert "parse_constant" in calls[0]
+
+
+def test_aggregate_jsonl_nodes_may_exceed_document_budget():
+    content = b"\n".join([b'{"kind":"log","message":"x"}'] * 5)
+    result = _parse(content, max_json_nodes=5)
+    assert len(result.events) == 5
+
+
+def test_over_budget_jsonl_line_recovers_later_event():
+    content = (b'[0,1,2,3,4,5]\n'
+               b'{"kind":"log","message":"saved"}\n')
+    result = _parse(content, max_json_nodes=5)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_node_budget_exact_boundary_document_and_jsonl():
+    document = b'{"kind":"log","message":"x"}'
+    assert len(_parse(document, max_json_nodes=5).events) == 1
+    rejected = _parse(document, max_json_nodes=4)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    jsonl = document + b"\n" + document
+    assert len(_parse(jsonl, max_json_nodes=5).events) == 2
+    rejected = _parse(jsonl, max_json_nodes=4)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1),
+        (RuntimeIssueCode.MALFORMED_JSON, 2)]
+
+
+def test_number_token_budget_exact_boundary_and_recovery():
+    document = b'{"kind":"log","message":"x","n":-1.2e+3}'
+    assert len(_parse(document, max_json_nodes=7,
+                      max_json_number_bytes=7).events) == 1
+    rejected = _parse(document, max_json_nodes=7,
+                      max_json_number_bytes=6)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    jsonl = document + b"\n" + b'{"kind":"log","message":"saved"}'
+    recovered = _parse(jsonl, max_json_nodes=7, max_json_number_bytes=6)
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_numeric_conversion_failure_is_recoverable():
+    huge_number = b"9" * 5000
+    document = (b'{"kind":"log","message":"x","n":'
+                + huge_number + b"}")
+
+    failed = _parse(document, max_json_number_bytes=10000)
+    assert failed.events == ()
+    assert [(i.code, i.source_line) for i in failed.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    recovered = _parse(
+        document + b'\n{"kind":"log","message":"saved"}',
+        max_json_number_bytes=10000,
+    )
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_oversized_numeric_token_is_rejected_before_materialization():
+    huge_number = b"9" * 5000
+    content = (b'{"kind":"log","message":"x","n":'
+               + huge_number + b"}\n"
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content, max_json_number_bytes=1024)
+    assert [e.message for e in result.events] == ["saved"]
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_deep_nesting_document_and_jsonl_resource_failure():
+    deep = b"[" * 5000 + b"0" + b"]" * 5000
+    document = _parse(deep)
+    assert document.events == ()
+    assert [(i.code, i.source_line) for i in document.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    recovered = _parse(
+        deep + b'\n{"kind":"log","message":"saved"}',
+        max_line_bytes=20000,
+    )
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b"NaN",
+        b"Infinity",
+        b"-Infinity",
+        b'{"kind":"log","message":"x","n":NaN}',
+        b"[Infinity]",
+    ],
+)
+def test_non_standard_json_constants_are_malformed(bad):
+    result = _parse(bad)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_nan_line_does_not_discard_later_valid_object():
+    content = (b'{"kind":"log","message":"x","n":NaN}\n'
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_jsonl_failure_precedence_and_one_based_lines():
+    content = (b'{"kind":"log","message":"ok"}\n'
+               b'\x00' + b"x" * 40 + b'\n'
+               b'no\x00\n'
+               b'\xff\n'
+               b'{"kind":"log"}\n')
+    result = _parse(content, max_line_bytes=32)
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 2),
+        (RuntimeIssueCode.NUL_BYTE, 3),
+        (RuntimeIssueCode.INVALID_UTF8, 4),
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, 5),
+    ]
+
+
+def test_line_both_overlong_and_nul_reports_length_first():
+    content = (b'\x00' + b"x" * 40 + b"\n"
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content, max_line_bytes=32)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 1)]
+
+
+def test_blank_and_overlong_whitespace_only_lines_are_ignored():
+    content = (b" " * 40 + b"\n"
+               b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content, max_line_bytes=32)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 2), ("b", 3)]
+    assert result.issues == ()
+
+    blank_only = _parse(b" " * 40 + b"\n" + b"\t" * 40,
+                        max_line_bytes=32)
+    assert blank_only.events == ()
+    assert blank_only.empty_input is True
+    assert blank_only.issues == ()
+
+
+def test_multibyte_text_is_retained_and_lines_are_byte_measured():
+    line = (b'{"kind":"log","message":"'
+            + "\u00e9".encode("utf-8") * 8 + b'"}')
+    char_length = len(line.decode("utf-8"))
+    assert len(line) > char_length
+    content = line + b'\n{"kind":"log","message":"ok"}'
+
+    overlong = _parse(content, max_line_bytes=char_length,
+                      max_message_bytes=64)
+    assert overlong.events[0].source_line == 2
+    assert [e.message for e in overlong.events] == ["ok"]
+    assert [(i.code, i.source_line) for i in overlong.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 1)]
+
+    accepted = _parse(content, max_line_bytes=len(line),
+                      max_message_bytes=64)
+    assert [e.message for e in accepted.events] == ["\u00e9" * 8, "ok"]
+    assert accepted.issues == ()
+
+
+def test_deferred_diagnostic_scan_without_a_qualifying_object():
+    content = (b"3\n"
+               b"[1,2]\n"
+               b'{"kind":"log"\n')
+    result = _parse(content)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [
+        (i.code, i.event_sequence, i.source_line)
+        for i in result.issues
+    ] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 1),
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 2),
+        (RuntimeIssueCode.MALFORMED_JSON, None, 3),
+    ]
+
+
+@pytest.mark.parametrize("content", [b"3", b'"text"', b"true", b"null"])
+def test_top_level_scalars_are_jsonl_invalid_schema(content):
+    result = _parse(content)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [
+        (i.code, i.event_sequence, i.source_line)
+        for i in result.issues
+    ] == [(RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 1)]
+
+
+def test_duplicate_key_precedence_document_and_jsonl():
+    document = (b'[{"kind":"log","message":"a"},'
+                b'{"kind":"log","message":"b","x":1,"x":2}]')
+    failed = _parse(document)
+    assert failed.events == ()
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in failed.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, None, None)]
+
+    lone = b'{"kind":"log","message":"a","x":1,"x":2}'
+    lone_result = _parse(lone)
+    assert lone_result.events == ()
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in lone_result.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, None, None)]
+
+    jsonl = (b'{"kind":"log","message":"a","x":1,"x":2}\n'
+             b'{"kind":"log","message":"b"}')
+    recovered = _parse(jsonl)
+    assert [e.message for e in recovered.events] == ["b"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, 1)]
+
+
+def test_duplicate_key_precedes_wrong_shape_in_jsonl():
+    content = (b'[{"a":1,"a":2}]\n'
+               b'{"kind":"log","message":"ok"}')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["ok"]
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, 1)]
+
+
+def test_event_limit_hit_stops_before_another_valid_event():
+    content = (b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}\n'
+               b'{"kind":"log","message":"c"}')
+    result = _parse(content, max_new_events=2)
+    assert [(e.sequence, e.message) for e in result.events] == [
+        (0, "a"), (1, "b")]
+    assert result.event_limit_hit is True
+
+    exact = _parse(content, max_new_events=3)
+    assert len(exact.events) == 3
+    assert exact.event_limit_hit is False
+
+
+def test_document_event_limit_continues_past_invalid_elements():
+    content = (b'[{"kind":"log","message":"a"},'
+               b'{"kind":"log","message":"b"},'
+               b'3,'
+               b'{"kind":"log","message":"c"}]')
+    result = _parse(content, max_new_events=2)
+    assert [(e.sequence, e.message) for e in result.events] == [
+        (0, "a"), (1, "b")]
+    assert result.event_limit_hit is True
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+
+
+def test_result_flags_are_or_of_emitted_event_flags():
+    text = _parse(
+        b'[{"kind":"log","message":"abcdef"},'
+        b'{"kind":"log","message":"x"}]',
+        max_message_bytes=4,
+    )
+    assert text.text_truncated is True
+    assert text.frames_truncated is False
+    assert text.events[0].message == "a\u2026"
+
+    frames = _parse(
+        b'[{"kind":"error","message":"x","error":{"frames":['
+        b'{"function":"f0"},{"function":"f1"},{"function":"f2"}]}}]',
+        max_frames_per_event=2,
+    )
+    assert frames.text_truncated is False
+    assert frames.frames_truncated is True
+    assert frames.events[0].frames_truncated is True
+
+
+def test_strip_utf8_bom_removes_at_most_one_leading_bom():
+    bom = b"\xef\xbb\xbf"
+    assert strip_utf8_bom(b"") == b""
+    assert strip_utf8_bom(b"{}") == b"{}"
+    assert strip_utf8_bom(bom + b"{}") == b"{}"
+    assert strip_utf8_bom(bom + bom + b"{}") == bom + b"{}"
+    assert strip_utf8_bom(b"x" + bom) == b"x" + bom
+
+
+def test_bom_document_and_jsonl_use_one_bom_only():
+    bom = b"\xef\xbb\xbf"
+    document = _parse(bom + b'{"kind":"log","message":"x"}')
+    assert len(document.events) == 1
+    assert document.events[0].source_line is None
+
+    content = (bom + b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 1), ("b", 2)]
+
+
+def test_parser_failure_messages_do_not_leak_artifact_text():
+    secret = "s3cr3t"
+    content = ('{"kind":"log","message":"%s","x":"\\x"}' % secret).encode()
+    result = _parse(content)
+    (issue,) = result.issues
+    assert issue.code is RuntimeIssueCode.MALFORMED_JSON
+    assert issue_message(issue.code) == "line or document is not valid JSON"
+    assert secret not in issue_message(issue.code)
