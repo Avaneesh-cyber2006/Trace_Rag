@@ -6,11 +6,18 @@ from pathlib import Path
 import pytest
 
 from backend.runtime_evidence import stack_parser
+from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.drafts import FrameDraft
-from backend.runtime_evidence.models import RuntimeFrameLanguage
+from backend.runtime_evidence.exceptions import RuntimeEvidenceValidationError
+from backend.runtime_evidence.models import (
+    RuntimeEventKind,
+    RuntimeFrameLanguage,
+    RuntimeIssueCode,
+)
 from backend.runtime_evidence.stack_parser import (
     StackParseResult,
     parse_stack_source,
+    parse_stack_trace_text,
 )
 
 
@@ -792,3 +799,440 @@ def _is_regex_compile_call(node):
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "re"
     )
+
+
+def _config(**kw):
+    values = dict(
+        max_stack_bytes=256,
+        max_frames_per_event=8,
+        max_message_bytes=64,
+        max_frame_function_bytes=64,
+        max_line_bytes=256,
+    )
+    values.update(kw)
+    return RuntimeEvidenceConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "language", [None, RuntimeFrameLanguage.UNKNOWN]
+)
+def test_stack_trace_text_requires_known_declared_language(language):
+    with pytest.raises(
+        RuntimeEvidenceValidationError,
+        match="^stack trace text requires a known declared language$",
+    ):
+        parse_stack_trace_text(b"", _config(), language, 10)
+
+
+def test_one_block_is_one_error_event_with_source_line():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "a.py", line 3, in f\n'
+        b"ValueError: x\n"
+    )
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.kind is RuntimeEventKind.ERROR
+    assert event.source_line == 1
+    assert len(event.frames) == 1
+    assert event.message == "Traceback (most recent call last):\nValueError: x"
+
+
+def test_blank_line_separates_independent_blocks():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b"\n"
+        b'  File "b.py", line 2, in g\n'
+    )
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert [
+        (event.source_line, len(event.frames))
+        for event in result.events
+    ] == [(1, 1), (3, 1)]
+
+
+def test_over_cap_block_retains_one_event_even_with_empty_prefix():
+    content = b"x" * 40 + b"\n" + b"second\n"
+    result = parse_stack_trace_text(
+        content,
+        _config(max_stack_bytes=10),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.message is None and event.frames == ()
+    assert event.text_truncated and event.frames_truncated
+    assert [(issue.code, issue.source_line) for issue in result.issues] == [
+        (RuntimeIssueCode.STACK_TOO_LARGE, 1),
+        (RuntimeIssueCode.TEXT_TRUNCATED, 1),
+    ]
+
+
+def test_over_cap_prefix_processes_only_complete_lines():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b'  File "b.py", line 2, in g\n'
+        b'  File "c.py", line 3, in h\n'
+    )
+    cap = 30  # first frame line plus LF, second does not fit
+    result = parse_stack_trace_text(
+        content,
+        _config(max_stack_bytes=cap),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert len(result.events) == 1
+    assert [frame.source_text for frame in result.events[0].frames] == [
+        "a.py"
+    ]
+    assert result.events[0].frames_truncated is True
+
+
+def test_unusable_block_produces_no_event_but_mixed_blocks_recover():
+    content = b"\xff\n\n" + b'  File "a.py", line 1, in f\n'
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert len(result.events) == 1
+    assert [(issue.code, issue.source_line) for issue in result.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)
+    ]
+    empty = parse_stack_trace_text(
+        b"\xff\n", _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert empty.events == () and empty.empty_input is False
+
+
+def test_usable_block_without_frames_retains_event_and_reports_unparseable():
+    result = parse_stack_trace_text(
+        b"Error: no frames\n",
+        _config(),
+        RuntimeFrameLanguage.JAVASCRIPT,
+        10,
+    )
+    assert len(result.events) == 1
+    assert result.events[0].frames == ()
+    assert [
+        (issue.code, issue.source_line, issue.event_sequence)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.STACK_UNPARSEABLE, 1, 0)]
+
+
+def test_empty_and_blank_only_artifacts_are_empty_input():
+    for content in (b"", b" \t\n\n\t \n"):
+        result = parse_stack_trace_text(
+            content, _config(), RuntimeFrameLanguage.PYTHON, 10
+        )
+        assert result.events == ()
+        assert result.issues == ()
+        assert result.empty_input is True
+        assert result.text_truncated is False
+        assert result.frames_truncated is False
+        assert result.event_limit_hit is False
+
+
+def test_crlf_and_lf_blocks_measure_the_same_normalized_bytes():
+    line_a = b'  File "a.py", line 1, in f'
+    line_b = b'  File "b.py", line 2, in g'
+    block_bytes = len(line_a) + 1 + len(line_b)
+    lf_content = line_a + b"\n" + line_b + b"\n"
+    crlf_content = line_a + b"\r\n" + line_b + b"\r\n"
+    for content in (lf_content, crlf_content):
+        exact = parse_stack_trace_text(
+            content,
+            _config(max_stack_bytes=block_bytes),
+            RuntimeFrameLanguage.PYTHON,
+            10,
+        )
+        assert [
+            frame.source_text for frame in exact.events[0].frames
+        ] == ["a.py", "b.py"]
+        assert exact.events[0].frames_truncated is False
+        assert exact.issues == ()
+
+        capped = parse_stack_trace_text(
+            content,
+            _config(max_stack_bytes=block_bytes - 1),
+            RuntimeFrameLanguage.PYTHON,
+            10,
+        )
+        assert [
+            frame.source_text for frame in capped.events[0].frames
+        ] == ["a.py"]
+        assert capped.events[0].frames_truncated is True
+
+
+def test_overlong_line_is_skipped_and_reported():
+    frame = b'  File "a.py", line 1, in f'
+    content = frame + b"\n" + b"x" * 40 + b"\n"
+    result = parse_stack_trace_text(
+        content,
+        _config(max_line_bytes=30),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert len(result.events) == 1
+    assert [frame.source_text for frame in result.events[0].frames] == [
+        "a.py"
+    ]
+    assert result.events[0].source_line == 1
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.LINE_TOO_LONG, None, 2)]
+
+
+def test_nul_line_is_skipped_and_reported():
+    content = b'  File "a.py", line 1, in f\n' + b"bad\x00line\n"
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert len(result.events) == 1
+    assert result.events[0].source_line == 1
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.NUL_BYTE, None, 2)]
+
+
+def test_block_with_no_usable_lines_produces_no_event():
+    content = b"\xff\n" + b"x" * 300 + b"\n" + b"bad\x00\n"
+    result = parse_stack_trace_text(
+        content,
+        _config(max_stack_bytes=1024),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [
+        (RuntimeIssueCode.INVALID_UTF8, None, 1),
+        (RuntimeIssueCode.LINE_TOO_LONG, None, 2),
+        (RuntimeIssueCode.NUL_BYTE, None, 3),
+    ]
+
+
+def test_frame_limit_and_function_truncation_report_once_per_event():
+    content = (
+        b'  File "a.py", line 1, in function_one\n'
+        b'  File "b.py", line 2, in function_two\n'
+    )
+    result = parse_stack_trace_text(
+        content,
+        _config(max_frames_per_event=1, max_frame_function_bytes=4),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    event = result.events[0]
+    assert [frame.source_text for frame in event.frames] == ["a.py"]
+    assert event.frames[0].function_text == "f\u2026"
+    assert event.frames_truncated is True
+    assert event.text_truncated is True
+    assert result.frames_truncated is True
+    assert result.text_truncated is True
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [
+        (RuntimeIssueCode.FRAME_LIMIT_REACHED, 0, 1),
+        (RuntimeIssueCode.TEXT_TRUNCATED, 0, 1),
+    ]
+
+
+def test_message_truncation_reports_one_issue():
+    content = b"E" * 40 + b"\n" + b'  File "a.py", line 1, in f\n'
+    result = parse_stack_trace_text(
+        content,
+        _config(max_message_bytes=10),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    event = result.events[0]
+    assert event.message == "E" * 7 + "\u2026"
+    assert event.text_truncated is True
+    assert event.frames_truncated is False
+    assert result.text_truncated is True
+    assert result.frames_truncated is False
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.TEXT_TRUNCATED, 0, 1)]
+
+
+def test_multiple_blocks_preserve_order_and_sequences():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b"\n"
+        b'  File "b.py", line 2, in g\n'
+        b"\n"
+        b'  File "c.py", line 3, in h\n'
+    )
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert [
+        (event.sequence, event.source_line, event.frames[0].source_text)
+        for event in result.events
+    ] == [(0, 1, "a.py"), (1, 3, "b.py"), (2, 5, "c.py")]
+
+
+def test_event_capacity_stops_before_later_blocks():
+    content = b'  File "a.py", line 1, in f\n\n' + b"\xff\n"
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 1
+    )
+    assert len(result.events) == 1
+    assert result.event_limit_hit is True
+    assert result.empty_input is False
+    assert result.issues == ()
+
+
+def test_chained_python_sections_remain_one_event():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "a.py", line 1, in outer\n'
+        b"ValueError: outer\n"
+        b"Caused by: KeyError: final\n"
+        b'  File "b.py", line 2, in inner\n'
+    )
+    result = parse_stack_trace_text(
+        content,
+        _config(max_message_bytes=200),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert len(result.events) == 1
+    assert [
+        frame.source_text for frame in result.events[0].frames
+    ] == ["a.py", "b.py"]
+    assert result.events[0].message == (
+        "Traceback (most recent call last):\n"
+        "ValueError: outer\n"
+        "Caused by: KeyError: final"
+    )
+    assert result.issues == ()
+
+
+def test_invalid_utf8_surrogate_encoding_is_skipped():
+    content = b'  File "a.py", line 1, in f\n' + b"\xed\xa0\x80\n"
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert result.events[0].source_line == 1
+    assert [
+        (issue.code, issue.event_sequence, issue.source_line)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.INVALID_UTF8, None, 2)]
+
+
+def test_source_line_after_skipped_invalid_lines():
+    content = b"\xff\n\x00bad\n\n" + b'  File "a.py", line 1, in f\n'
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert len(result.events) == 1
+    assert result.events[0].source_line == 4
+    assert [
+        (issue.code, issue.source_line) for issue in result.issues
+    ] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1),
+        (RuntimeIssueCode.NUL_BYTE, 2),
+    ]
+
+
+def test_prefix_ending_exactly_at_cap_is_accepted():
+    line_a = b'  File "a.py", line 1, in f'
+    line_b = b'  File "b.py", line 2, in g'
+    content = line_a + b"\n" + line_b + b"\n"
+    cap = len(line_a) + 1
+    result = parse_stack_trace_text(
+        content,
+        _config(max_stack_bytes=cap),
+        RuntimeFrameLanguage.PYTHON,
+        10,
+    )
+    assert [
+        frame.source_text for frame in result.events[0].frames
+    ] == ["a.py"]
+    assert result.events[0].frames_truncated is True
+    assert result.issues[0].code is RuntimeIssueCode.STACK_TOO_LARGE
+
+
+def test_over_cap_message_only_prefix_is_not_unparseable():
+    content = b"Error: x\n" + b"y" * 40 + b"\n"
+    result = parse_stack_trace_text(
+        content,
+        _config(max_stack_bytes=20),
+        RuntimeFrameLanguage.JAVASCRIPT,
+        10,
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.message == "Error: x"
+    assert event.frames == ()
+    assert [issue.code for issue in result.issues] == [
+        RuntimeIssueCode.STACK_TOO_LARGE,
+        RuntimeIssueCode.TEXT_TRUNCATED,
+    ]
+
+
+def test_v8_ambiguous_function_source_without_trailing_close_is_retained():
+    result = parse_stack_trace_text(
+        b"at foo(bar (src).js:1:2\n",
+        _config(),
+        RuntimeFrameLanguage.JAVASCRIPT,
+        10,
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert len(event.frames) == 1
+    frame = event.frames[0]
+    assert frame.function_text is None
+    assert frame.source_text == "foo(bar (src).js"
+    assert (frame.line, frame.column) == (1, 2)
+    assert event.message is None
+    assert result.issues == ()
+    assert event.frames_truncated is False
+    assert event.text_truncated is False
+
+
+def test_v8_ambiguous_function_source_with_trailing_close_is_unparseable():
+    result = parse_stack_trace_text(
+        b"at foo(bar (src).js:1:2)\n",
+        _config(),
+        RuntimeFrameLanguage.JAVASCRIPT,
+        10,
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.frames == ()
+    assert event.message == "at foo(bar (src).js:1:2)"
+    assert [
+        (issue.code, issue.source_line, issue.event_sequence)
+        for issue in result.issues
+    ] == [(RuntimeIssueCode.STACK_UNPARSEABLE, 1, 0)]
+
+
+def test_v8_ambiguous_line_beside_valid_frame_stays_message_text():
+    content = (
+        b"at foo(bar (src).js:1:2)\n"
+        b"    at good (ok.js:2:3)\n"
+    )
+    result = parse_stack_trace_text(
+        content, _config(), RuntimeFrameLanguage.JAVASCRIPT, 10
+    )
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert [frame.function_text for frame in event.frames] == ["good"]
+    assert [frame.source_text for frame in event.frames] == ["ok.js"]
+    assert event.message == "at foo(bar (src).js:1:2)"
+    assert result.issues == ()

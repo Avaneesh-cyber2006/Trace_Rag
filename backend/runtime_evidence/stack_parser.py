@@ -3,8 +3,24 @@
 import re
 from dataclasses import dataclass
 
-from backend.runtime_evidence.drafts import FrameDraft
-from backend.runtime_evidence.models import RuntimeFrameLanguage
+from backend.runtime_evidence.config import RuntimeEvidenceConfig
+from backend.runtime_evidence.drafts import (
+    ArtifactParseResult,
+    EventDraft,
+    FrameDraft,
+    IssueDraft,
+)
+from backend.runtime_evidence.exceptions import RuntimeEvidenceValidationError
+from backend.runtime_evidence.lines import (
+    PhysicalLine,
+    decode_physical_line,
+    split_physical_lines,
+)
+from backend.runtime_evidence.models import (
+    RuntimeEventKind,
+    RuntimeFrameLanguage,
+    RuntimeIssueCode,
+)
 from backend.runtime_evidence.validation import truncate_utf8_text
 
 _PYTHON_FRAME_PATTERN = re.compile(
@@ -19,6 +35,15 @@ _CONTINUATION_PATTERN = re.compile(r"^[ \t]*\.\.\. [0-9]+ more$")
 
 _V8_LANGUAGES = frozenset(
     (
+        RuntimeFrameLanguage.JAVASCRIPT,
+        RuntimeFrameLanguage.TYPESCRIPT,
+        RuntimeFrameLanguage.TSX,
+    )
+)
+_KNOWN_LANGUAGES = frozenset(
+    (
+        RuntimeFrameLanguage.PYTHON,
+        RuntimeFrameLanguage.JAVA,
         RuntimeFrameLanguage.JAVASCRIPT,
         RuntimeFrameLanguage.TYPESCRIPT,
         RuntimeFrameLanguage.TSX,
@@ -395,4 +420,218 @@ def parse_stack_source(
         recognized_frame_count=recognized_frame_count,
         function_truncated=function_truncated,
         frame_limit_hit=frame_limit_hit,
+    )
+
+
+def _blocks(
+    lines: tuple[PhysicalLine, ...],
+) -> list[list[PhysicalLine]]:
+    blocks: list[list[PhysicalLine]] = []
+    current: list[PhysicalLine] = []
+    for line in lines:
+        if line.blank:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _block_bytes(block: list[PhysicalLine]) -> int:
+    return sum(len(line.raw) for line in block) + len(block) - 1
+
+
+def _prefix_within(
+    block: list[PhysicalLine], cap: int
+) -> list[PhysicalLine]:
+    selected: list[PhysicalLine] = []
+    measured = 0
+    for line in block:
+        addition = len(line.raw) + (1 if selected else 0)
+        if measured + addition > cap:
+            break
+        measured += addition
+        selected.append(line)
+    return selected
+
+
+def _event_issue(
+    code: RuntimeIssueCode,
+    sequence: int,
+    source_line: int | None,
+) -> IssueDraft:
+    return IssueDraft(
+        code=code, event_sequence=sequence, source_line=source_line
+    )
+
+
+def _build_event(
+    sequence: int,
+    source_line: int,
+    message: str | None,
+    frames: tuple[FrameDraft, ...],
+    text_truncated: bool,
+    frames_truncated: bool,
+) -> EventDraft:
+    return EventDraft(
+        sequence=sequence,
+        source_line=source_line,
+        kind=RuntimeEventKind.ERROR,
+        timestamp_text=None,
+        level=None,
+        message=message,
+        logger=None,
+        operation=None,
+        trace_id=None,
+        span_id=None,
+        parent_span_id=None,
+        duration_ms_text=None,
+        status=None,
+        error_type=None,
+        error_message=None,
+        tags=(),
+        frames=frames,
+        text_truncated=text_truncated,
+        frames_truncated=frames_truncated,
+    )
+
+
+def parse_stack_trace_text(
+    content: bytes,
+    config: RuntimeEvidenceConfig,
+    declared_language: RuntimeFrameLanguage | None,
+    max_new_events: int,
+) -> ArtifactParseResult:
+    """Parse one STACK_TRACE_TEXT artifact into events and issues."""
+    if declared_language not in _KNOWN_LANGUAGES:
+        raise RuntimeEvidenceValidationError(
+            "stack trace text requires a known declared language"
+        )
+
+    lines = split_physical_lines(content)
+    blocks = _blocks(lines)
+    if not blocks:
+        return ArtifactParseResult(
+            events=(),
+            issues=(),
+            text_truncated=False,
+            frames_truncated=False,
+            empty_input=True,
+            event_limit_hit=False,
+        )
+
+    events: list[EventDraft] = []
+    issues: list[IssueDraft] = []
+    text_truncated = False
+    frames_truncated = False
+    event_limit_hit = False
+
+    for block in blocks:
+        if len(events) >= max_new_events:
+            event_limit_hit = True
+            break
+        sequence = len(events)
+        source_line = block[0].number
+        over_cap = _block_bytes(block) > config.max_stack_bytes
+        selected = (
+            _prefix_within(block, config.max_stack_bytes)
+            if over_cap
+            else block
+        )
+
+        usable_lines: list[str] = []
+        block_issues: list[IssueDraft] = []
+        for line in selected:
+            decoded = decode_physical_line(line, config.max_line_bytes)
+            if decoded.issue is not None:
+                block_issues.append(
+                    IssueDraft(
+                        code=decoded.issue,
+                        event_sequence=None,
+                        source_line=line.number,
+                    )
+                )
+            else:
+                usable_lines.append(decoded.text)
+
+        if not over_cap and not usable_lines:
+            issues.extend(block_issues)
+            continue
+
+        parsed = parse_stack_source(
+            "\n".join(usable_lines),
+            declared_language,
+            max_frames=config.max_frames_per_event,
+            max_function_bytes=config.max_frame_function_bytes,
+        )
+        if parsed.message is None:
+            message = None
+            message_truncated = False
+        else:
+            message, message_truncated = truncate_utf8_text(
+                parsed.message, config.max_message_bytes
+            )
+
+        event_text_truncated = (
+            message_truncated or parsed.function_truncated or over_cap
+        )
+        event_frames_truncated = parsed.frame_limit_hit or over_cap
+
+        issues.extend(block_issues)
+        if over_cap:
+            issues.append(
+                _event_issue(
+                    RuntimeIssueCode.STACK_TOO_LARGE,
+                    sequence,
+                    source_line,
+                )
+            )
+        elif parsed.recognized_frame_count == 0:
+            issues.append(
+                _event_issue(
+                    RuntimeIssueCode.STACK_UNPARSEABLE,
+                    sequence,
+                    source_line,
+                )
+            )
+        if parsed.frame_limit_hit:
+            issues.append(
+                _event_issue(
+                    RuntimeIssueCode.FRAME_LIMIT_REACHED,
+                    sequence,
+                    source_line,
+                )
+            )
+        if event_text_truncated:
+            issues.append(
+                _event_issue(
+                    RuntimeIssueCode.TEXT_TRUNCATED,
+                    sequence,
+                    source_line,
+                )
+            )
+
+        events.append(
+            _build_event(
+                sequence,
+                source_line,
+                message,
+                parsed.frames,
+                event_text_truncated,
+                event_frames_truncated,
+            )
+        )
+        text_truncated = text_truncated or event_text_truncated
+        frames_truncated = frames_truncated or event_frames_truncated
+
+    return ArtifactParseResult(
+        events=tuple(events),
+        issues=tuple(issues),
+        text_truncated=text_truncated,
+        frames_truncated=frames_truncated,
+        empty_input=False,
+        event_limit_hit=event_limit_hit,
     )
