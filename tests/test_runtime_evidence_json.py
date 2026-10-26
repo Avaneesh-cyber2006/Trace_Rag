@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.runtime_evidence import json_scanner
+from backend.runtime_evidence import json_adapter, json_scanner
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.json_adapter import (
     NormalizedEvent,
@@ -808,6 +808,33 @@ def test_stack_without_recognized_frame_or_with_nul_or_surrogate_is_unparseable(
     assert result.draft.text_truncated is False
     assert [i.code for i in result.issues] == [
         RuntimeIssueCode.STACK_UNPARSEABLE]
+
+
+def test_over_cap_unpaired_surrogate_stack_is_unparseable_not_truncated():
+    stack = "\ud800" * 200
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is not None
+    assert result.draft.frames == ()
+    assert result.draft.frames_truncated is False
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_UNPARSEABLE]
+
+
+def test_json_adapter_does_not_use_surrogatepass():
+    source = Path(json_adapter.__file__).read_text(encoding="utf-8")
+    assert "surrogatepass" not in source
+
+
+def test_stack_type_is_validated_even_when_frames_are_present():
+    result = _norm({"kind": "error",
+                    "error": {"frames": [], "stack": 42}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is None
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.INVALID_EVENT_SCHEMA]
 
 
 def test_stack_function_truncation_sets_text_flag():

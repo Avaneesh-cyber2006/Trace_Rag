@@ -335,10 +335,15 @@ def _parsed_stack(
         )
     normalized = _normalize_scalars(stack_text)
     if normalized is None:
-        stack_bytes = len(stack_text.encode("utf-8", "surrogatepass"))
-    else:
-        stack_bytes = utf8_size(normalized)
-    if stack_bytes > config.max_stack_bytes:
+        return (
+            (),
+            False,
+            False,
+            False,
+            RuntimeIssueCode.STACK_UNPARSEABLE,
+            0,
+        )
+    if utf8_size(normalized) > config.max_stack_bytes:
         return (
             (),
             True,
@@ -347,7 +352,7 @@ def _parsed_stack(
             RuntimeIssueCode.STACK_TOO_LARGE,
             0,
         )
-    if normalized is None or "\x00" in normalized:
+    if "\x00" in normalized:
         return (
             (),
             False,
