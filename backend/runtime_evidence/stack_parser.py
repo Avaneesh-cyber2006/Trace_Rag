@@ -40,15 +40,6 @@ _V8_LANGUAGES = frozenset(
         RuntimeFrameLanguage.TSX,
     )
 )
-_KNOWN_LANGUAGES = frozenset(
-    (
-        RuntimeFrameLanguage.PYTHON,
-        RuntimeFrameLanguage.JAVA,
-        RuntimeFrameLanguage.JAVASCRIPT,
-        RuntimeFrameLanguage.TYPESCRIPT,
-        RuntimeFrameLanguage.TSX,
-    )
-)
 _BLANK_CHARACTERS = frozenset(" \t")
 _MAX_POSITION_DIGITS = 19
 
@@ -506,7 +497,10 @@ def parse_stack_trace_text(
     max_new_events: int,
 ) -> ArtifactParseResult:
     """Parse one STACK_TRACE_TEXT artifact into events and issues."""
-    if declared_language not in _KNOWN_LANGUAGES:
+    if (
+        type(declared_language) is not RuntimeFrameLanguage
+        or declared_language is RuntimeFrameLanguage.UNKNOWN
+    ):
         raise RuntimeEvidenceValidationError(
             "stack trace text requires a known declared language"
         )

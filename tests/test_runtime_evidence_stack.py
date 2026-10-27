@@ -824,6 +824,23 @@ def test_stack_trace_text_requires_known_declared_language(language):
         parse_stack_trace_text(b"", _config(), language, 10)
 
 
+@pytest.mark.parametrize("language", ["python", "javascript", []])
+def test_stack_trace_text_requires_exact_known_language_enum(language):
+    result = None
+    with pytest.raises(
+        RuntimeEvidenceValidationError,
+        match="^stack trace text requires a known declared language$",
+    ):
+        result = parse_stack_trace_text(
+            b'  File "a.py", line 1, in f\n'
+            b"    at run (src/app.js:1:2)\n",
+            _config(),
+            language,
+            10,
+        )
+    assert result is None
+
+
 def test_one_block_is_one_error_event_with_source_line():
     content = (
         b"Traceback (most recent call last):\n"
