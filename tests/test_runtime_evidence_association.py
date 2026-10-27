@@ -208,3 +208,517 @@ def test_file_and_webpack_forms_reclassify_without_forced_relative():
     relative = normalize_source_reference("webpack:///./src/app.js", 1024)
     assert (relative.kind, relative.relative_path) == (
         SourceReferenceKind.RELATIVE, "src/app.js")
+
+
+# ---------------------------------------------------------------------------
+# Task 14: graph validation and association lookup index
+# ---------------------------------------------------------------------------
+
+from types import MappingProxyType, SimpleNamespace
+
+import backend.runtime_evidence.association as association
+from backend.code_graph import CodeGraphInventory, GraphNode, GraphNodeKind
+from backend.runtime_evidence.association import build_association_index
+from backend.runtime_evidence.exceptions import RuntimeEvidenceGraphError
+
+
+def _loc(start_line=1, end_line=1, start_column=0, end_column=0):
+    return SimpleNamespace(
+        start_byte=0, end_byte=10, start_line=start_line,
+        start_column=start_column, end_line=end_line, end_column=end_column)
+
+
+def _node(node_id, kind, path, *, namespace="repo", location=None):
+    return GraphNode(
+        node_id=node_id, node_kind=kind, repository_namespace=namespace,
+        relative_path=path, language="python", parse_status="success",
+        symbol_kind=None, name=None, qualified_name=None, location=location)
+
+
+def _graph(nodes, *, namespace="repo"):
+    return CodeGraphInventory(
+        namespace, tuple(nodes), (), (),
+        MappingProxyType({}), MappingProxyType({}),
+        MappingProxyType({}), MappingProxyType({}))
+
+
+def _loc_fields(**overrides):
+    values = {
+        "start_byte": 0,
+        "end_byte": 10,
+        "start_line": 1,
+        "start_column": 0,
+        "end_line": 1,
+        "end_column": 0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _build(nodes, *, namespace="repo", max_namespace_bytes=256):
+    return build_association_index(
+        _graph(nodes, namespace=namespace),
+        repository_namespace=namespace,
+        max_namespace_bytes=max_namespace_bytes,
+    )
+
+
+def _file_node(node_id="file-main", path="pkg/main.py"):
+    return _node(node_id, GraphNodeKind.FILE, path)
+
+
+def _symbol_node(node_id, path="pkg/main.py", **location):
+    return _node(
+        node_id, GraphNodeKind.SYMBOL, path, location=_loc_fields(**location)
+    )
+
+
+def test_indexes_exact_file_and_symbol_buckets():
+    graph = _graph([
+        _node("file-main", GraphNodeKind.FILE, "pkg/main.py"),
+        _node("sym-b", GraphNodeKind.SYMBOL, "pkg/main.py",
+              location=_loc(8, 20, 0, 0)),
+        _node("sym-a", GraphNodeKind.SYMBOL, "pkg/main.py",
+              location=_loc(1, 7, 0, 0)),
+    ])
+    index = build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+    assert index.files_by_path["pkg/main.py"].node_id == "file-main"
+    assert [f.node_id for f in index.files_by_basename["main.py"]] == ["file-main"]
+    assert [(s.node_id, s.start_line, s.last_covered_line)
+            for s in index.symbols_by_file["pkg/main.py"]] == [
+        ("sym-a", 1, 6), ("sym-b", 8, 19)]
+
+
+def test_namespace_multibyte_at_limit_and_mismatch():
+    namespace = "é" * 128
+    graph = _graph([], namespace=namespace)
+    assert build_association_index(
+        graph, repository_namespace=namespace, max_namespace_bytes=256)
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace=namespace + "a",
+                                max_namespace_bytes=256)
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace=namespace,
+                                max_namespace_bytes=255)
+
+
+def test_graph_failures_are_fixed_and_content_free():
+    sentinel = "SENTINEL-PATH"
+    graph = _graph([_node("f", GraphNodeKind.FILE, "../" + sentinel)])
+    with pytest.raises(RuntimeEvidenceGraphError) as caught:
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+    assert sentinel not in str(caught.value)
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(object(), repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_graph_paths_reject_c0_tab_and_surrogates():
+    for path in ("a\x01b", "a\tb", "a\ud800b"):
+        graph = _graph([_node("f", GraphNodeKind.FILE, path)])
+        with pytest.raises(RuntimeEvidenceGraphError):
+            build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+
+
+def test_none_graph_returns_none_immediately():
+    assert build_association_index(
+        None, repository_namespace="repo", max_namespace_bytes=256) is None
+
+
+def test_empty_graph_produces_empty_immutable_index():
+    index = _build([])
+    assert isinstance(index, association.AssociationIndex)
+    assert dict(index.files_by_path) == {}
+    assert dict(index.files_by_basename) == {}
+    assert dict(index.symbols_by_file) == {}
+    assert isinstance(index.files_by_path, MappingProxyType)
+    assert isinstance(index.files_by_basename, MappingProxyType)
+    assert isinstance(index.symbols_by_file, MappingProxyType)
+
+
+def test_duplicate_node_ids_are_rejected():
+    graph = _graph([
+        _node("same", GraphNodeKind.FILE, "a.py"),
+        _node("same", GraphNodeKind.FILE, "b.py"),
+    ])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("node_id", ["", "a\ud800b", "a\x00b", None, 7, True])
+def test_node_ids_must_be_nonempty_scalar_strings(node_id):
+    graph = _graph([_node(node_id, GraphNodeKind.FILE, "a.py")])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_node_namespace_must_equal_request_namespace():
+    graph = _graph(
+        [_node("f", GraphNodeKind.FILE, "a.py", namespace="other")],
+        namespace="repo",
+    )
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("namespace", [None, "", "a\ud800b", "a\x00b", True, 7])
+def test_node_namespace_must_be_nonempty_scalar_text(namespace):
+    graph = _graph([_node("f", GraphNodeKind.FILE, "a.py",
+                          namespace=namespace)])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_duplicate_file_paths_are_rejected():
+    graph = _graph([
+        _node("file-a", GraphNodeKind.FILE, "pkg/main.py"),
+        _node("file-b", GraphNodeKind.FILE, "pkg/main.py"),
+    ])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_file_node_must_not_have_a_location():
+    graph = _graph([
+        _node("file-main", GraphNodeKind.FILE, "pkg/main.py",
+              location=_loc()),
+    ])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_symbol_location_must_be_structurally_complete():
+    missing_column = SimpleNamespace(
+        start_byte=0, end_byte=10, start_line=1, start_column=0,
+        end_line=1)
+    for location in (None, missing_column, object()):
+        graph = _graph([
+            _file_node(),
+            _node("sym", GraphNodeKind.SYMBOL, "pkg/main.py",
+                  location=location),
+        ])
+        with pytest.raises(RuntimeEvidenceGraphError):
+            build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+
+
+def test_symbol_path_must_have_exactly_one_file_node():
+    for nodes in (
+        [_symbol_node("sym", path="pkg/other.py")],
+        [
+            _file_node(path="pkg/other.py"),
+            _symbol_node("sym", path="pkg/main.py"),
+        ],
+    ):
+        graph = _graph(nodes)
+        with pytest.raises(RuntimeEvidenceGraphError):
+            build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"start_byte": True},
+    {"start_byte": "0"},
+    {"end_byte": 1.5},
+    {"start_byte": -1},
+    {"end_byte": -1},
+    {"start_line": True},
+    {"start_line": 0},
+    {"end_line": 0},
+    {"end_line": -3},
+    {"start_column": True},
+    {"start_column": -1},
+    {"end_column": -1},
+    {"start_byte": 11, "end_byte": 10},
+    {"start_line": 3, "end_line": 2, "start_column": 0, "end_column": 0},
+])
+def test_invalid_location_fields_are_rejected(overrides):
+    graph = _graph([_file_node(), _symbol_node("sym", **overrides)])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_same_line_start_column_must_not_exceed_end_column():
+    graph = _graph([
+        _file_node(),
+        _symbol_node("sym", start_line=2, end_line=2, start_column=4,
+                     end_column=3),
+    ])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+    accepted = _build([
+        _file_node(),
+        _symbol_node("sym", start_line=2, end_line=2, start_column=4,
+                     end_column=4),
+    ])
+    assert accepted.symbols_by_file["pkg/main.py"][0].last_covered_line == 2
+
+
+def test_different_line_columns_are_not_ordered():
+    index = _build([
+        _file_node(),
+        _symbol_node("sym", start_line=2, end_line=5, start_column=9,
+                     end_column=1),
+    ])
+    assert index.symbols_by_file["pkg/main.py"][0].last_covered_line == 5
+
+
+def test_zero_end_column_uses_the_previous_line_and_may_be_zero():
+    index = _build([
+        _file_node(),
+        _symbol_node("first", start_line=1, end_line=1, end_column=0),
+        _symbol_node("second", start_line=5, end_line=9, end_column=0),
+    ])
+    assert [(s.node_id, s.start_line, s.last_covered_line)
+            for s in index.symbols_by_file["pkg/main.py"]] == [
+        ("first", 1, 0), ("second", 5, 8)]
+
+
+def test_positive_end_column_keeps_the_end_line():
+    index = _build([
+        _file_node(),
+        _symbol_node("sym", start_line=4, end_line=9, end_column=3),
+    ])
+    assert index.symbols_by_file["pkg/main.py"][0].last_covered_line == 9
+
+
+def test_nodes_must_be_an_exact_tuple():
+    node = _file_node()
+    graph = object.__new__(CodeGraphInventory)
+    object.__setattr__(graph, "repository_namespace", "repo")
+    object.__setattr__(graph, "nodes", [node])
+    object.__setattr__(graph, "edges", ())
+    object.__setattr__(graph, "unresolved_references", ())
+    object.__setattr__(graph, "outgoing_edges", MappingProxyType({}))
+    object.__setattr__(graph, "incoming_edges", MappingProxyType({}))
+    object.__setattr__(graph, "nodes_by_file", MappingProxyType({}))
+    object.__setattr__(graph, "nodes_by_qualified_name", MappingProxyType({}))
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+    class _TupleSubclass(tuple):
+        pass
+
+    graph = _graph([])
+    object.__setattr__(graph, "nodes", _TupleSubclass((node,)))
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_nodes_must_be_exact_graph_node_instances():
+    class _NodeSubclass(GraphNode):
+        __slots__ = ()
+
+    node = _NodeSubclass(
+        node_id="file-main", node_kind=GraphNodeKind.FILE,
+        repository_namespace="repo", relative_path="pkg/main.py",
+        language="python", parse_status="success", symbol_kind=None,
+        name=None, qualified_name=None, location=None)
+    graph = _graph([node])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("kind", ["file", "symbol", None, 1])
+def test_node_kind_must_be_an_exact_graph_node_kind(kind):
+    location = _loc() if kind == "symbol" else None
+    graph = _graph([_node("node", kind, "pkg/main.py", location=location)])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("path", [
+    "",
+    "a\x00b",
+    "a\x01b",
+    "a\tb",
+    "a\ud800b",
+    "/abs.py",
+    "C:foo",
+    "C:/foo",
+    "a\\b.py",
+    "a//b",
+    "a/./b",
+    "a/../b",
+    "../a",
+    "a/",
+])
+def test_invalid_relative_paths_are_rejected(path):
+    graph = _graph([_node("f", GraphNodeKind.FILE, path)])
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_true_namespace_mismatch_is_rejected():
+    graph = _graph([], namespace="other")
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(graph, repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("namespace", [None, "", "a\ud800b", "a\x00b", True, 7])
+def test_request_namespace_must_be_nonempty_scalar_text(namespace):
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(_graph([], namespace="repo"),
+                                repository_namespace=namespace,
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("namespace", [None, "", "a\ud800b", True, 7])
+def test_graph_namespace_must_be_nonempty_scalar_text(namespace):
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(_graph([], namespace=namespace),
+                                repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+@pytest.mark.parametrize("limit", [-1, 0, True, "256", 1.5, None])
+def test_max_namespace_bytes_must_be_a_positive_exact_int(limit):
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(_graph([], namespace="repo"),
+                                repository_namespace="repo",
+                                max_namespace_bytes=limit)
+
+
+def test_request_namespace_one_byte_over_the_limit_is_rejected():
+    namespace = "é" * 128 + "a"
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(_graph([], namespace="repo"),
+                                repository_namespace=namespace,
+                                max_namespace_bytes=256)
+
+
+def test_graph_namespace_one_byte_over_the_limit_is_rejected():
+    namespace = "é" * 128 + "a"
+    with pytest.raises(RuntimeEvidenceGraphError):
+        build_association_index(_graph([], namespace=namespace),
+                                repository_namespace="repo",
+                                max_namespace_bytes=256)
+
+
+def test_mapping_keys_and_buckets_are_lexically_ordered():
+    index = _build([
+        _node("z-file", GraphNodeKind.FILE, "z/main.py"),
+        _node("a-file", GraphNodeKind.FILE, "a/main.py"),
+        _node("m-file", GraphNodeKind.FILE, "pkg/m.py"),
+        _node("z-sym", GraphNodeKind.SYMBOL, "pkg/m.py",
+              location=_loc_fields(start_line=4, end_line=4)),
+        _node("a-sym", GraphNodeKind.SYMBOL, "pkg/m.py",
+              location=_loc_fields(start_line=2, end_line=2)),
+        _node("main-sym", GraphNodeKind.SYMBOL, "z/main.py",
+              location=_loc_fields(start_line=2, end_line=2)),
+    ])
+    assert list(index.files_by_path) == [
+        "a/main.py", "pkg/m.py", "z/main.py"]
+    assert list(index.files_by_basename) == ["m.py", "main.py"]
+    assert [entry.node_id
+            for entry in index.files_by_basename["main.py"]] == [
+        "a-file", "z-file"]
+    assert list(index.symbols_by_file) == ["pkg/m.py", "z/main.py"]
+
+
+def test_symbol_buckets_sort_by_start_last_covered_and_node_id():
+    index = _build([
+        _file_node(),
+        _symbol_node("sym-c", start_line=1, end_line=5),
+        _symbol_node("sym-b", start_line=1, end_line=3),
+        _symbol_node("sym-a", start_line=1, end_line=3),
+    ])
+    assert [symbol.node_id
+            for symbol in index.symbols_by_file["pkg/main.py"]] == [
+        "sym-a", "sym-b", "sym-c"]
+
+
+def test_index_is_frozen_and_uses_immutable_snapshots():
+    index = _build([_file_node(), _symbol_node("sym")])
+    assert not hasattr(index, "__dict__")
+    assert type(index.files_by_basename["main.py"]) is tuple
+    assert type(index.symbols_by_file["pkg/main.py"]) is tuple
+    with pytest.raises(TypeError):
+        index.files_by_path["other.py"] = None
+    with pytest.raises(TypeError):
+        index.files_by_basename["main.py"] = ()
+    with pytest.raises(TypeError):
+        index.symbols_by_file["pkg/main.py"] = ()
+    with pytest.raises(FrozenInstanceError):
+        index.files_by_path = MappingProxyType({})
+
+
+def test_index_retains_no_graph_reference_or_graph_records():
+    graph = _graph([_file_node(), _symbol_node("sym")])
+    index = build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+    assert not hasattr(index, "__dict__")
+    files = list(index.files_by_path.values())
+    for bucket in index.files_by_basename.values():
+        files.extend(bucket)
+    symbols = []
+    for bucket in index.symbols_by_file.values():
+        symbols.extend(bucket)
+    assert all(type(entry) is association.GraphFileEntry for entry in files)
+    assert all(
+        type(symbol) is association.GraphSymbolEntry for symbol in symbols)
+    assert not any(
+        type(value) in (CodeGraphInventory, GraphNode)
+        for value in files + symbols)
+
+
+def test_building_an_index_reads_no_source_files(monkeypatch):
+    def _deny(*args, **kwargs):
+        raise AssertionError("filesystem access is not allowed")
+
+    monkeypatch.setattr("builtins.open", _deny)
+    index = _build([
+        _file_node(),
+        _symbol_node("sym", start_line=2, end_line=3, end_column=1),
+    ])
+    assert index.files_by_path["pkg/main.py"].node_id == "file-main"
+    assert index.symbols_by_file["pkg/main.py"][0].node_id == "sym"
+
+
+def test_bypassed_inventory_ignores_edges_and_public_mappings():
+    graph = object.__new__(CodeGraphInventory)
+    object.__setattr__(graph, "repository_namespace", "repo")
+    object.__setattr__(
+        graph, "nodes", (_node("file-main", GraphNodeKind.FILE,
+                               "pkg/main.py"),))
+    object.__setattr__(graph, "edges", ("not-an-edge",))
+    object.__setattr__(graph, "unresolved_references", (object(),))
+    object.__setattr__(
+        graph, "outgoing_edges", MappingProxyType({"bad": ("bad",)}))
+    object.__setattr__(
+        graph, "incoming_edges", MappingProxyType({"bad": ("bad",)}))
+    object.__setattr__(
+        graph, "nodes_by_file", MappingProxyType({"bad": ("bad",)}))
+    object.__setattr__(
+        graph, "nodes_by_qualified_name", MappingProxyType({"bad": ("bad",)}))
+    index = build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+    assert index.files_by_path["pkg/main.py"].node_id == "file-main"
+
+
+def test_bypassed_inventory_with_absent_unused_fields_is_accepted():
+    graph = object.__new__(CodeGraphInventory)
+    object.__setattr__(graph, "repository_namespace", "repo")
+    object.__setattr__(
+        graph, "nodes", (_node("file-main", GraphNodeKind.FILE,
+                               "pkg/main.py"),))
+    index = build_association_index(graph, repository_namespace="repo",
+                                    max_namespace_bytes=256)
+    assert index.files_by_path["pkg/main.py"].node_id == "file-main"
