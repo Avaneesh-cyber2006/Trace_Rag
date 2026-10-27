@@ -722,3 +722,418 @@ def test_bypassed_inventory_with_absent_unused_fields_is_accepted():
     index = build_association_index(graph, repository_namespace="repo",
                                     max_namespace_bytes=256)
     assert index.files_by_path["pkg/main.py"].node_id == "file-main"
+
+
+# ---------------------------------------------------------------------------
+# Task 15: frame source matching and line association
+# ---------------------------------------------------------------------------
+
+from backend.runtime_evidence.association import (
+    AssociationIndex, AssociationResult, GraphFileEntry, GraphSymbolEntry,
+    associate_frames, match_symbols_by_line,
+)
+from backend.runtime_evidence.drafts import FrameDraft, IssueDraft
+from backend.runtime_evidence.identities import frame_id, source_reference_sha256
+from backend.runtime_evidence.models import (
+    FrameAssociation, PathMatchBasis, RuntimeFrameLanguage, RuntimeIssueCode,
+)
+
+
+def _draft(source=None, line=None, column=None, function="f"):
+    return FrameDraft(RuntimeFrameLanguage.PYTHON, function, source, line,
+                      column)
+
+
+def _assoc(drafts, graph_index, *, namespace="repo", sequence=0,
+           source_line=1, config=None):
+    from backend.runtime_evidence.config import RuntimeEvidenceConfig
+    return associate_frames(
+        tuple(drafts), event_id="e" * 64, event_sequence=sequence,
+        source_line=source_line, repository_namespace=namespace,
+        config=config or RuntimeEvidenceConfig(), graph_index=graph_index)
+
+
+def _index(files, symbols=()):
+    by_path = {f.relative_path: f for f in files}
+    by_base = {}
+    for f in files:
+        by_base.setdefault(f.components[-1], []).append(f)
+    by_file = {}
+    for s in symbols:
+        by_file.setdefault(s[0], []).append(s[2])
+    return AssociationIndex(
+        MappingProxyType(by_path),
+        MappingProxyType({k: tuple(v) for k, v in by_base.items()}),
+        MappingProxyType({k: tuple(v) for k, v in by_file.items()}))
+
+
+def _file(node_id, path):
+    return GraphFileEntry(node_id, path, tuple(path.split("/")))
+
+
+def test_no_graph_relative_candidate_is_unverified_and_has_hash():
+    result = _assoc([_draft("pkg/app.py", 10)], None)
+    frame = result.frames[0]
+    assert frame.path_match_basis is PathMatchBasis.UNVERIFIED_RELATIVE_PATH
+    assert frame.association is FrameAssociation.NOT_EVALUATED
+    assert frame.relative_path == "pkg/app.py"
+    assert frame.source_reference_sha256
+    assert frame.candidate_node_ids == ()
+
+
+def test_exact_file_and_symbol_association_and_line_sweep():
+    file = GraphFileEntry("file", "pkg/app.py", ("pkg", "app.py"))
+    one = GraphSymbolEntry("sym", 10, 20)
+    index = _index([file], [(file.relative_path, file, one)])
+    result = _assoc([_draft("pkg/app.py", 15)], index)
+    frame = result.frames[0]
+    assert frame.association is FrameAssociation.SYMBOL
+    assert frame.primary_node_id == "sym"
+    assert frame.candidate_node_ids == ("file", "sym")
+    file_only = _assoc([_draft("pkg/app.py", 21)], index).frames[0]
+    assert file_only.association is FrameAssociation.FILE
+    assert file_only.primary_node_id == "file"
+    assert file_only.candidate_node_ids == ("file",)
+
+
+def test_exclusive_end_line_and_ambiguous_symbols():
+    file = GraphFileEntry("file", "pkg/app.py", ("pkg", "app.py"))
+    a = GraphSymbolEntry("a", 10, 19)  # end_line 20, end_column 0
+    b = GraphSymbolEntry("b", 15, 20)
+    index = _index([file], [(file.relative_path, file, a),
+                            (file.relative_path, file, b)])
+    at_19 = _assoc([_draft("pkg/app.py", 19)], index).frames[0]
+    assert at_19.association is FrameAssociation.AMBIGUOUS_SYMBOL
+    assert at_19.primary_node_id is None
+    assert at_19.candidate_node_ids == ("a", "b", "file")
+    at_20 = _assoc([_draft("pkg/app.py", 20)], index).frames[0]
+    assert at_20.association is FrameAssociation.SYMBOL
+    assert at_20.primary_node_id == "b"
+
+
+def test_relative_retention_and_resolved_absolute_and_basename_paths():
+    file = GraphFileEntry("file", "pkg/app.py", ("pkg", "app.py"))
+    index = _index([file])
+
+    unmatched = _assoc([_draft("other/app.py", 1)], index).frames[0]
+    assert unmatched.path_match_basis is PathMatchBasis.UNMATCHED
+    assert unmatched.relative_path == "other/app.py"
+    assert unmatched.source_reference_sha256
+    assert unmatched.association is FrameAssociation.UNASSOCIATED
+
+    absolute = _assoc([_draft("/repo/pkg/app.py", 1)], index).frames[0]
+    assert absolute.path_match_basis is PathMatchBasis.UNIQUE_PATH_SUFFIX
+    assert absolute.relative_path == "pkg/app.py"
+    assert absolute.association is FrameAssociation.FILE
+
+    basename = _assoc([_draft("app.py", 1)], index).frames[0]
+    assert basename.path_match_basis is PathMatchBasis.UNIQUE_BASENAME
+    assert basename.relative_path == "pkg/app.py"
+    assert basename.association is FrameAssociation.FILE
+
+    ambiguous_index = _index([
+        GraphFileEntry("file-a", "one/src/app.py", ("one", "src", "app.py")),
+        GraphFileEntry("file-b", "two/src/app.py", ("two", "src", "app.py")),
+    ])
+    ambiguous = _assoc([_draft("src/app.py", 1)], ambiguous_index).frames[0]
+    assert ambiguous.path_match_basis is PathMatchBasis.AMBIGUOUS
+    assert ambiguous.relative_path == "src/app.py"
+    assert ambiguous.source_reference_sha256
+    assert ambiguous.association is FrameAssociation.UNASSOCIATED
+    assert ambiguous.candidate_node_ids == ()
+
+
+def test_match_symbols_by_line_boundaries_and_repeated_lines():
+    a = GraphSymbolEntry("a", 10, 20)
+    b = GraphSymbolEntry("b", 15, 15)
+    empty = GraphSymbolEntry("empty", 30, 29)
+    result = match_symbols_by_line((15, 10, 20, 25, 15, 10, 30),
+                                   (b, empty, a))
+    assert [tuple(s.node_id for s in group) for group in result] == [
+        ("a", "b"), ("a",), ("a",), (), ("a", "b"), ("a",), ()]
+    assert result[0] == result[4]
+    assert result[1] == result[5]
+    assert match_symbols_by_line((), (a,)) == ()
+    assert [tuple(s.node_id for s in group)
+            for group in match_symbols_by_line((9, 10, 21), (a,))] == [
+        (), ("a",), ()]
+
+
+def test_unique_and_ambiguous_relative_suffix_retention():
+    file = _file("file", "pkg/src/app.py")
+    unique = _assoc([_draft("src/app.py", 1)], _index([file])).frames[0]
+    assert unique.path_match_basis is PathMatchBasis.UNIQUE_PATH_SUFFIX
+    assert unique.relative_path == "pkg/src/app.py"
+    assert unique.source_reference_sha256 == source_reference_sha256(
+        "pkg/src/app.py")
+    assert unique.association is FrameAssociation.FILE
+    assert unique.primary_node_id == "file"
+    assert unique.candidate_node_ids == ("file",)
+
+    ambiguous_index = _index([
+        _file("one", "one/src/app.py"),
+        _file("two", "two/src/app.py")])
+    ambiguous = _assoc([_draft("src/app.py", 1)], ambiguous_index).frames[0]
+    assert ambiguous.path_match_basis is PathMatchBasis.AMBIGUOUS
+    assert ambiguous.relative_path == "src/app.py"
+    assert ambiguous.source_reference_sha256 == source_reference_sha256(
+        "src/app.py")
+    assert ambiguous.association is FrameAssociation.UNASSOCIATED
+    assert ambiguous.primary_node_id is None
+    assert ambiguous.candidate_node_ids == ()
+
+    unmatched = _assoc([_draft("other/app.py", 1)], _index([file])).frames[0]
+    assert unmatched.path_match_basis is PathMatchBasis.UNMATCHED
+    assert unmatched.relative_path == "other/app.py"
+    assert unmatched.source_reference_sha256 == source_reference_sha256(
+        "other/app.py")
+    assert unmatched.association is FrameAssociation.UNASSOCIATED
+
+
+def test_suffix_matching_is_component_wise_and_case_sensitive():
+    file = _file("file", "pkg/src/App.py")
+    index = _index([file])
+    for source in ("rc/App.py", "kg/src/App.py", "pkg/src/app.py"):
+        frame = _assoc([_draft(source, 1)], index).frames[0]
+        assert frame.path_match_basis is PathMatchBasis.UNMATCHED
+        assert frame.relative_path == source
+    exact = _assoc([_draft("pkg/src/App.py", 1)], index).frames[0]
+    assert exact.path_match_basis is PathMatchBasis.EXACT_RELATIVE_PATH
+    assert exact.relative_path == "pkg/src/App.py"
+
+
+def test_basename_unique_ambiguous_and_unmatched():
+    file = _file("file", "pkg/app.py")
+    unique = _assoc([_draft("app.py", 1)], _index([file])).frames[0]
+    assert unique.path_match_basis is PathMatchBasis.UNIQUE_BASENAME
+    assert unique.relative_path == "pkg/app.py"
+    assert unique.source_reference_sha256 == source_reference_sha256(
+        "pkg/app.py")
+    assert unique.association is FrameAssociation.FILE
+    assert unique.primary_node_id == "file"
+
+    ambiguous_index = _index([
+        _file("one", "one/app.py"), _file("two", "two/app.py")])
+    ambiguous = _assoc([_draft("app.py", 1)], ambiguous_index).frames[0]
+    assert ambiguous.path_match_basis is PathMatchBasis.AMBIGUOUS
+    assert ambiguous.relative_path is None
+    assert ambiguous.source_reference_sha256 is None
+    assert ambiguous.association is FrameAssociation.UNASSOCIATED
+    assert ambiguous.candidate_node_ids == ()
+
+    unmatched = _assoc([_draft("other.py", 1)], _index([file])).frames[0]
+    assert unmatched.path_match_basis is PathMatchBasis.UNMATCHED
+    assert unmatched.relative_path is None
+    assert unmatched.source_reference_sha256 is None
+    assert unmatched.association is FrameAssociation.UNASSOCIATED
+
+
+@pytest.mark.parametrize("source", [
+    "/repo/pkg/app.py",
+    r"C:\repo\pkg\app.py",
+    "file:///C:/repo/pkg/app.py",
+    "webpack://C:/repo/pkg/app.py",
+])
+def test_absolute_posix_drive_file_and_webpack_forms_resolve_by_suffix(source):
+    file = _file("file", "pkg/app.py")
+    frame = _assoc([_draft(source, 1)], _index([file])).frames[0]
+    assert frame.path_match_basis is PathMatchBasis.UNIQUE_PATH_SUFFIX
+    assert frame.relative_path == "pkg/app.py"
+    assert frame.association is FrameAssociation.FILE
+    assert "C:" not in repr(frame)
+    assert source not in repr(frame)
+
+
+def test_absolute_suffix_ambiguity_and_no_match_retain_no_path():
+    ambiguous_index = _index([
+        _file("root", "app.py"), _file("nested", "x/app.py")])
+    ambiguous = _assoc([_draft("/x/app.py", 1)],
+                       ambiguous_index).frames[0]
+    assert ambiguous.path_match_basis is PathMatchBasis.AMBIGUOUS
+    assert ambiguous.relative_path is None
+    assert ambiguous.source_reference_sha256 is None
+    assert ambiguous.association is FrameAssociation.UNASSOCIATED
+
+    unmatched = _assoc([_draft("/repo/other.py", 1)],
+                       _index([_file("file", "pkg/app.py")])).frames[0]
+    assert unmatched.path_match_basis is PathMatchBasis.UNMATCHED
+    assert unmatched.relative_path is None
+    assert unmatched.source_reference_sha256 is None
+    assert unmatched.association is FrameAssociation.UNASSOCIATED
+
+
+def test_external_invalid_and_missing_sources_retain_no_path():
+    index = _index([_file("file", "pkg/app.py")])
+    external = _assoc([_draft("https://example/app.py", 1)],
+                      index).frames[0]
+    assert external.path_match_basis is PathMatchBasis.EXTERNAL_OR_NON_FILE
+    assert external.relative_path is None
+    assert external.source_reference_sha256 is None
+    assert external.association is FrameAssociation.UNASSOCIATED
+
+    unc = _assoc([_draft("//server/share/app.py", 1)], None).frames[0]
+    assert unc.path_match_basis is PathMatchBasis.EXTERNAL_OR_NON_FILE
+    assert unc.relative_path is None
+    assert unc.association is FrameAssociation.NOT_EVALUATED
+
+    missing = _assoc([_draft(None, 1)], index)
+    assert missing.frames[0].path_match_basis is PathMatchBasis.UNMATCHED
+    assert missing.frames[0].relative_path is None
+    assert missing.frames[0].association is FrameAssociation.UNASSOCIATED
+    assert missing.issues == ()
+
+    invalid = _assoc([_draft("a\x00b", 1)], index, sequence=4,
+                     source_line=8)
+    frame = invalid.frames[0]
+    assert frame.path_match_basis is PathMatchBasis.UNMATCHED
+    assert frame.relative_path is None
+    assert frame.association is FrameAssociation.UNASSOCIATED
+    assert len(invalid.issues) == 1
+    assert type(invalid.issues[0]) is IssueDraft
+    assert invalid.issues[0].code is RuntimeIssueCode.INVALID_SOURCE_LOCATION
+    assert invalid.issues[0].event_sequence == 4
+    assert invalid.issues[0].source_line == 8
+
+
+@pytest.mark.parametrize("line, column", [
+    (0, None),
+    (-3, None),
+    (True, None),
+    ("4", None),
+    (None, -1),
+    (None, True),
+])
+def test_invalid_line_or_column_becomes_none_with_one_issue(line, column):
+    index = _index([_file("file", "pkg/app.py")])
+    result = _assoc([_draft("pkg/app.py", line, column)], index,
+                    sequence=3, source_line=99)
+    frame = result.frames[0]
+    assert frame.line is None
+    assert frame.column is None
+    assert frame.association is FrameAssociation.FILE
+    assert frame.primary_node_id == "file"
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert issue.code is RuntimeIssueCode.INVALID_SOURCE_LOCATION
+    assert issue.event_sequence == 3
+    assert issue.source_line == 99
+
+
+def test_invalid_column_is_dropped_but_the_valid_line_still_associates():
+    file = _file("file", "pkg/app.py")
+    symbol = GraphSymbolEntry("sym", 1, 5)
+    index = _index([file], [(file.relative_path, file, symbol)])
+    result = _assoc([_draft("pkg/app.py", 3, -1)], index, sequence=2,
+                    source_line=17)
+    frame = result.frames[0]
+    assert frame.line == 3
+    assert frame.column is None
+    assert frame.association is FrameAssociation.SYMBOL
+    assert frame.primary_node_id == "sym"
+    assert len(result.issues) == 1
+    assert result.issues[0].source_line == 17
+
+
+def test_invalid_source_and_location_emit_only_one_issue():
+    index = _index([_file("file", "pkg/app.py")])
+    result = _assoc([_draft("a\x00b", 0, -1)], index, sequence=2,
+                    source_line=5)
+    frame = result.frames[0]
+    assert frame.path_match_basis is PathMatchBasis.UNMATCHED
+    assert frame.relative_path is None
+    assert frame.line is None
+    assert frame.column is None
+    assert frame.association is FrameAssociation.UNASSOCIATED
+    assert len(result.issues) == 1
+    assert result.issues[0].code is RuntimeIssueCode.INVALID_SOURCE_LOCATION
+
+
+def test_columns_are_retained_and_never_used_for_association():
+    file = _file("file", "pkg/app.py")
+    symbol = GraphSymbolEntry("sym", 1, 5)
+    index = _index([file], [(file.relative_path, file, symbol)])
+    for column in (0, 1, 4, 999):
+        frame = _assoc([_draft("pkg/app.py", 3, column)],
+                       index).frames[0]
+        assert frame.column == column
+        assert frame.association is FrameAssociation.SYMBOL
+        assert frame.primary_node_id == "sym"
+
+
+def test_candidate_ids_are_sorted_when_the_file_sorts_after_the_symbol():
+    file = _file("z-file", "pkg/app.py")
+    symbol = GraphSymbolEntry("a-sym", 1, 10)
+    index = _index([file], [(file.relative_path, file, symbol)])
+    frame = _assoc([_draft("pkg/app.py", 5)], index).frames[0]
+    assert frame.association is FrameAssociation.SYMBOL
+    assert frame.primary_node_id == "a-sym"
+    assert frame.candidate_node_ids == ("a-sym", "z-file")
+    file_only = _assoc([_draft("pkg/app.py", 11)], index).frames[0]
+    assert file_only.association is FrameAssociation.FILE
+    assert file_only.candidate_node_ids == ("z-file",)
+
+
+def test_source_hash_is_present_exactly_when_a_path_is_retained():
+    file = _file("file", "pkg/app.py")
+    index = _index([file])
+    ambiguous_relative = _index([
+        _file("a", "one/src/app.py"), _file("b", "two/src/app.py")])
+    ambiguous_absolute = _index([
+        _file("root", "app.py"), _file("nested", "x/app.py")])
+    frames = [
+        _assoc([_draft("pkg/app.py", 1)], None).frames[0],
+        _assoc([_draft("other/app.py", 1)], index).frames[0],
+        _assoc([_draft("src/app.py", 1)], ambiguous_relative).frames[0],
+        _assoc([_draft("pkg/app.py", 1)], index).frames[0],
+        _assoc([_draft("app.py", 1)], index).frames[0],
+        _assoc([_draft("app.py", 1)],
+               _index([_file("a", "one/app.py"),
+                       _file("b", "two/app.py")])).frames[0],
+        _assoc([_draft("other.py", 1)], index).frames[0],
+        _assoc([_draft("/x/app.py", 1)], ambiguous_absolute).frames[0],
+        _assoc([_draft("/other/x.py", 1)], index).frames[0],
+        _assoc([_draft("https://example/a.py", 1)], index).frames[0],
+        _assoc([_draft(None, 1)], index).frames[0],
+        _assoc([_draft("", 1)], index).frames[0],
+    ]
+    for frame in frames:
+        assert (frame.relative_path is not None) == (
+            frame.source_reference_sha256 is not None)
+        if frame.relative_path is not None:
+            assert frame.source_reference_sha256 == (
+                source_reference_sha256(frame.relative_path))
+
+
+def test_no_graph_absolute_and_basename_are_unmatched_without_path():
+    for source in ("/repo/pkg/app.py", r"C:\repo\pkg\app.py", "app.py"):
+        frame = _assoc([_draft(source, 1)], None).frames[0]
+        assert frame.path_match_basis is PathMatchBasis.UNMATCHED
+        assert frame.relative_path is None
+        assert frame.source_reference_sha256 is None
+        assert frame.association is FrameAssociation.NOT_EVALUATED
+        assert frame.candidate_node_ids == ()
+
+
+def test_graph_file_only_unknown_path_and_outside_line():
+    file = _file("file", "pkg/app.py")
+    symbol = GraphSymbolEntry("sym", 1, 10)
+    index = _index([file], [(file.relative_path, file, symbol)])
+    no_line = _assoc([_draft("pkg/app.py")], index).frames[0]
+    assert no_line.association is FrameAssociation.FILE
+    assert no_line.primary_node_id == "file"
+    assert no_line.candidate_node_ids == ("file",)
+    outside = _assoc([_draft("pkg/app.py", 11)], index).frames[0]
+    assert outside.association is FrameAssociation.FILE
+    unknown = _assoc([_draft("missing/app.py", 1)], index).frames[0]
+    assert unknown.association is FrameAssociation.UNASSOCIATED
+    assert unknown.primary_node_id is None
+    assert unknown.candidate_node_ids == ()
+
+
+def test_frame_ids_and_ordinals_are_occurrence_based():
+    result = _assoc([_draft("pkg/app.py", 1), _draft(None)], None)
+    assert type(result) is AssociationResult
+    assert [frame.ordinal for frame in result.frames] == [0, 1]
+    assert result.frames[0].frame_id == frame_id("repo", "e" * 64, 0)
+    assert result.frames[1].frame_id == frame_id("repo", "e" * 64, 1)
+    assert result.issues == ()
