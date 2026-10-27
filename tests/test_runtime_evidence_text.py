@@ -6,12 +6,15 @@ from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.drafts import (
     ArtifactParseResult, EventDraft, FrameDraft, IssueDraft,
 )
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
 from backend.runtime_evidence.lines import (
     LineDecodeResult, PhysicalLine, decode_physical_line,
     split_physical_lines,
 )
 from backend.runtime_evidence.models import (
-    RuntimeEventKind, RuntimeFrameLanguage, RuntimeIssueCode, RuntimeTag,
+    RuntimeArtifact, RuntimeArtifactFormat, RuntimeArtifactStatus,
+    RuntimeEventKind, RuntimeEvidenceRequest, RuntimeFrameLanguage,
+    RuntimeIssueCode, RuntimeTag,
 )
 from backend.runtime_evidence.text_adapter import parse_text_log
 
@@ -315,3 +318,80 @@ def test_draft_interfaces_are_exact_frozen_slotted_and_tuple_typed():
         issue.source_line = 2
     with pytest.raises(FrozenInstanceError):
         result.empty_input = True
+
+
+def _ingest_text(content, config=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("ci.log", RuntimeArtifactFormat.TEXT_LOG,
+                            content),
+        )))
+
+
+def test_pipeline_text_keeps_zero_based_sequences_and_one_based_lines():
+    inv = _ingest_text(b"one\n\ntwo\n")
+    assert [(event.sequence, event.source_line, event.message)
+            for event in inv.events] == [
+        (0, 1, "one"), (1, 3, "two")]
+    artifact = inv.artifacts[0]
+    assert artifact.status is RuntimeArtifactStatus.COMPLETE
+    assert artifact.event_count == 2
+    assert artifact.frame_count == 0
+    assert artifact.issue_count == 0
+    assert artifact.text_truncated is False
+    assert inv.total_events == 2
+    assert inv.frames == ()
+    assert inv.issues == ()
+    assert inv.ingestion_complete is True
+
+
+def test_pipeline_text_truncation_is_partial_with_one_issue():
+    inv = _ingest_text(
+        b"abcdef\n", RuntimeEvidenceConfig(
+            max_message_bytes=4, max_line_bytes=32))
+    assert len(inv.artifacts) == 1
+    assert len(inv.events) == 1
+    artifact = inv.artifacts[0]
+    assert artifact.status is RuntimeArtifactStatus.PARTIAL
+    assert artifact.text_truncated is True
+    assert artifact.frames_truncated is False
+    assert inv.text_truncated is True
+    assert inv.events[0].message == "a\u2026"
+    assert inv.events[0].text_truncated is True
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in inv.issues] == [
+        (RuntimeIssueCode.TEXT_TRUNCATED, 0, 1)]
+    assert artifact.issue_count == 1
+
+
+def test_pipeline_text_metadata_only_omits_messages_and_truncation():
+    content = b"ok\nthis message is too long\n"
+    config = RuntimeEvidenceConfig(max_message_bytes=8)
+    retained = _ingest_text(content, config)
+    metadata = _ingest_text(
+        content, RuntimeEvidenceConfig(
+            max_message_bytes=8, retain_event_text=False))
+
+    assert [event.message for event in retained.events] == [
+        "ok", "this \u2026"]
+    assert [event.message for event in metadata.events] == [None, None]
+    assert [event.event_id for event in metadata.events] == [
+        event.event_id for event in retained.events]
+    assert all(
+        metadata_event.event_fingerprint != retained_event.event_fingerprint
+        for metadata_event, retained_event in zip(
+            metadata.events, retained.events)
+    )
+    assert [event.text_truncated for event in retained.events] == [
+        False, True]
+    assert [event.text_truncated for event in metadata.events] == [
+        False, False]
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in retained.issues] == [
+        (RuntimeIssueCode.TEXT_TRUNCATED, 1, 2)]
+    assert metadata.issues == ()
+    assert metadata.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+    assert metadata.artifacts[0].issue_count == 0
+    assert metadata.artifacts[0].text_truncated is False
+    assert metadata.text_truncated is False
+    assert metadata.incomplete_reasons == ()

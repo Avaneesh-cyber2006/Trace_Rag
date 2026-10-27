@@ -7,6 +7,18 @@ from backend.runtime_evidence.source_references import (
     SourceReferenceKind,
     normalize_source_reference,
 )
+from backend.runtime_evidence.identities import source_reference_sha256
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
+from backend.runtime_evidence.models import (
+    FrameAssociation,
+    GraphBinding,
+    PathMatchBasis,
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeArtifactStatus,
+    RuntimeEvidenceRequest,
+    RuntimeFrameLanguage,
+)
 
 
 @pytest.mark.parametrize("source, kind, path, components", [
@@ -1137,3 +1149,67 @@ def test_frame_ids_and_ordinals_are_occurrence_based():
     assert result.frames[0].frame_id == frame_id("repo", "e" * 64, 0)
     assert result.frames[1].frame_id == frame_id("repo", "e" * 64, 1)
     assert result.issues == ()
+
+
+def test_pipeline_associates_exact_unmatched_and_ambiguous_paths():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "pkg/main.py", line 10, in run\n'
+        b'  File "pkg/x.py", line 5, in ambiguous\n'
+        b'  File "misc/other.py", line 7, in missing\n'
+        b"ValueError: boom\n"
+    )
+    graph = _graph((
+        _node("file-main", GraphNodeKind.FILE, "pkg/main.py"),
+        _node("sym-run", GraphNodeKind.SYMBOL, "pkg/main.py",
+              location=_loc(start_line=1, end_line=20)),
+        _node("file-x1", GraphNodeKind.FILE, "a/pkg/x.py"),
+        _node("file-x2", GraphNodeKind.FILE, "b/pkg/x.py"),
+    ))
+    inv = RuntimeEvidenceIngestor().ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("trace.stack",
+                            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            content, RuntimeFrameLanguage.PYTHON),
+        ),
+    ), graph)
+    assert inv.graph_binding is GraphBinding.NAMESPACE_MATCHED_UNVERSIONED
+    assert len(inv.artifacts) == 1
+    assert len(inv.events) == 1
+    artifact = inv.artifacts[0]
+    assert artifact.status is RuntimeArtifactStatus.COMPLETE
+    (event,) = inv.events
+    exact, ambiguous, unmatched = event.frames
+    assert (
+        exact.relative_path, exact.path_match_basis, exact.association,
+        exact.primary_node_id, exact.candidate_node_ids,
+    ) == (
+        "pkg/main.py", PathMatchBasis.EXACT_RELATIVE_PATH,
+        FrameAssociation.SYMBOL, "sym-run", ("file-main", "sym-run"),
+    )
+    assert (
+        ambiguous.relative_path, ambiguous.path_match_basis,
+        ambiguous.association, ambiguous.primary_node_id,
+        ambiguous.candidate_node_ids,
+    ) == (
+        "pkg/x.py", PathMatchBasis.AMBIGUOUS,
+        FrameAssociation.UNASSOCIATED, None, (),
+    )
+    assert (
+        unmatched.relative_path, unmatched.path_match_basis,
+        unmatched.association, unmatched.primary_node_id,
+        unmatched.candidate_node_ids,
+    ) == (
+        "misc/other.py", PathMatchBasis.UNMATCHED,
+        FrameAssociation.UNASSOCIATED, None, (),
+    )
+    for frame in event.frames:
+        assert frame.source_reference_sha256 == (
+            source_reference_sha256(frame.relative_path))
+    assert dict(inv.frames_by_file) == {
+        "pkg/main.py": (exact,),
+        "pkg/x.py": (ambiguous,),
+        "misc/other.py": (unmatched,),
+    }
+    assert dict(inv.frames_by_node) == {"sym-run": (exact,)}
+    assert inv.issues == ()

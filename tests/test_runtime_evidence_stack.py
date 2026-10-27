@@ -9,8 +9,18 @@ from backend.runtime_evidence import stack_parser
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.drafts import FrameDraft
 from backend.runtime_evidence.exceptions import RuntimeEvidenceValidationError
+from backend.runtime_evidence.identities import (
+    event_fingerprint, event_id, frame_id, source_reference_sha256,
+)
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
 from backend.runtime_evidence.models import (
+    FrameAssociation,
+    PathMatchBasis,
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeArtifactStatus,
     RuntimeEventKind,
+    RuntimeEvidenceRequest,
     RuntimeFrameLanguage,
     RuntimeIssueCode,
 )
@@ -1253,3 +1263,181 @@ def test_v8_ambiguous_line_beside_valid_frame_stays_message_text():
     assert [frame.source_text for frame in event.frames] == ["ok.js"]
     assert event.message == "at foo(bar (src).js:1:2)"
     assert result.issues == ()
+
+
+def test_pipeline_stack_event_frames_identities_and_candidates():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "pkg/a.py", line 10, in f\n'
+        b'  File "pkg/b.py", line 20, in g\n'
+        b"ValueError: boom\n"
+    )
+    inv = RuntimeEvidenceIngestor().ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("trace.stack",
+                            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            content, RuntimeFrameLanguage.PYTHON),
+        ),
+    ))
+    assert len(inv.artifacts) == 1
+    assert len(inv.events) == 1
+    artifact = inv.artifacts[0]
+    assert artifact.status is RuntimeArtifactStatus.COMPLETE
+    assert artifact.event_count == 1
+    assert artifact.frame_count == 2
+    assert artifact.text_truncated is False
+    assert artifact.frames_truncated is False
+    (event,) = inv.events
+    assert event.kind is RuntimeEventKind.ERROR
+    assert event.sequence == 0
+    assert event.source_line == 1
+    assert event.event_id == event_id(
+        "repo", artifact.artifact_id, event.sequence)
+    assert [(frame.ordinal, frame.relative_path, frame.line)
+            for frame in event.frames] == [
+        (0, "pkg/a.py", 10), (1, "pkg/b.py", 20)]
+    for frame in event.frames:
+        assert frame.frame_id == frame_id(
+            "repo", event.event_id, frame.ordinal)
+        assert frame.path_match_basis is (
+            PathMatchBasis.UNVERIFIED_RELATIVE_PATH)
+        assert frame.association is FrameAssociation.NOT_EVALUATED
+        assert frame.candidate_node_ids == ()
+        assert frame.primary_node_id is None
+        assert frame.source_reference_sha256 == source_reference_sha256(
+            frame.relative_path)
+    assert event.event_fingerprint == event_fingerprint(
+        repository_namespace="repo", kind=event.kind,
+        timestamp_text=event.timestamp_text, level=event.level,
+        message=event.message, logger=event.logger,
+        operation=event.operation, trace_id=event.trace_id,
+        span_id=event.span_id, parent_span_id=event.parent_span_id,
+        duration_ms_text=event.duration_ms_text, status=event.status,
+        error_type=event.error_type, error_message=event.error_message,
+        tags=event.tags, frames=event.frames)
+    assert inv.frames == event.frames
+    assert dict(inv.frames_by_file) == {
+        "pkg/a.py": (event.frames[0],),
+        "pkg/b.py": (event.frames[1],),
+    }
+    assert dict(inv.frames_by_node) == {}
+    assert inv.issues == ()
+
+
+def test_pipeline_stack_metadata_only_omits_message_and_function_text():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "pkg/a.py", line 10, in verylongfunctionname\n'
+        b'  File "pkg/b.py", line 20, in anotherlongfunctionname\n'
+        b"ValueError: secret failure message\n"
+    )
+    request = RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("trace.stack",
+                            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            content, RuntimeFrameLanguage.PYTHON),
+        ),
+    )
+    retained = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_message_bytes=12, max_frame_function_bytes=6)).ingest(request)
+    metadata = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_message_bytes=12, max_frame_function_bytes=6,
+        retain_event_text=False)).ingest(request)
+
+    assert len(retained.events) == len(metadata.events) == 1
+    retained_event = retained.events[0]
+    metadata_event = metadata.events[0]
+    assert retained_event.message == "Traceback\u2026"
+    assert metadata_event.message is None
+    assert [frame.function_text for frame in retained_event.frames] == [
+        "ver\u2026", "ano\u2026"]
+    assert [frame.function_text for frame in metadata_event.frames] == [
+        None, None]
+    assert retained_event.text_truncated is True
+    assert metadata_event.text_truncated is False
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in retained.issues] == [
+        (RuntimeIssueCode.TEXT_TRUNCATED, 0, 1)]
+    assert metadata.issues == ()
+    assert metadata_event.event_fingerprint != (
+        retained_event.event_fingerprint)
+    assert [event.event_id for event in metadata.events] == [
+        event.event_id for event in retained.events]
+    assert [frame.frame_id for frame in metadata_event.frames] == [
+        frame.frame_id for frame in retained_event.frames]
+    assert [
+        (frame.relative_path, frame.line, frame.path_match_basis,
+         frame.association)
+        for frame in metadata_event.frames
+    ] == [
+        (frame.relative_path, frame.line, frame.path_match_basis,
+         frame.association)
+        for frame in retained_event.frames
+    ]
+    assert [frame.relative_path for frame in metadata_event.frames] == [
+        "pkg/a.py", "pkg/b.py"]
+    assert [frame.line for frame in metadata_event.frames] == [10, 20]
+    assert all(
+        frame.path_match_basis is PathMatchBasis.UNVERIFIED_RELATIVE_PATH
+        and frame.association is FrameAssociation.NOT_EVALUATED
+        for frame in metadata_event.frames)
+    assert metadata.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+    assert metadata.artifacts[0].event_count == 1
+    assert metadata.artifacts[0].frame_count == 2
+    assert metadata.artifacts[0].issue_count == 0
+    assert metadata.artifacts[0].text_truncated is False
+    assert metadata.text_truncated is False
+    assert metadata.incomplete_reasons == ()
+
+
+def test_pipeline_stack_metadata_only_preserves_structural_truncation():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "pkg/a.py", line 10, in f\n'
+        b'  File "pkg/b.py", line 20, in g\n'
+        b"ValueError: boom\n"
+    )
+    request = RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("trace.stack",
+                            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            content, RuntimeFrameLanguage.PYTHON),
+        ),
+    )
+    config = RuntimeEvidenceConfig(max_stack_bytes=72)
+    retained = RuntimeEvidenceIngestor(config).ingest(request)
+    metadata = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_stack_bytes=72, retain_event_text=False)).ingest(request)
+
+    expected_issues = [
+        (RuntimeIssueCode.STACK_TOO_LARGE, 0, 1),
+        (RuntimeIssueCode.TEXT_TRUNCATED, 0, 1),
+    ]
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in retained.issues] == expected_issues
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in metadata.issues] == expected_issues
+    retained_event = retained.events[0]
+    metadata_event = metadata.events[0]
+    assert retained_event.message == "Traceback (most recent call last):"
+    assert metadata_event.message is None
+    assert [frame.function_text for frame in retained_event.frames] == ["f"]
+    assert [frame.function_text for frame in metadata_event.frames] == [None]
+    assert metadata_event.text_truncated is True
+    assert metadata_event.frames_truncated is True
+    assert metadata_event.event_id == retained_event.event_id
+    assert metadata_event.event_fingerprint != (
+        retained_event.event_fingerprint)
+    assert metadata_event.frames[0].frame_id == (
+        retained_event.frames[0].frame_id)
+    assert (
+        metadata_event.frames[0].relative_path,
+        metadata_event.frames[0].line,
+    ) == ("pkg/a.py", 10)
+    assert metadata.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert metadata.artifacts[0].issue_count == 2
+    assert metadata.artifacts[0].text_truncated is True
+    assert metadata.artifacts[0].frames_truncated is True
+    assert metadata.text_truncated is True
+    assert metadata.frames_truncated is True
+    assert metadata.ingestion_complete is False

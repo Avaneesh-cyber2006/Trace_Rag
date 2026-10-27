@@ -7,6 +7,7 @@ import pytest
 
 from backend.runtime_evidence import json_adapter, json_scanner
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
 from backend.runtime_evidence.json_adapter import (
     NormalizedEvent,
     normalize_event_object,
@@ -19,7 +20,11 @@ from backend.runtime_evidence.json_scanner import (
 )
 from backend.runtime_evidence.lines import strip_utf8_bom
 from backend.runtime_evidence.models import (
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeArtifactStatus,
     RuntimeEventKind,
+    RuntimeEvidenceRequest,
     RuntimeFrameLanguage,
     RuntimeIssueCode,
     issue_message,
@@ -1573,3 +1578,73 @@ def test_parser_failure_messages_do_not_leak_artifact_text():
     assert issue.code is RuntimeIssueCode.MALFORMED_JSON
     assert issue_message(issue.code) == "line or document is not valid JSON"
     assert secret not in issue_message(issue.code)
+
+
+def _ingest_json(content, config=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("events.json", RuntimeArtifactFormat.JSON_EVENTS,
+                            content),
+        )))
+
+
+def test_pipeline_jsonl_and_document_provenance_is_exact():
+    jsonl = _ingest_json(
+        b'{"kind":"log","message":"a"}\n'
+        b'{"kind":"log","message":"b"}\n')
+    assert [(event.sequence, event.source_line, event.message)
+            for event in jsonl.events] == [
+        (0, 1, "a"), (1, 2, "b")]
+    assert jsonl.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+    assert jsonl.artifacts[0].issue_count == 0
+
+    document = _ingest_json(
+        b'[{"kind":"log","message":"a"},{"kind":"log","message":"b"}]')
+    assert [(event.sequence, event.source_line, event.message)
+            for event in document.events] == [
+        (0, None, "a"), (1, None, "b")]
+    assert document.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+
+
+def test_pipeline_metadata_only_keeps_structure_and_identities():
+    content = (
+        b'{"kind":"error","timestamp":"ts","level":"ERROR",'
+        b'"logger":"lg","operation":"op","trace_id":"t","span_id":"s",'
+        b'"parent_span_id":"p","duration_ms":"1.5","status":"failed",'
+        b'"message":"secret message","tags":{"a":"b"},'
+        b'"error":{"type":"Boom","message":"secret error","frames":['
+        b'{"function":"f","source":"src/a.py","line":3,"column":4}]}}'
+    )
+    retained = _ingest_json(content)
+    metadata = _ingest_json(
+        content, RuntimeEvidenceConfig(retain_event_text=False))
+    assert len(retained.events) == 1
+    assert len(metadata.events) == 1
+    retained_event = retained.events[0]
+    metadata_event = metadata.events[0]
+    assert retained.event_text_retained is True
+    assert metadata.event_text_retained is False
+    assert retained_event.message == "secret message"
+    assert metadata_event.message is None
+    assert metadata_event.logger is None
+    assert metadata_event.operation is None
+    assert metadata_event.error_type is None
+    assert metadata_event.error_message is None
+    assert metadata_event.tags == ()
+    assert metadata_event.frames[0].function_text is None
+    assert metadata_event.timestamp_text == "ts"
+    assert metadata_event.level == "ERROR"
+    assert metadata_event.trace_id == "t"
+    assert metadata_event.span_id == "s"
+    assert metadata_event.parent_span_id == "p"
+    assert metadata_event.duration_ms_text == "1.5"
+    assert metadata_event.status == "failed"
+    assert metadata_event.frames[0].line == 3
+    assert metadata_event.frames[0].column == 4
+    assert metadata.artifacts[0].artifact_id == (
+        retained.artifacts[0].artifact_id)
+    assert metadata_event.event_id == retained_event.event_id
+    assert metadata_event.frames[0].frame_id == (
+        retained_event.frames[0].frame_id)
+    assert metadata_event.event_fingerprint != (
+        retained_event.event_fingerprint)

@@ -13,6 +13,7 @@ from backend.runtime_evidence.exceptions import (
 from backend.runtime_evidence.indexes import (
     InventoryIndexes, build_inventory_indexes, validate_inventory,
 )
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
 from backend.runtime_evidence.models import (
     CaptureCompleteness, FrameAssociation, GraphBinding, ISSUE_MESSAGES,
     PathMatchBasis, RuntimeArtifact, RuntimeArtifactFormat,
@@ -2371,3 +2372,108 @@ def test_redacted_reprs_contain_no_raw_or_escaped_hostile_text():
         assert "\u202e" not in text
         assert "\\x1b" not in text
         assert "\\u202e" not in text
+
+
+_PIPELINE_STACK = (
+    b'  File "pkg/a.py", line 10, in f\n'
+    b'  File "pkg/b.py", line 20, in g\n'
+    b"ValueError: boom\n"
+)
+
+
+def _pipeline_inventory():
+    return RuntimeEvidenceIngestor().ingest(RuntimeEvidenceRequest(
+        "repo",
+        (
+            RuntimeArtifact("a.log", RuntimeArtifactFormat.TEXT_LOG,
+                            b"one\n"),
+            RuntimeArtifact("a.log", RuntimeArtifactFormat.TEXT_LOG,
+                            b"one\n"),
+            RuntimeArtifact("b.json", RuntimeArtifactFormat.JSON_EVENTS,
+                            b'{"kind":"log","message":"m",'
+                            b'"trace_id":"trace-1"}'),
+            RuntimeArtifact("c.stack",
+                            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                            _PIPELINE_STACK,
+                            RuntimeFrameLanguage.PYTHON),
+        ),
+    ))
+
+
+def test_pipeline_counters_equal_the_authoritative_tuples():
+    inv = _pipeline_inventory()
+    assert inv.submitted_artifacts == 4
+    assert inv.duplicate_artifacts == 1
+    assert inv.submitted_artifacts == (
+        len(inv.artifacts) + inv.duplicate_artifacts)
+    assert inv.total_input_bytes == sum(
+        artifact.size_bytes for artifact in inv.artifacts)
+    assert inv.total_events == len(inv.events) == sum(
+        artifact.event_count for artifact in inv.artifacts)
+    assert inv.total_frames == len(inv.frames) == sum(
+        artifact.frame_count for artifact in inv.artifacts) == sum(
+        len(event.frames) for event in inv.events)
+    assert sum(artifact.issue_count for artifact in inv.artifacts) == len(
+        inv.issues)
+    assert inv.ingestion_complete is True
+    assert inv.incomplete_reasons == ()
+    validate_inventory(inv)
+
+
+def test_pipeline_indexes_are_immutable_exact_filters():
+    inv = _pipeline_inventory()
+    assert len(inv.artifacts) == 3
+    assert len(inv.events) == 3
+    assert len(inv.frames) == 2
+    expected_by_artifact = {
+        artifact.artifact_id: tuple(
+            event for event in inv.events
+            if event.artifact_id == artifact.artifact_id)
+        for artifact in inv.artifacts
+    }
+    expected_by_trace: dict[str, list] = {}
+    expected_by_fingerprint: dict[str, list] = {}
+    for event in inv.events:
+        if event.trace_id is not None:
+            expected_by_trace.setdefault(event.trace_id, []).append(event)
+        expected_by_fingerprint.setdefault(
+            event.event_fingerprint, []).append(event)
+    expected_by_file: dict[str, list] = {}
+    expected_by_node: dict[str, list] = {}
+    for frame in inv.frames:
+        if frame.relative_path is not None:
+            expected_by_file.setdefault(
+                frame.relative_path, []).append(frame)
+        if (
+            frame.association
+            in (FrameAssociation.FILE, FrameAssociation.SYMBOL)
+            and frame.primary_node_id is not None
+        ):
+            expected_by_node.setdefault(
+                frame.primary_node_id, []).append(frame)
+
+    assert dict(inv.events_by_artifact) == expected_by_artifact
+    assert dict(inv.events_by_trace_id) == {
+        key: tuple(values) for key, values in expected_by_trace.items()}
+    assert dict(inv.events_by_fingerprint) == {
+        key: tuple(values)
+        for key, values in expected_by_fingerprint.items()}
+    assert dict(inv.frames_by_file) == {
+        key: tuple(values) for key, values in expected_by_file.items()}
+    assert dict(inv.frames_by_node) == {
+        key: tuple(values) for key, values in expected_by_node.items()}
+    assert inv.events_by_trace_id["trace-1"] == (
+        tuple(event for event in inv.events
+              if event.trace_id == "trace-1"))
+    assert set(inv.events_by_artifact) == {
+        artifact.artifact_id for artifact in inv.artifacts}
+    assert set(inv.frames_by_file) == {"pkg/a.py", "pkg/b.py"}
+
+    for name in _INVENTORY_INDEX_FIELDS:
+        mapping = getattr(inv, name)
+        assert isinstance(mapping, MappingProxyType)
+        assert list(mapping) == sorted(mapping)
+        for value in mapping.values():
+            assert type(value) is tuple
+        with pytest.raises(TypeError):
+            mapping["x"] = ()
