@@ -26,6 +26,7 @@ from backend.runtime_evidence.models import (
     RuntimeEventKind,
     RuntimeEvidenceRequest,
     RuntimeFrameLanguage,
+    RuntimeIncompleteReason,
     RuntimeIssueCode,
     issue_message,
 )
@@ -1648,3 +1649,107 @@ def test_pipeline_metadata_only_keeps_structure_and_identities():
         retained_event.frames[0].frame_id)
     assert metadata_event.event_fingerprint != (
         retained_event.event_fingerprint)
+
+
+# --- Task 17: record budgets ------------------------------------------------
+
+
+def test_json_document_event_budget_keeps_prefix_and_marks_partial():
+    inv = _ingest_json(
+        b'[{"kind":"log","message":"a"},{"kind":"log","message":"b"}]',
+        RuntimeEvidenceConfig(max_events=1))
+    assert inv.total_events == len(inv.events) == 1
+    assert [(event.sequence, event.source_line, event.message)
+            for event in inv.events] == [(0, None, "a")]
+    assert inv.artifacts[0].event_count == 1
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is True
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+    )
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.EVENT_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence is None
+    assert issue.source_line is None
+
+
+def test_jsonl_event_budget_keeps_prefix_and_marks_partial():
+    content = (
+        b'{"kind":"log","message":"a"}\n'
+        b'{"kind":"log","message":"b"}\n'
+        b'{"kind":"log","message":"c"}\n'
+    )
+    inv = _ingest_json(content, RuntimeEvidenceConfig(max_events=1))
+    assert inv.total_events == len(inv.events) == 1
+    assert [(event.sequence, event.source_line, event.message)
+            for event in inv.events] == [(0, 1, "a")]
+    assert inv.artifacts[0].event_count == 1
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is True
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.EVENT_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence is None
+    assert issue.source_line is None
+
+
+def _ingest_json_with_language(content, config=None, language=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact(
+                "events.json", RuntimeArtifactFormat.JSON_EVENTS,
+                content, language),
+        )))
+
+
+def test_json_explicit_frames_respect_global_frame_budget():
+    content = (
+        b'[{"kind":"error","message":"a","error":{"frames":['
+        b'{"function":"f0","source":"a.py","line":1}]}},'
+        b'{"kind":"error","message":"b","error":{"frames":['
+        b'{"function":"f1","source":"b.py","line":2}]}}]'
+    )
+    inv = _ingest_json(content, RuntimeEvidenceConfig(
+        max_frames_per_event=1, max_total_frames=1))
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    assert inv.events[0].frames[0].function_text == "f0"
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.FRAME_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line is None
+
+
+def test_json_parsed_stack_frames_respect_global_frame_budget():
+    content = (
+        b'[{"kind":"error","message":"a","error":{"stack":'
+        b'"  File \\"pkg/a.py\\", line 3, in f\\n"}},'
+        b'{"kind":"error","message":"b","error":{"stack":'
+        b'"  File \\"pkg/b.py\\", line 4, in g\\n"}}]'
+    )
+    inv = _ingest_json_with_language(
+        content,
+        RuntimeEvidenceConfig(max_frames_per_event=1, max_total_frames=1),
+        RuntimeFrameLanguage.PYTHON,
+    )
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    retained = inv.events[0].frames[0]
+    assert (retained.function_text, retained.relative_path, retained.line) == (
+        "f", "pkg/a.py", 3)
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.FRAME_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line is None

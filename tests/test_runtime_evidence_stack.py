@@ -22,6 +22,7 @@ from backend.runtime_evidence.models import (
     RuntimeEventKind,
     RuntimeEvidenceRequest,
     RuntimeFrameLanguage,
+    RuntimeIncompleteReason,
     RuntimeIssueCode,
 )
 from backend.runtime_evidence.stack_parser import (
@@ -1441,3 +1442,89 @@ def test_pipeline_stack_metadata_only_preserves_structural_truncation():
     assert metadata.text_truncated is True
     assert metadata.frames_truncated is True
     assert metadata.ingestion_complete is False
+
+
+# --- Task 17: record budgets ------------------------------------------------
+
+
+def test_pipeline_frame_budget_keeps_later_artifacts_and_flags_events():
+    first_content = (
+        b'  File "a.py", line 1, in f\n'
+        b'  File "b.py", line 2, in g\n'
+        b"\n"
+        b'  File "c.py", line 4, in h\n'
+    )
+    second_content = b'  File "d.py", line 6, in i\n'
+    request = RuntimeEvidenceRequest(
+        "repo",
+        (
+            RuntimeArtifact(
+                "a.stack", RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                first_content, RuntimeFrameLanguage.PYTHON),
+            RuntimeArtifact(
+                "b.stack", RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                second_content, RuntimeFrameLanguage.PYTHON),
+        ),
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=2, max_total_frames=2)).ingest(request)
+    assert [(event.artifact_id, event.sequence, event.source_line,
+             len(event.frames), event.frames_truncated)
+            for event in inv.events] == [
+        (inv.artifacts[0].artifact_id, 0, 1, 2, False),
+        (inv.artifacts[0].artifact_id, 1, 4, 0, True),
+        (inv.artifacts[1].artifact_id, 0, 1, 0, True),
+    ]
+    assert inv.total_events == 3
+    assert inv.total_frames == 2
+    assert inv.frames_truncated is True
+    assert [artifact.status for artifact in inv.artifacts] == [
+        RuntimeArtifactStatus.PARTIAL, RuntimeArtifactStatus.PARTIAL]
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+    issue = inv.issues[0]
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line == 4
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.FRAME_LIMIT_REACHED,
+    )
+
+
+def test_pipeline_frame_budget_metadata_only_preserves_structural_loss():
+    content = (
+        b'  File "pkg/a.py", line 1, in verylongfunctionname\n'
+        b"\n"
+        b'  File "pkg/b.py", line 2, in anotherlongfunctionname\n'
+    )
+    request = RuntimeEvidenceRequest(
+        "repo",
+        (
+            RuntimeArtifact(
+                "trace.stack", RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                content, RuntimeFrameLanguage.PYTHON),
+        ),
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=1, max_total_frames=1,
+        retain_event_text=False)).ingest(request)
+    assert inv.event_text_retained is False
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [event.message for event in inv.events] == [None, None]
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert inv.events[0].frames[0].function_text is None
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    assert [event.text_truncated for event in inv.events] == [False, False]
+    assert inv.frames_truncated is True
+    assert inv.text_truncated is False
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.artifacts[0].frames_truncated is True
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in inv.issues] == [
+        (RuntimeIssueCode.FRAME_LIMIT_REACHED, 1, 3)]
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.FRAME_LIMIT_REACHED,
+    )

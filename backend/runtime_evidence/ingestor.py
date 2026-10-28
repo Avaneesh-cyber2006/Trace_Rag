@@ -78,6 +78,19 @@ class _ArtifactGroup:
     submissions: int
 
 
+@dataclass(slots=True)
+class _BudgetState:
+    """Invocation-local counters and flags for the three record budgets."""
+
+    events_retained: int = 0
+    frames_retained: int = 0
+    ordinary_issues: int = 0
+    events_truncated: bool = False
+    frames_truncated: bool = False
+    issues_truncated: bool = False
+    event_limit_issue_emitted: bool = False
+
+
 def _parse_artifact(
     artifact: RuntimeArtifact,
     config: RuntimeEvidenceConfig,
@@ -259,8 +272,14 @@ def _assemble_event(
     namespace: str,
     config: RuntimeEvidenceConfig,
     graph_index: AssociationIndex | None,
-) -> tuple[RuntimeEvent, tuple[IssueDraft, ...]]:
-    """Build one immutable event from a draft and its associated frames."""
+    frame_capacity: int,
+) -> tuple[RuntimeEvent, tuple[IssueDraft, ...], bool]:
+    """Build one immutable event from a draft and its associated frames.
+
+    Association runs on every adapter-retained draft frame. The global frame
+    budget then keeps only the capacity-fitting prefix. The returned boolean
+    reports whether that global prefix actually dropped frames.
+    """
     identifier = event_id(namespace, prepared.artifact_id, draft.sequence)
     association = associate_frames(
         draft.frames,
@@ -271,7 +290,8 @@ def _assemble_event(
         config=config,
         graph_index=graph_index,
     )
-    frames = association.frames
+    frames = association.frames[:frame_capacity]
+    frame_budget_cut = len(association.frames) > frame_capacity
     fingerprint = event_fingerprint(
         repository_namespace=namespace,
         kind=draft.kind,
@@ -312,9 +332,9 @@ def _assemble_event(
         tags=draft.tags,
         frames=frames,
         text_truncated=draft.text_truncated,
-        frames_truncated=draft.frames_truncated,
+        frames_truncated=draft.frames_truncated or frame_budget_cut,
     )
-    return event, association.issues
+    return event, association.issues, frame_budget_cut
 
 
 def _project_issues(
@@ -366,7 +386,9 @@ def _artifact_status(
 def _incomplete_reasons(
     artifacts: tuple[RuntimeArtifactRecord, ...],
     text_truncated: bool,
+    events_truncated: bool,
     frames_truncated: bool,
+    issues_truncated: bool,
 ) -> tuple[RuntimeIncompleteReason, ...]:
     reasons: set[RuntimeIncompleteReason] = set()
     for artifact in artifacts:
@@ -376,8 +398,12 @@ def _incomplete_reasons(
             reasons.add(RuntimeIncompleteReason.ARTIFACT_PARTIAL)
         elif artifact.status is RuntimeArtifactStatus.SKIPPED:
             reasons.add(RuntimeIncompleteReason.ARTIFACT_SKIPPED)
+    if events_truncated:
+        reasons.add(RuntimeIncompleteReason.EVENT_LIMIT_REACHED)
     if frames_truncated:
         reasons.add(RuntimeIncompleteReason.FRAME_LIMIT_REACHED)
+    if issues_truncated:
+        reasons.add(RuntimeIncompleteReason.ISSUE_LIMIT_REACHED)
     if text_truncated:
         reasons.add(RuntimeIncompleteReason.TEXT_TRUNCATED)
     return tuple(sorted(reasons, key=lambda reason: reason.value))
@@ -396,6 +422,51 @@ def _issue_order_key(
         issue.code.value,
         issue.message,
     )
+
+
+def _apply_issue_budget(
+    issues: tuple[RuntimeEvidenceIssue, ...],
+    config: RuntimeEvidenceConfig,
+    artifact_positions: dict[str, int],
+    budget: _BudgetState,
+) -> tuple[RuntimeEvidenceIssue, ...]:
+    """Deduplicate, order, cap, and sentinel the final issue tuple."""
+    seen: set[tuple] = set()
+    unique: list[RuntimeEvidenceIssue] = []
+    for issue in issues:
+        key = (
+            issue.code,
+            issue.artifact_id,
+            issue.event_sequence,
+            issue.source_line,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    ordered = sorted(
+        unique,
+        key=lambda issue: _issue_order_key(issue, artifact_positions),
+    )
+    if len(ordered) <= config.max_issues:
+        budget.ordinary_issues = len(ordered)
+        return tuple(ordered)
+
+    budget.issues_truncated = True
+    budget.ordinary_issues = config.max_issues
+    first_dropped = ordered[config.max_issues]
+    sentinel = RuntimeEvidenceIssue(
+        code=RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+        message=issue_message(RuntimeIssueCode.ISSUE_LIMIT_REACHED),
+        artifact_id=first_dropped.artifact_id,
+        event_sequence=first_dropped.event_sequence,
+        source_line=first_dropped.source_line,
+    )
+    final = [*ordered[:config.max_issues], sentinel]
+    final.sort(
+        key=lambda issue: _issue_order_key(issue, artifact_positions)
+    )
+    return tuple(final)
 
 
 class RuntimeEvidenceIngestor:
@@ -458,12 +529,15 @@ class RuntimeEvidenceIngestor:
         issues: list[RuntimeEvidenceIssue] = []
         artifacts: list[RuntimeArtifactRecord] = []
         artifact_positions: dict[str, int] = {}
+        budget = _BudgetState()
+        frame_limit_issue_emitted = False
 
         for position, item in enumerate(work_items):
             artifact_positions[item.artifact_id] = position
             size_bytes = len(item.artifact.content)
             artifact_events: list[RuntimeEvent] = []
             issue_drafts: list[IssueDraft] = []
+            remaining_events = config.max_events - budget.events_retained
 
             if size_bytes > config.max_artifact_bytes:
                 status = RuntimeArtifactStatus.SKIPPED
@@ -474,16 +548,69 @@ class RuntimeEvidenceIngestor:
                         source_line=None,
                     )
                 )
+            elif remaining_events <= 0:
+                status = RuntimeArtifactStatus.SKIPPED
+                budget.events_truncated = True
+                if not budget.event_limit_issue_emitted:
+                    issue_drafts.append(
+                        IssueDraft(
+                            code=RuntimeIssueCode.EVENT_LIMIT_REACHED,
+                            event_sequence=None,
+                            source_line=None,
+                        )
+                    )
+                    budget.event_limit_issue_emitted = True
             else:
                 parse_result = _parse_artifact(
-                    item.artifact, config, config.max_events
+                    item.artifact, config, remaining_events
                 )
                 parse_result = _project_metadata_only(parse_result, config)
-                issue_drafts.extend(parse_result.issues)
-                for draft in parse_result.events:
-                    event, association_issues = _assemble_event(
-                        draft, item, namespace, config, graph_index
+                retained_drafts = parse_result.events[:remaining_events]
+                if (
+                    parse_result.event_limit_hit
+                    or len(parse_result.events) > remaining_events
+                ):
+                    budget.events_truncated = True
+                    issue_drafts.append(
+                        IssueDraft(
+                            code=RuntimeIssueCode.EVENT_LIMIT_REACHED,
+                            event_sequence=None,
+                            source_line=None,
+                        )
                     )
+                    budget.event_limit_issue_emitted = True
+                budget.events_retained += len(retained_drafts)
+                issue_drafts.extend(parse_result.issues)
+                for draft in retained_drafts:
+                    remaining_frames = max(
+                        0, config.max_total_frames - budget.frames_retained
+                    )
+                    (
+                        event,
+                        association_issues,
+                        frame_budget_cut,
+                    ) = _assemble_event(
+                        draft,
+                        item,
+                        namespace,
+                        config,
+                        graph_index,
+                        remaining_frames,
+                    )
+                    if frame_budget_cut:
+                        budget.frames_truncated = True
+                        if not frame_limit_issue_emitted:
+                            issue_drafts.append(
+                                IssueDraft(
+                                    code=(
+                                        RuntimeIssueCode.FRAME_LIMIT_REACHED
+                                    ),
+                                    event_sequence=event.sequence,
+                                    source_line=event.source_line,
+                                )
+                            )
+                            frame_limit_issue_emitted = True
+                    budget.frames_retained += len(event.frames)
                     artifact_events.append(event)
                     issue_drafts.extend(association_issues)
                 status = None
@@ -527,15 +654,49 @@ class RuntimeEvidenceIngestor:
             events.extend(artifact_events)
             issues.extend(artifact_issues)
 
-        artifact_records = tuple(artifacts)
         event_records = tuple(events)
         frame_records = tuple(
             frame for event in event_records for frame in event.frames
         )
-        issues.sort(
-            key=lambda issue: _issue_order_key(issue, artifact_positions)
+        issue_records = _apply_issue_budget(
+            tuple(issues), config, artifact_positions, budget
         )
-        issue_records = tuple(issues)
+        events_by_artifact: dict[str, list[RuntimeEvent]] = {}
+        for event in event_records:
+            events_by_artifact.setdefault(event.artifact_id, []).append(event)
+        issue_counts: dict[str, int] = {}
+        for issue in issue_records:
+            issue_counts[issue.artifact_id] = (
+                issue_counts.get(issue.artifact_id, 0) + 1
+            )
+        artifact_records = tuple(
+            replace(
+                artifact,
+                event_count=len(
+                    events_by_artifact.get(artifact.artifact_id, ())
+                ),
+                frame_count=sum(
+                    len(event.frames)
+                    for event in events_by_artifact.get(
+                        artifact.artifact_id, ()
+                    )
+                ),
+                text_truncated=any(
+                    event.text_truncated
+                    for event in events_by_artifact.get(
+                        artifact.artifact_id, ()
+                    )
+                ),
+                frames_truncated=any(
+                    event.frames_truncated
+                    for event in events_by_artifact.get(
+                        artifact.artifact_id, ()
+                    )
+                ),
+                issue_count=issue_counts.get(artifact.artifact_id, 0),
+            )
+            for artifact in artifacts
+        )
 
         text_truncated = any(
             event.text_truncated for event in event_records
@@ -544,7 +705,11 @@ class RuntimeEvidenceIngestor:
             event.frames_truncated for event in event_records
         )
         reasons = _incomplete_reasons(
-            artifact_records, text_truncated, frames_truncated
+            artifact_records,
+            text_truncated,
+            budget.events_truncated,
+            frames_truncated,
+            budget.issues_truncated,
         )
         indexes = build_inventory_indexes(
             artifact_records, event_records, frame_records
@@ -574,9 +739,9 @@ class RuntimeEvidenceIngestor:
             total_events=len(event_records),
             total_frames=len(frame_records),
             text_truncated=text_truncated,
-            events_truncated=False,
+            events_truncated=budget.events_truncated,
             frames_truncated=frames_truncated,
-            issues_truncated=False,
+            issues_truncated=budget.issues_truncated,
             ingestion_complete=not reasons,
             incomplete_reasons=reasons,
             events_by_artifact=indexes.events_by_artifact,

@@ -5,6 +5,7 @@ import pytest
 from backend.code_graph import CodeGraphInventory, GraphNode, GraphNodeKind
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.exceptions import (
+    RuntimeEvidenceConfigurationError,
     RuntimeEvidenceGraphError, RuntimeEvidenceLimitError,
     RuntimeEvidenceValidationError,
 )
@@ -616,3 +617,497 @@ def test_inventory_retains_no_bytes_and_repr_is_redacted():
             for field in fields(record))
     assert not any(
         type(getattr(inv, field.name)) is bytes for field in fields(inv))
+
+
+# --- Task 17: record budgets ------------------------------------------------
+
+
+def test_event_budget_exact_end_has_no_loss():
+    inv = RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_events=1)).ingest(
+            _request(_artifact("one.log", b"one\n")))
+    assert inv.total_events == 1
+    assert inv.events_truncated is False
+    assert inv.incomplete_reasons == ()
+    assert inv.issues == ()
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+
+
+def test_event_budget_skips_later_artifact_with_one_issue():
+    inv = RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_events=1)).ingest(_request(
+            _artifact("a.log", b"one\n"), _artifact("b.log", b"two\n")))
+    assert [a.status for a in inv.artifacts] == [
+        RuntimeArtifactStatus.COMPLETE, RuntimeArtifactStatus.SKIPPED]
+    assert inv.events_truncated is True
+    assert [i.code for i in inv.issues] == [RuntimeIssueCode.EVENT_LIMIT_REACHED]
+    assert inv.issues[0].artifact_id == inv.artifacts[1].artifact_id
+    assert inv.issues[0].event_sequence is None
+    assert inv.issues[0].source_line is None
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_SKIPPED,
+        RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+    )
+
+
+def test_event_budget_overflow_marks_current_partial():
+    inv = RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_events=1)).ingest(
+            _request(_artifact("a.log", b"one\ntwo\n")))
+    assert inv.total_events == 1
+    assert [(e.sequence, e.source_line, e.message)
+            for e in inv.events] == [(0, 1, "one")]
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is True
+    assert [i.code for i in inv.issues] == [RuntimeIssueCode.EVENT_LIMIT_REACHED]
+    assert inv.issues[0].artifact_id == inv.artifacts[0].artifact_id
+    assert inv.issues[0].event_sequence is None
+    assert inv.issues[0].source_line is None
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+    )
+
+
+def test_event_budget_skip_precedes_adapter_dispatch(monkeypatch):
+    import backend.runtime_evidence.ingestor as ingestor
+
+    calls = []
+    real_parse = ingestor.parse_text_log
+
+    def spy(content, config, max_new_events):
+        calls.append((content, config, max_new_events))
+        return real_parse(content, config, max_new_events)
+
+    monkeypatch.setattr(ingestor, "parse_text_log", spy)
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_events=1)).ingest(
+        _request(_artifact("a.log", b"one\n"), _artifact("b.log", b"two\n")))
+    assert len(calls) == 1
+    assert calls[0][0] == b"one\n"
+    assert calls[0][2] == 1
+    assert inv.artifacts[1].status is RuntimeArtifactStatus.SKIPPED
+    assert inv.artifacts[1].event_count == 0
+
+
+def test_event_budget_overflow_skips_later_artifacts_with_one_issue():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_events=1)).ingest(
+        _request(
+            _artifact("a.log", b"one\ntwo\n"),
+            _artifact("b.log", b"three\n"),
+            _artifact("c.log", b"four\n"),
+        ))
+    assert [a.status for a in inv.artifacts] == [
+        RuntimeArtifactStatus.PARTIAL,
+        RuntimeArtifactStatus.SKIPPED,
+        RuntimeArtifactStatus.SKIPPED,
+    ]
+    assert [a.event_count for a in inv.artifacts] == [1, 0, 0]
+    assert [i.code for i in inv.issues] == [RuntimeIssueCode.EVENT_LIMIT_REACHED]
+    assert inv.issues[0].artifact_id == inv.artifacts[0].artifact_id
+    assert inv.issues[0].event_sequence is None
+    assert inv.issues[0].source_line is None
+    assert inv.total_events == 1
+    assert inv.events_truncated is True
+
+
+def test_event_limit_issue_is_artifact_scoped_and_not_fabricated():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_events=1)).ingest(
+        _request(
+            _artifact("a.log", b"one\n"),
+            _artifact("b.log", b"two\nthree\n"),
+        ))
+    skipped_id = inv.artifacts[1].artifact_id
+    assert tuple(
+        event for event in inv.events if event.artifact_id == skipped_id
+    ) == ()
+    assert inv.artifacts[1].event_count == 0
+    (issue,) = inv.issues
+    assert issue.artifact_id == skipped_id
+    assert issue.event_sequence is None
+    assert issue.source_line is None
+
+
+def test_oversized_later_artifact_precedes_event_budget_skipping():
+    config = RuntimeEvidenceConfig(
+        max_events=1, max_artifact_bytes=4, max_total_input_bytes=13,
+        max_submitted_input_bytes=13)
+    inv = RuntimeEvidenceIngestor(config).ingest(_request(
+        _artifact("a.log", b"one\n"),
+        _artifact("b_big.log", b"12345"),
+        _artifact("c.log", b"two\n"),
+    ))
+    assert [a.status for a in inv.artifacts] == [
+        RuntimeArtifactStatus.COMPLETE,
+        RuntimeArtifactStatus.SKIPPED,
+        RuntimeArtifactStatus.SKIPPED,
+    ]
+    assert [(issue.code, issue.artifact_id) for issue in inv.issues] == [
+        (RuntimeIssueCode.ARTIFACT_TOO_LARGE, inv.artifacts[1].artifact_id),
+        (RuntimeIssueCode.EVENT_LIMIT_REACHED, inv.artifacts[2].artifact_id),
+    ]
+    assert inv.issues[1].event_sequence is None
+    assert inv.issues[1].source_line is None
+    assert inv.events_truncated is True
+
+
+def test_oversized_only_later_artifact_keeps_exact_event_end_complete():
+    config = RuntimeEvidenceConfig(
+        max_events=1, max_artifact_bytes=4, max_total_input_bytes=9,
+        max_submitted_input_bytes=9)
+    inv = RuntimeEvidenceIngestor(config).ingest(_request(
+        _artifact("a.log", b"one\n"),
+        _artifact("b_big.log", b"12345"),
+    ))
+    assert [a.status for a in inv.artifacts] == [
+        RuntimeArtifactStatus.COMPLETE, RuntimeArtifactStatus.SKIPPED]
+    assert inv.events_truncated is False
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.ARTIFACT_TOO_LARGE]
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_SKIPPED,)
+
+
+def test_event_budget_is_deterministic_under_submission_order():
+    config = RuntimeEvidenceConfig(max_events=2)
+    artifacts = (
+        _artifact("a.log", b"a1\na2\na3\n"),
+        _artifact("b.log", b"b1\nb2\n"),
+        _artifact("c.log", b"c1\n"),
+    )
+    forward = RuntimeEvidenceIngestor(config).ingest(_request(*artifacts))
+    reverse = RuntimeEvidenceIngestor(config).ingest(
+        _request(*reversed(artifacts)))
+
+    def summary(inventory):
+        return (
+            [
+                (artifact.source_names, artifact.artifact_id,
+                 artifact.status, artifact.event_count)
+                for artifact in inventory.artifacts
+            ],
+            [
+                (event.event_id, event.artifact_id, event.sequence,
+                 event.source_line, event.message)
+                for event in inventory.events
+            ],
+            [
+                (issue.code, issue.artifact_id, issue.event_sequence,
+                 issue.source_line)
+                for issue in inventory.issues
+            ],
+            (inventory.total_events, inventory.events_truncated,
+             inventory.incomplete_reasons),
+        )
+
+    assert summary(forward) == summary(reverse)
+    assert [a.status for a in forward.artifacts] == [
+        RuntimeArtifactStatus.PARTIAL,
+        RuntimeArtifactStatus.SKIPPED,
+        RuntimeArtifactStatus.SKIPPED,
+    ]
+
+
+def test_frame_budget_exact_global_limit_has_no_loss():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b"\n"
+        b'  File "b.py", line 2, in g\n'
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=1, max_total_frames=2)).ingest(_request(
+            _artifact("trace.txt", content,
+                      RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                      RuntimeFrameLanguage.PYTHON)))
+    assert inv.total_events == 2
+    assert inv.total_frames == 2
+    assert [len(event.frames) for event in inv.events] == [1, 1]
+    assert [event.frames_truncated for event in inv.events] == [False, False]
+    assert inv.frames_truncated is False
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+    assert inv.issues == ()
+    assert inv.incomplete_reasons == ()
+
+
+def test_frame_budget_one_over_global_limit_keeps_later_events():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b"\n"
+        b'  File "b.py", line 2, in g\n'
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=1, max_total_frames=1)).ingest(_request(
+            _artifact("trace.txt", content,
+                      RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                      RuntimeFrameLanguage.PYTHON)))
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.artifacts[0].frames_truncated is True
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.FRAME_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line == 3
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.FRAME_LIMIT_REACHED,
+    )
+
+
+def test_frame_budget_interacts_with_adapter_per_event_cap():
+    content = (
+        b'  File "a.py", line 1, in f\n'
+        b"\n"
+        b'  File "b.py", line 2, in g\n'
+        b'  File "c.py", line 3, in h\n'
+        b'  File "d.py", line 4, in i\n'
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=2, max_total_frames=2)).ingest(_request(
+            _artifact("trace.txt", content,
+                      RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                      RuntimeFrameLanguage.PYTHON)))
+    assert inv.total_events == 2
+    assert inv.total_frames == 2
+    assert [len(event.frames) for event in inv.events] == [1, 1]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    assert inv.events[1].frames[0].ordinal == 0
+    assert inv.events[1].frames[0].line == 2
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+    assert inv.issues[0].event_sequence == 1
+    assert inv.issues[0].source_line == 3
+
+
+def test_frame_budget_keeps_retained_identities_and_association():
+    content = (
+        b'  File "pkg/a.py", line 1, in f\n'
+        b"\n"
+        b'  File "pkg/c.py", line 5, in g\n'
+        b'  File "pkg/a.py", line 10, in h\n'
+    )
+    graph = _graph((
+        _node("file-a", GraphNodeKind.FILE, "pkg/a.py"),
+        _node("file-c", GraphNodeKind.FILE, "pkg/c.py"),
+    ))
+    request = _request(_artifact(
+        "trace.stack", content, RuntimeArtifactFormat.STACK_TRACE_TEXT,
+        RuntimeFrameLanguage.PYTHON))
+    unbudgeted = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=10, max_total_frames=10)).ingest(
+            request, graph)
+    budgeted = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_frames_per_event=2, max_total_frames=2)).ingest(request, graph)
+
+    assert budgeted.total_events == unbudgeted.total_events == 2
+    assert budgeted.total_frames == 2
+    assert [event.event_id for event in budgeted.events] == [
+        event.event_id for event in unbudgeted.events]
+    retained = budgeted.events[1].frames[0]
+    occurrence = unbudgeted.events[1].frames[0]
+    assert retained.frame_id == occurrence.frame_id
+    assert retained.ordinal == occurrence.ordinal == 0
+    assert retained.relative_path == occurrence.relative_path == "pkg/c.py"
+    assert retained.association is FrameAssociation.FILE
+    assert retained.primary_node_id == occurrence.primary_node_id == "file-c"
+    assert budgeted.events[1].frames_truncated is True
+    assert [frame.frame_id for frame in budgeted.frames_by_file["pkg/a.py"]] == [
+        unbudgeted.events[0].frames[0].frame_id]
+    assert [frame.frame_id for frame in budgeted.frames_by_file["pkg/c.py"]] == [
+        retained.frame_id]
+    assert [issue.code for issue in budgeted.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+    assert budgeted.issues[0].event_sequence == 1
+    assert budgeted.issues[0].source_line == 3
+
+
+def test_issue_budget_exact_positive_limit_has_no_sentinel():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=2)).ingest(
+        _request(_artifact("a.log", b"\xff\n\xfe\n")))
+    assert [(issue.code, issue.source_line) for issue in inv.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1),
+        (RuntimeIssueCode.INVALID_UTF8, 2),
+    ]
+    assert inv.issues_truncated is False
+    assert len(inv.issues) == 2
+    assert inv.artifacts[0].issue_count == 2
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.FAILED
+    assert inv.incomplete_reasons == (RuntimeIncompleteReason.ARTIFACT_FAILED,)
+
+
+def test_issue_budget_one_over_adds_exactly_one_sentinel():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=2)).ingest(
+        _request(_artifact("a.log", b"\xff\n\xfe\n\xfd\n")))
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.INVALID_UTF8,
+        RuntimeIssueCode.INVALID_UTF8,
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+    ]
+    assert [issue.source_line for issue in inv.issues] == [1, 2, 3]
+    assert inv.issues_truncated is True
+    assert len(inv.issues) == 3
+    assert inv.artifacts[0].issue_count == 3
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.FAILED
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_FAILED,
+        RuntimeIncompleteReason.ISSUE_LIMIT_REACHED,
+    )
+
+
+def test_issue_budget_sentinel_reorders_before_retained_ordinary_issue():
+    content = (
+        b"Traceback (most recent call last):\n"
+        b'  File "pkg/a.py", line 10, in f\n'
+        b'  File "pkg/b.py", line 20, in g\n'
+        b"ValueError: boom\n"
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_issues=1, max_stack_bytes=72)).ingest(_request(
+            _artifact("trace.stack", content,
+                      RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                      RuntimeFrameLanguage.PYTHON)))
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in inv.issues] == [
+        (RuntimeIssueCode.ISSUE_LIMIT_REACHED, 0, 1),
+        (RuntimeIssueCode.STACK_TOO_LARGE, 0, 1),
+    ]
+    sentinel = inv.issues[0]
+    assert sentinel.artifact_id == inv.artifacts[0].artifact_id
+    assert inv.issues_truncated is True
+    assert inv.artifacts[0].issue_count == 2
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+
+
+def test_issue_budget_many_dropped_still_has_one_sentinel():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=1)).ingest(
+        _request(_artifact("a.log", b"\xff\n\xfe\n\xfd\n\xfc\n")))
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.INVALID_UTF8,
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+    ]
+    assert [issue.source_line for issue in inv.issues] == [1, 2]
+    assert sum(
+        1 for issue in inv.issues
+        if issue.code is RuntimeIssueCode.ISSUE_LIMIT_REACHED) == 1
+    assert inv.issues_truncated is True
+    assert inv.artifacts[0].issue_count == 2
+
+
+def test_issue_budget_deduplicates_before_accounting():
+    content = (
+        b'{"kind":"error","message":"x","error":{"frames":['
+        b'{"source":"a//b","line":1},{"source":"a//b","line":1}]}}'
+    )
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=1)).ingest(
+        _request(_artifact("bad.json", content,
+                           RuntimeArtifactFormat.JSON_EVENTS)))
+    assert [(issue.code, issue.event_sequence, issue.source_line)
+            for issue in inv.issues] == [
+        (RuntimeIssueCode.INVALID_SOURCE_LOCATION, 0, None)]
+    assert inv.issues_truncated is False
+    assert inv.artifacts[0].issue_count == 1
+    assert len(inv.events) == 1
+    assert len(inv.events[0].frames) == 2
+
+
+def test_issue_budget_sentinel_points_to_first_dropped_coordinates():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_issues=1, max_message_bytes=2)).ingest(
+            _request(_artifact("a.log", b"abcdef\nghijkl\n")))
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED,
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+    ]
+    sentinel = inv.issues[-1]
+    assert sentinel.artifact_id == inv.artifacts[0].artifact_id
+    assert sentinel.event_sequence == 1
+    assert sentinel.source_line == 2
+    assert inv.issues_truncated is True
+    assert inv.artifacts[0].issue_count == 2
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is False
+
+
+def test_issue_budget_sentinel_attribution_across_artifacts():
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=1)).ingest(
+        _request(
+            _artifact("a.log", b"\xff\n"),
+            _artifact("b.log", b"\xfe\n"),
+            _artifact("c.log", b"\xfd\n"),
+        ))
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.INVALID_UTF8,
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED,
+    ]
+    assert [issue.artifact_id for issue in inv.issues] == [
+        inv.artifacts[0].artifact_id, inv.artifacts[1].artifact_id]
+    assert inv.issues[-1].artifact_id == inv.artifacts[1].artifact_id
+    assert inv.issues[-1].source_line == 1
+    assert [artifact.issue_count for artifact in inv.artifacts] == [1, 1, 0]
+    assert sum(
+        artifact.issue_count for artifact in inv.artifacts) == len(inv.issues)
+    assert [artifact.status for artifact in inv.artifacts] == [
+        RuntimeArtifactStatus.FAILED,
+        RuntimeArtifactStatus.FAILED,
+        RuntimeArtifactStatus.FAILED,
+    ]
+
+
+def test_issue_budget_does_not_change_artifact_status_or_events():
+    content = b"abcdef\nghijkl\n"
+    request = _request(_artifact("a.log", content))
+    high = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_issues=10, max_message_bytes=2)).ingest(request)
+    low = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(
+        max_issues=1, max_message_bytes=2)).ingest(request)
+    assert [artifact.status for artifact in high.artifacts] == [
+        artifact.status for artifact in low.artifacts]
+    assert high.total_events == low.total_events
+    assert [event.event_id for event in high.events] == [
+        event.event_id for event in low.events]
+    assert high.issues_truncated is False
+    assert low.issues_truncated is True
+    assert len(high.issues) == 2
+    assert len(low.issues) == 2
+    assert low.issues[-1].code is RuntimeIssueCode.ISSUE_LIMIT_REACHED
+
+
+def test_issue_budget_never_exceeds_the_configured_cap():
+    max_issues = 2
+    inv = RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_issues=max_issues)).ingest(
+            _request(_artifact("a.log", b"\xff\n\xfe\n\xfd\n\xfc\n\xfb\n")))
+    ordinary = sum(
+        1 for issue in inv.issues
+        if issue.code is not RuntimeIssueCode.ISSUE_LIMIT_REACHED)
+    assert ordinary == max_issues
+    assert len(inv.issues) == max_issues + 1
+    assert inv.issues_truncated is True
+
+
+def test_issue_limit_zero_is_rejected_by_configuration():
+    with pytest.raises(RuntimeEvidenceConfigurationError):
+        RuntimeEvidenceConfig(max_issues=0)
+
+
+def test_issue_limit_sentinel_points_to_first_dropped_issue():
+    content = (b'{"kind":"log","message":"one"}\n'
+               b'{"kind":"log"}\n'
+               b'{"kind":"log"}\n')
+    inv = RuntimeEvidenceIngestor(RuntimeEvidenceConfig(max_issues=1)).ingest(
+        _request(_artifact("a.jsonl", content,
+                           RuntimeArtifactFormat.JSON_EVENTS)))
+    assert [issue.code for issue in inv.issues] == [
+        RuntimeIssueCode.INVALID_EVENT_SCHEMA,
+        RuntimeIssueCode.ISSUE_LIMIT_REACHED]
+    sentinel = inv.issues[-1]
+    assert sentinel.artifact_id == inv.artifacts[0].artifact_id
+    assert sentinel.event_sequence is None
+    assert sentinel.source_line == 3
+    assert inv.issues_truncated is True
+    assert inv.artifacts[0].issue_count == 2
