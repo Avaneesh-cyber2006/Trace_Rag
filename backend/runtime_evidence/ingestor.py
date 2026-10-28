@@ -7,6 +7,7 @@ returns one immutable inventory.
 """
 
 import hashlib
+import logging
 from dataclasses import dataclass, replace
 
 from backend.code_graph import CodeGraphInventory
@@ -23,6 +24,8 @@ from backend.runtime_evidence.drafts import (
 )
 from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceConfigurationError,
+    RuntimeEvidenceGraphError,
+    RuntimeEvidenceIngestionError,
     RuntimeEvidenceLimitError,
     RuntimeEvidenceValidationError,
 )
@@ -51,6 +54,8 @@ from backend.runtime_evidence.models import (
 from backend.runtime_evidence.stack_parser import parse_stack_trace_text
 from backend.runtime_evidence.text_adapter import parse_text_log
 from backend.runtime_evidence.validation import require_scalar_text
+
+logger = logging.getLogger(__name__)
 
 _DEDUPLICATION_KEY = tuple[
     RuntimeArtifactFormat, RuntimeFrameLanguage | None, str
@@ -478,12 +483,16 @@ class RuntimeEvidenceIngestor:
         self,
         config: RuntimeEvidenceConfig | None = None,
     ) -> None:
-        if config is None:
-            config = RuntimeEvidenceConfig()
-        elif type(config) is not RuntimeEvidenceConfig:
-            raise RuntimeEvidenceConfigurationError(
-                "config must be an exact RuntimeEvidenceConfig"
-            )
+        try:
+            if config is None:
+                config = RuntimeEvidenceConfig()
+            elif type(config) is not RuntimeEvidenceConfig:
+                raise RuntimeEvidenceConfigurationError(
+                    "config must be an exact RuntimeEvidenceConfig"
+                )
+        except RuntimeEvidenceConfigurationError:
+            logger.error("runtime evidence configuration failed")
+            raise
         self._config = config
 
     def ingest(
@@ -492,6 +501,84 @@ class RuntimeEvidenceIngestor:
         graph: CodeGraphInventory | None = None,
     ) -> RuntimeEvidenceInventory:
         """Ingest one request and return an immutable inventory."""
+        try:
+            logger.info("runtime evidence ingestion started")
+            inventory = self._ingest(request, graph)
+            self._log_artifact_details(inventory)
+            logger.info(
+                "runtime evidence ingestion completed "
+                "artifacts=%d events=%d frames=%d issues=%d",
+                len(inventory.artifacts),
+                len(inventory.events),
+                len(inventory.frames),
+                len(inventory.issues),
+            )
+            return inventory
+        except RuntimeEvidenceValidationError:
+            logger.error("runtime evidence validation failed")
+            raise
+        except RuntimeEvidenceLimitError:
+            logger.error("runtime evidence limit failed")
+            raise
+        except RuntimeEvidenceGraphError:
+            logger.error("runtime evidence graph failed")
+            raise
+        except Exception:
+            logger.error("runtime evidence ingestion failed")
+            raise RuntimeEvidenceIngestionError(
+                "runtime evidence ingestion failed"
+            ) from None
+
+    @staticmethod
+    def _log_artifact_details(
+        inventory: RuntimeEvidenceInventory,
+    ) -> None:
+        codes_by_artifact: dict[str, list[str]] = {}
+        for issue in inventory.issues:
+            codes_by_artifact.setdefault(
+                issue.artifact_id, []
+            ).append(issue.code.value)
+        for artifact in inventory.artifacts:
+            codes = sorted(
+                codes_by_artifact.get(artifact.artifact_id, ())
+            )
+            rendered_codes = ",".join(codes)
+            logger.debug(
+                "runtime evidence artifact artifact_id=%s format=%s "
+                "status=%s events=%d frames=%d issues=%s",
+                artifact.artifact_id,
+                artifact.format.value,
+                artifact.status.value,
+                artifact.event_count,
+                artifact.frame_count,
+                rendered_codes,
+            )
+            degraded = (
+                artifact.status
+                in (
+                    RuntimeArtifactStatus.PARTIAL,
+                    RuntimeArtifactStatus.FAILED,
+                    RuntimeArtifactStatus.SKIPPED,
+                )
+                or artifact.text_truncated
+                or artifact.frames_truncated
+                or RuntimeIssueCode.ISSUE_LIMIT_REACHED.value in codes
+            )
+            if degraded:
+                logger.warning(
+                    "runtime evidence artifact warning artifact_id=%s "
+                    "status=%s issues=%s",
+                    artifact.artifact_id,
+                    artifact.status.value,
+                    rendered_codes,
+                )
+
+    def _ingest(
+        self,
+        request: RuntimeEvidenceRequest,
+        graph: CodeGraphInventory | None = None,
+    ) -> RuntimeEvidenceInventory:
+        """Assemble one inventory without logging or failure translation."""
         config = self._config
         request = _validate_request(request, config)
         namespace = request.repository_namespace

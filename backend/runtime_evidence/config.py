@@ -1,5 +1,6 @@
 """Configuration for runtime evidence ingestion."""
 
+import logging
 from dataclasses import dataclass
 
 from backend.runtime_evidence.exceptions import (
@@ -9,6 +10,8 @@ from backend.runtime_evidence.validation import (
     require_exact_bool,
     require_positive_int,
 )
+
+logger = logging.getLogger(__name__)
 
 _INTEGER_FIELD_NAMES = (
     "max_artifacts",
@@ -62,26 +65,31 @@ class RuntimeEvidenceConfig:
 
     def __post_init__(self) -> None:
         """Validate every limit and cross-field relation."""
-        for field_name in _INTEGER_FIELD_NAMES:
-            require_positive_int(
-                getattr(self, field_name),
-                field_name,
+        try:
+            for field_name in _INTEGER_FIELD_NAMES:
+                require_positive_int(
+                    getattr(self, field_name),
+                    field_name,
+                    RuntimeEvidenceConfigurationError,
+                )
+            require_exact_bool(
+                self.retain_event_text,
+                "retain_event_text",
                 RuntimeEvidenceConfigurationError,
             )
-        require_exact_bool(
-            self.retain_event_text,
-            "retain_event_text",
-            RuntimeEvidenceConfigurationError,
-        )
-        if self.max_artifact_bytes > self.max_total_input_bytes:
-            raise RuntimeEvidenceConfigurationError(
-                "max_artifact_bytes must not exceed max_total_input_bytes"
-            )
-        if self.max_total_input_bytes > self.max_submitted_input_bytes:
-            raise RuntimeEvidenceConfigurationError(
-                "max_total_input_bytes must not exceed max_submitted_input_bytes"
-            )
-        if self.max_frames_per_event > self.max_total_frames:
-            raise RuntimeEvidenceConfigurationError(
-                "max_frames_per_event must not exceed max_total_frames"
-            )
+            if self.max_artifact_bytes > self.max_total_input_bytes:
+                raise RuntimeEvidenceConfigurationError(
+                    "max_artifact_bytes must not exceed max_total_input_bytes"
+                )
+            if self.max_total_input_bytes > self.max_submitted_input_bytes:
+                raise RuntimeEvidenceConfigurationError(
+                    "max_total_input_bytes must not exceed "
+                    "max_submitted_input_bytes"
+                )
+            if self.max_frames_per_event > self.max_total_frames:
+                raise RuntimeEvidenceConfigurationError(
+                    "max_frames_per_event must not exceed max_total_frames"
+                )
+        except RuntimeEvidenceConfigurationError:
+            logger.error("runtime evidence configuration failed")
+            raise

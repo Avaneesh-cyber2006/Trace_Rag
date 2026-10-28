@@ -1,8 +1,10 @@
+import logging
 from dataclasses import FrozenInstanceError, fields
 from types import MappingProxyType
 
 import pytest
 
+import backend.runtime_evidence as runtime_evidence
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceConfigurationError, RuntimeEvidenceError,
@@ -2477,3 +2479,173 @@ def test_pipeline_indexes_are_immutable_exact_filters():
             assert type(value) is tuple
         with pytest.raises(TypeError):
             mapping["x"] = ()
+
+
+# --- Task 18: public exports, convenience API, and configuration logging ---
+
+
+EXPECTED_EXPORTS = {
+    "CaptureCompleteness", "FrameAssociation", "GraphBinding", "PathMatchBasis",
+    "RuntimeArtifact", "RuntimeArtifactFormat", "RuntimeArtifactRecord",
+    "RuntimeArtifactStatus", "RuntimeEvent", "RuntimeEventKind",
+    "RuntimeEvidenceConfig", "RuntimeEvidenceConfigurationError",
+    "RuntimeEvidenceError", "RuntimeEvidenceGraphError",
+    "RuntimeEvidenceIngestionError", "RuntimeEvidenceIngestor",
+    "RuntimeEvidenceInventory", "RuntimeEvidenceInvariantError",
+    "RuntimeEvidenceIssue", "RuntimeEvidenceLimitError",
+    "RuntimeEvidenceRequest", "RuntimeEvidenceValidationError",
+    "RuntimeFrameLanguage", "RuntimeIncompleteReason", "RuntimeIssueCode",
+    "RuntimeStackFrame", "RuntimeTag", "ingest_runtime_evidence",
+}
+
+
+def test_public_exports_are_exact_and_hide_internals():
+    assert set(runtime_evidence.__all__) == EXPECTED_EXPORTS
+    assert len(runtime_evidence.__all__) == 28
+    assert len(set(runtime_evidence.__all__)) == 28
+    for name in EXPECTED_EXPORTS:
+        assert getattr(runtime_evidence, name)
+    for name in (
+        "parse_text_log", "parse_json_events", "parse_stack_source",
+        "normalize_source_reference", "build_inventory_indexes",
+        "build_association_index", "AssociationIndex",
+    ):
+        assert not hasattr(runtime_evidence, name)
+
+
+def test_convenience_api_forwards_defaults_and_explicit_inputs(monkeypatch):
+    seen = []
+
+    class FakeIngestor:
+        def __init__(self, config=None):
+            seen.append(("init", config))
+
+        def ingest(self, request, graph=None):
+            seen.append(("ingest", request, graph))
+            return "RESULT"
+
+    monkeypatch.setattr(
+        runtime_evidence, "RuntimeEvidenceIngestor", FakeIngestor)
+    request = _request()
+    assert runtime_evidence.ingest_runtime_evidence(request) == "RESULT"
+    assert seen == [("init", None), ("ingest", request, None)]
+
+    seen.clear()
+    config = RuntimeEvidenceConfig(max_events=1)
+    graph = object()
+    assert runtime_evidence.ingest_runtime_evidence(
+        request, graph=graph, config=config) == "RESULT"
+    assert seen == [("init", config), ("ingest", request, graph)]
+
+
+def test_convenience_api_uses_a_fresh_instance_on_every_call(monkeypatch):
+    created = []
+
+    class FakeIngestor:
+        def __init__(self, config=None):
+            self.calls = 0
+            created.append(self)
+
+        def ingest(self, request, graph=None):
+            self.calls += 1
+            return ("RESULT", len(created), self.calls)
+
+    monkeypatch.setattr(
+        runtime_evidence, "RuntimeEvidenceIngestor", FakeIngestor)
+    first = runtime_evidence.ingest_runtime_evidence(_request())
+    second = runtime_evidence.ingest_runtime_evidence(_request())
+    assert first == ("RESULT", 1, 1)
+    assert second == ("RESULT", 2, 1)
+    assert len(created) == 2
+    assert created[0] is not created[1]
+
+
+def test_convenience_api_propagates_the_original_failure(monkeypatch):
+    failure = RuntimeEvidenceValidationError("SENTINEL-VALIDATION")
+
+    class FakeIngestor:
+        def __init__(self, config=None):
+            pass
+
+        def ingest(self, request, graph=None):
+            raise failure
+
+    monkeypatch.setattr(
+        runtime_evidence, "RuntimeEvidenceIngestor", FakeIngestor)
+    with pytest.raises(RuntimeEvidenceValidationError) as caught:
+        runtime_evidence.ingest_runtime_evidence(_request())
+    assert caught.value is failure
+
+
+def test_constructor_rejects_non_exact_config_with_one_log(caplog):
+    logger_name = "backend.runtime_evidence.ingestor"
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        with pytest.raises(RuntimeEvidenceConfigurationError):
+            runtime_evidence.RuntimeEvidenceIngestor(object())
+    assert [(record.name, record.getMessage())
+            for record in caplog.records] == [
+        (logger_name, "runtime evidence configuration failed")]
+    record = caplog.records[0]
+    assert record.levelno == logging.ERROR
+    assert record.args == ()
+    assert record.exc_info is None
+    assert record.stack_info is None
+
+
+def test_convenience_config_rejection_logs_once_and_not_twice(caplog):
+    logger_name = "backend.runtime_evidence.ingestor"
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        with pytest.raises(RuntimeEvidenceConfigurationError):
+            runtime_evidence.ingest_runtime_evidence(
+                _request(), config=object())
+    assert [(record.name, record.getMessage())
+            for record in caplog.records] == [
+        (logger_name, "runtime evidence configuration failed")]
+
+
+def test_separate_instances_keep_distinct_effective_configs():
+    request = _request(artifacts=(_artifact(content=b"one\ntwo\n"),))
+    limited = runtime_evidence.RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_events=1)).ingest(request)
+    full = runtime_evidence.RuntimeEvidenceIngestor(
+        RuntimeEvidenceConfig(max_events=2)).ingest(request)
+    assert limited.total_events == 1
+    assert limited.events_truncated is True
+    assert [event.message for event in limited.events] == ["one"]
+    assert full.total_events == 2
+    assert full.events_truncated is False
+    assert [event.message for event in full.events] == ["one", "two"]
+
+
+def test_convenience_results_keep_existing_redacted_representations():
+    sentinel = "CP18-PRIVACY"
+    inventory = runtime_evidence.ingest_runtime_evidence(_request(
+        artifacts=(
+            _artifact(
+                source_name=f"{sentinel}-SOURCE.log",
+                content=(sentinel + "-MESSAGE\n").encode(),
+            ),
+            _artifact(
+                source_name=f"{sentinel}-STACK.log",
+                format=RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                content=(
+                    f'  File "pkg/{sentinel}-PATH.py", line 1, '
+                    f"in {sentinel}-FUNCTION\n"
+                ).encode(),
+                declared_language=RuntimeFrameLanguage.PYTHON,
+            ),
+        ),
+        repository_namespace=f"{sentinel}-NAMESPACE",
+        declared_revision=f"{sentinel}-REVISION",
+    ))
+    assert inventory.frames
+    values = (
+        inventory,
+        *inventory.artifacts,
+        *inventory.events,
+        *inventory.frames,
+        *inventory.issues,
+    )
+    for value in values:
+        text = repr(value) + str(value)
+        assert sentinel not in text, type(value).__name__
