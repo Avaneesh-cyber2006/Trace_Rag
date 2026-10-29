@@ -1,10 +1,14 @@
+import inspect
+import json
 import logging
-from dataclasses import FrozenInstanceError, fields
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, fields, is_dataclass
 from types import MappingProxyType
 
 import pytest
 
 import backend.runtime_evidence as runtime_evidence
+import backend.runtime_evidence.models as models_module
 from backend.runtime_evidence.config import RuntimeEvidenceConfig
 from backend.runtime_evidence.exceptions import (
     RuntimeEvidenceConfigurationError, RuntimeEvidenceError,
@@ -2649,3 +2653,404 @@ def test_convenience_results_keep_existing_redacted_representations():
     for value in values:
         text = repr(value) + str(value)
         assert sentinel not in text, type(value).__name__
+
+
+# --- Task 20: security, privacy, and redacted representations ---
+
+
+SENTINEL = "SENTINEL-REPR-CONTENT"
+HOSTILE = "\x1b[31m" + SENTINEL + "\x1b[0m\u202e"
+
+_PUBLIC_NON_CONFIG_DATACLASSES = (
+    RuntimeTag,
+    RuntimeArtifact,
+    RuntimeEvidenceRequest,
+    RuntimeStackFrame,
+    RuntimeEvent,
+    RuntimeEvidenceIssue,
+    RuntimeArtifactRecord,
+    RuntimeEvidenceInventory,
+)
+
+
+def _privacy_config(**overrides):
+    values = dict(max_stack_bytes=512, max_message_bytes=128,
+                  max_error_message_bytes=128, max_frame_function_bytes=128,
+                  max_line_bytes=512, max_tags=4, max_tag_key_bytes=32,
+                  max_tag_value_bytes=64, retain_event_text=True)
+    values.update(overrides)
+    return RuntimeEvidenceConfig(**values)
+
+
+def _privacy_artifact(name, content, fmt=RuntimeArtifactFormat.TEXT_LOG,
+                      language=None):
+    return RuntimeArtifact(name, fmt, content, language)
+
+
+def _privacy_request(*artifacts, namespace="repo", revision=None, captured=None,
+                     completeness=None):
+    kwargs = {}
+    if revision is not None:
+        kwargs["declared_revision"] = revision
+    if captured is not None:
+        kwargs["declared_captured_at"] = captured
+    if completeness is not None:
+        kwargs["declared_capture_completeness"] = completeness
+    return RuntimeEvidenceRequest(namespace, tuple(artifacts), **kwargs)
+
+
+def _privacy_inventory(**config_overrides):
+    log = {
+        "kind": "log",
+        "message": SENTINEL + "-message",
+        "timestamp": SENTINEL + "-timestamp",
+        "level": SENTINEL + "-level",
+        "logger": SENTINEL + "-logger",
+        "operation": SENTINEL + "-operation",
+        "trace_id": SENTINEL + "-trace",
+        "span_id": SENTINEL + "-span",
+        "parent_span_id": SENTINEL + "-parent",
+        "duration_ms": "1.5",
+        "status": SENTINEL + "-status",
+        "tags": {"secret_key": "secret_value"},
+    }
+    error = {
+        "kind": "error",
+        "message": SENTINEL + "-error-message",
+        "error": {
+            "type": SENTINEL + "-error-type",
+            "message": SENTINEL + "-error-detail",
+            "frames": [{
+                "function": SENTINEL + "-function",
+                "source": "pkg/app.py",
+                "line": 5,
+                "column": 2,
+            }],
+        },
+    }
+    content = (b"\xff\n" + (json.dumps(log) + "\n" + json.dumps(error) + "\n").encode())
+    return RuntimeEvidenceIngestor(_privacy_config(**config_overrides)).ingest(
+        _privacy_request(_privacy_artifact(SENTINEL + "-source.log", content,
+                                           RuntimeArtifactFormat.JSON_EVENTS),
+                         namespace=SENTINEL + "-namespace",
+                         revision=SENTINEL + "-revision",
+                         captured=SENTINEL + "-captured"))
+
+
+def _leaf_values(value):
+    if is_dataclass(value):
+        for field in fields(value):
+            yield from _leaf_values(getattr(value, field.name))
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            yield key
+            yield from _leaf_values(item)
+    elif isinstance(value, tuple):
+        for item in value:
+            yield from _leaf_values(item)
+    else:
+        yield value
+
+
+def test_every_public_record_owns_an_explicit_redacted_repr():
+    inventory = _privacy_inventory()
+    artifact = _privacy_artifact(SENTINEL + "-artifact", SENTINEL.encode())
+    request = _privacy_request(
+        artifact, namespace=SENTINEL + "-request-namespace",
+        revision=SENTINEL + "-request-revision",
+        captured=SENTINEL + "-request-captured")
+    values = (
+        artifact, request, RuntimeTag(SENTINEL + "-key", SENTINEL + "-value"),
+        inventory, *inventory.artifacts, *inventory.events,
+        *inventory.frames, *inventory.issues,
+    )
+    for value in values:
+        assert "__repr__" in type(value).__dict__, type(value).__name__
+        assert type(value).__repr__ is not object.__repr__
+        text = repr(value)
+        assert type(value).__name__ in text
+        for forbidden in (SENTINEL, "pkg/app.py", "secret_key", "secret_value",
+                          "\x1b", "\u202e", "b'", 'b"'):
+            assert forbidden not in text, (type(value).__name__, forbidden)
+
+
+def test_repr_prints_only_identity_structure_and_counts():
+    inventory = _privacy_inventory()
+    event = next(item for item in inventory.events if item.kind.value == "log")
+    frame = inventory.frames[0]
+    record = inventory.artifacts[0]
+    issue = inventory.issues[0]
+    assert f"event_id={event.event_id}" in repr(event)
+    assert f"artifact_id={event.artifact_id}" in repr(event)
+    assert "sequence=0" in repr(event)
+    assert "kind=log" in repr(event)
+    assert "frame_count=0" in repr(event)
+    assert f"frame_id={frame.frame_id}" in repr(frame)
+    assert "language=unknown" in repr(frame)
+    assert "path_match_basis=unverified_relative_path" in repr(frame)
+    assert "association=not_evaluated" in repr(frame)
+    assert f"artifact_id={record.artifact_id}" in repr(record)
+    assert f"status={record.status.value}" in repr(record)
+    assert f"size_bytes={record.size_bytes}" in repr(record)
+    assert "event_text_retained=True" in repr(inventory)
+    assert f"incomplete_reason_count={len(inventory.incomplete_reasons)}" in repr(
+        inventory)
+    assert f"code={issue.code.value}" in repr(issue)
+    assert f"source_line={issue.source_line}" in repr(issue)
+
+
+def test_inventory_contains_no_bytes_or_raw_artifact_reference():
+    inventory = _privacy_inventory()
+    leaves = list(_leaf_values(inventory))
+    assert not any(isinstance(value, (bytes, bytearray, memoryview))
+                   for value in leaves)
+    assert all(not isinstance(value, RuntimeArtifact) for value in leaves)
+
+
+def test_metadata_only_reprs_stay_redacted_and_keep_structure():
+    inventory = _privacy_inventory(retain_event_text=False)
+    assert inventory.event_text_retained is False
+    assert inventory.text_truncated is False
+    assert all(event.text_truncated is False for event in inventory.events)
+    assert all(artifact.text_truncated is False
+               for artifact in inventory.artifacts)
+    assert RuntimeIncompleteReason.TEXT_TRUNCATED not in (
+        inventory.incomplete_reasons)
+    assert all(event.message is None for event in inventory.events)
+    assert all(event.tags == () for event in inventory.events)
+    assert all(frame.function_text is None for frame in inventory.frames)
+    assert inventory.frames[0].relative_path == "pkg/app.py"
+    assert inventory.frames[0].line == 5
+    for value in (inventory, *inventory.artifacts, *inventory.events,
+                  *inventory.frames):
+        assert SENTINEL not in repr(value)
+        assert "pkg/app.py" not in repr(value)
+
+
+def test_task20_reprs_have_exact_redacted_formats():
+    inventory = _privacy_inventory()
+    artifact = _privacy_artifact(SENTINEL + "-artifact", SENTINEL.encode())
+    request = _privacy_request(artifact, namespace=SENTINEL + "-namespace")
+    tag = RuntimeTag(SENTINEL + "-key", SENTINEL + "-value")
+    log_event = next(
+        item for item in inventory.events if item.kind.value == "log")
+    error_event = next(
+        item for item in inventory.events if item.kind.value == "error")
+    frame = inventory.frames[0]
+    record = inventory.artifacts[0]
+    issue = inventory.issues[0]
+
+    assert repr(tag) == "RuntimeTag()"
+    assert repr(artifact) == (
+        "RuntimeArtifact(format=text_log, declared_language=None, "
+        f"size_bytes={len(SENTINEL.encode())})"
+    )
+    assert repr(request) == "RuntimeEvidenceRequest(artifact_count=1)"
+    assert repr(frame) == (
+        f"RuntimeStackFrame(frame_id={frame.frame_id}, "
+        f"event_id={frame.event_id}, ordinal=0, language=unknown, "
+        "line=5, column=2, "
+        "path_match_basis=unverified_relative_path, "
+        "association=not_evaluated, candidate_count=0)"
+    )
+    assert repr(log_event) == (
+        f"RuntimeEvent(event_id={log_event.event_id}, "
+        f"artifact_id={log_event.artifact_id}, sequence=0, "
+        "source_line=2, kind=log, frame_count=0, "
+        "text_truncated=False, frames_truncated=False)"
+    )
+    assert repr(error_event) == (
+        f"RuntimeEvent(event_id={error_event.event_id}, "
+        f"artifact_id={error_event.artifact_id}, sequence=1, "
+        "source_line=3, kind=error, frame_count=1, "
+        "text_truncated=False, frames_truncated=False)"
+    )
+    assert repr(issue) == (
+        f"RuntimeEvidenceIssue(code=invalid_utf8, "
+        f"artifact_id={issue.artifact_id}, event_sequence=None, "
+        "source_line=1)"
+    )
+    assert repr(record) == (
+        f"RuntimeArtifactRecord(artifact_id={record.artifact_id}, "
+        "format=json_events, declared_language=None, "
+        f"size_bytes={record.size_bytes}, status=partial, "
+        "event_count=2, frame_count=1, duplicate_count=0, "
+        "text_truncated=False, frames_truncated=False, issue_count=1)"
+    )
+    assert repr(inventory) == (
+        "RuntimeEvidenceInventory(artifact_count=1, event_count=2, "
+        "frame_count=1, issue_count=1, "
+        f"total_input_bytes={inventory.total_input_bytes}, "
+        "submitted_artifacts=1, duplicate_artifacts=0, "
+        "graph_binding=not_provided, event_text_retained=True, "
+        "ingestion_complete=False, text_truncated=False, "
+        "events_truncated=False, frames_truncated=False, "
+        "issues_truncated=False, "
+        f"incomplete_reason_count={len(inventory.incomplete_reasons)})"
+    )
+
+
+def test_runtime_artifact_one_mib_binary_repr_is_exact_and_redacted():
+    body = ((SENTINEL.encode() + b"\x00\xff\x1b") * 50_000)[:1_048_576]
+    assert len(body) == 1_048_576
+    source = SENTINEL + "-source-secret_key-secret_value.log"
+    artifact = RuntimeArtifact(
+        source, RuntimeArtifactFormat.TEXT_LOG, body)
+    text = repr(artifact)
+    assert text == (
+        "RuntimeArtifact(format=text_log, declared_language=None, "
+        f"size_bytes={len(body)})"
+    )
+    for forbidden in (
+        SENTINEL,
+        source,
+        "b'",
+        'b"',
+        "bytearray",
+        repr(body),
+        str(body),
+        body.hex(),
+        body.decode("latin-1"),
+    ):
+        assert forbidden not in text
+
+
+def test_hostile_nested_inventory_reprs_are_inert():
+    log = {
+        "kind": "log",
+        "message": HOSTILE,
+        "tags": {HOSTILE: HOSTILE},
+    }
+    error = {
+        "kind": "error",
+        "message": HOSTILE,
+        "error": {
+            "type": HOSTILE,
+            "message": HOSTILE,
+            "frames": [{
+                "function": HOSTILE,
+                "source": "pkg/app.py",
+                "line": 1,
+                "column": 0,
+            }],
+        },
+    }
+    content = (json.dumps(log) + "\n" + json.dumps(error) + "\n").encode()
+    inventory = RuntimeEvidenceIngestor(
+        _privacy_config(max_tag_key_bytes=64)).ingest(
+        _privacy_request(_privacy_artifact(
+            SENTINEL + "-hostile-source.log", content,
+            RuntimeArtifactFormat.JSON_EVENTS)))
+    assert inventory.events[0].message == HOSTILE
+    assert inventory.events[0].tags[0].key == HOSTILE
+    assert inventory.events[0].tags[0].value == HOSTILE
+    assert inventory.frames[0].function_text == HOSTILE
+
+    request = _privacy_request(
+        _privacy_artifact(SENTINEL + "-hostile-request.log", HOSTILE.encode()),
+        namespace=HOSTILE, revision=HOSTILE, captured=HOSTILE)
+    assert repr(request) == "RuntimeEvidenceRequest(artifact_count=1)"
+    values = (
+        request,
+        inventory,
+        *inventory.artifacts,
+        *inventory.events,
+        *inventory.frames,
+        *inventory.issues,
+    )
+    for value in values:
+        text = repr(value)
+        for forbidden in (
+            SENTINEL,
+            "\x1b",
+            "\u202e",
+            "\\x1b",
+            "\\u202e",
+            repr(HOSTILE),
+            HOSTILE.encode("unicode_escape").decode("ascii"),
+            "pkg/app.py",
+        ):
+            assert forbidden not in text, (type(value).__name__, forbidden)
+
+    tag = RuntimeTag(HOSTILE, HOSTILE)
+    assert repr(tag) == "RuntimeTag()"
+    artifact = _privacy_artifact(
+        SENTINEL + "-hostile-artifact.log", HOSTILE.encode())
+    assert repr(artifact) == (
+        "RuntimeArtifact(format=text_log, declared_language=None, "
+        f"size_bytes={len(HOSTILE.encode())})"
+    )
+
+
+def test_public_models_are_frozen_slotted_and_own_explicit_reprs():
+    artifact, request, tag, frame, event, issue, record, inventory = (
+        _privacy_models()
+    )
+    instances = (tag, artifact, request, frame, event, issue, record, inventory)
+    for cls, value in zip(_PUBLIC_NON_CONFIG_DATACLASSES, instances):
+        assert type(value) is cls
+        assert is_dataclass(cls)
+        assert cls.__dataclass_params__.frozen is True
+        assert "__slots__" in cls.__dict__
+        assert "__repr__" in cls.__dict__
+        assert cls.__repr__ is not object.__repr__
+        assert inspect.getsourcefile(cls.__repr__) == models_module.__file__
+        assert not hasattr(value, "__dict__")
+        first_field = fields(value)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(value, first_field, None)
+
+    config = RuntimeEvidenceConfig()
+    assert is_dataclass(config)
+    assert type(config).__dataclass_params__.frozen is True
+    assert "__slots__" in type(config).__dict__
+    assert not hasattr(config, "__dict__")
+
+    public_dataclasses = [
+        getattr(runtime_evidence, name)
+        for name in runtime_evidence.__all__
+        if is_dataclass(getattr(runtime_evidence, name))
+    ]
+    without_explicit_repr = [
+        cls for cls in public_dataclasses
+        if inspect.getsourcefile(cls.__repr__) != models_module.__file__
+    ]
+    assert without_explicit_repr == [RuntimeEvidenceConfig]
+
+
+EXPECTED_ALL = (
+    "CaptureCompleteness",
+    "FrameAssociation",
+    "GraphBinding",
+    "PathMatchBasis",
+    "RuntimeArtifact",
+    "RuntimeArtifactFormat",
+    "RuntimeArtifactRecord",
+    "RuntimeArtifactStatus",
+    "RuntimeEvent",
+    "RuntimeEventKind",
+    "RuntimeEvidenceConfig",
+    "RuntimeEvidenceConfigurationError",
+    "RuntimeEvidenceError",
+    "RuntimeEvidenceGraphError",
+    "RuntimeEvidenceIngestionError",
+    "RuntimeEvidenceIngestor",
+    "RuntimeEvidenceInventory",
+    "RuntimeEvidenceInvariantError",
+    "RuntimeEvidenceIssue",
+    "RuntimeEvidenceLimitError",
+    "RuntimeEvidenceRequest",
+    "RuntimeEvidenceValidationError",
+    "RuntimeFrameLanguage",
+    "RuntimeIncompleteReason",
+    "RuntimeIssueCode",
+    "RuntimeStackFrame",
+    "RuntimeTag",
+    "ingest_runtime_evidence",
+)
+
+
+def test_public_all_is_the_exact_28_name_contract():
+    assert runtime_evidence.__all__ == EXPECTED_ALL
+    assert len(EXPECTED_ALL) == 28
+    assert len(set(EXPECTED_ALL)) == 28
