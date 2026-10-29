@@ -4,9 +4,14 @@ import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
+from backend.code_graph import CodeGraphInventory, GraphNode, GraphNodeKind
+from backend.runtime_evidence import (
+    RuntimeArtifact, RuntimeEvidenceIngestor, RuntimeEvidenceRequest,
+)
 from backend.runtime_evidence.exceptions import RuntimeEvidenceInvariantError
 from backend.runtime_evidence.identities import (
     artifact_id, event_fingerprint, event_id, frame_id,
@@ -672,3 +677,133 @@ def test_event_fingerprint_rejects_surrogate_in_tags_and_frames(
     assert message == INVALID_MESSAGE
     assert "\ud800" not in message
     assert exc_info.value.__cause__ is None
+
+
+def _runtime_request(*artifacts):
+    return RuntimeEvidenceRequest("repo", tuple(artifacts))
+
+
+def _file_node(node_id, relative_path):
+    return GraphNode(
+        node_id=node_id,
+        node_kind=GraphNodeKind.FILE,
+        repository_namespace="repo",
+        relative_path=relative_path,
+        language="python",
+        parse_status="success",
+        symbol_kind=None,
+        name=None,
+        qualified_name=None,
+        location=None,
+    )
+
+
+def _file_graph(relative_path):
+    return CodeGraphInventory(
+        "repo",
+        (_file_node("node-app", relative_path),),
+        (),
+        (),
+        MappingProxyType({}),
+        MappingProxyType({}),
+        MappingProxyType({}),
+        MappingProxyType({}),
+    )
+
+
+def _id_tuples(inventory):
+    return (
+        tuple(artifact.artifact_id for artifact in inventory.artifacts),
+        tuple(event.event_id for event in inventory.events),
+        tuple(frame.frame_id for frame in inventory.frames),
+    )
+
+
+def test_fingerprint_groups_equal_normalized_content_without_merging_occurrences():
+    request = _runtime_request(
+        RuntimeArtifact(
+            "a.jsonl",
+            RuntimeArtifactFormat.JSON_EVENTS,
+            b'{"kind":"log","message":"same"}\n',
+        ),
+        RuntimeArtifact(
+            "b.jsonl",
+            RuntimeArtifactFormat.JSON_EVENTS,
+            b'{ "kind": "log", "message": "same" }\n',
+        ),
+    )
+    inventory = RuntimeEvidenceIngestor().ingest(request)
+    assert len(inventory.artifacts) == 2
+    assert len(inventory.events) == 2
+    assert len({
+        artifact.artifact_id for artifact in inventory.artifacts
+    }) == 2
+    first, second = inventory.events
+    assert first.event_id != second.event_id
+    assert first.sequence == 0
+    assert second.sequence == 0
+    assert first.event_fingerprint == second.event_fingerprint
+    assert inventory.events_by_fingerprint[
+        first.event_fingerprint
+    ] == inventory.events
+    repeated = RuntimeEvidenceIngestor().ingest(request)
+    assert _id_tuples(repeated) == _id_tuples(inventory)
+
+
+def test_repeated_occurrences_in_one_artifact_keep_sequences_and_ids():
+    request = _runtime_request(
+        RuntimeArtifact(
+            "events.jsonl",
+            RuntimeArtifactFormat.JSON_EVENTS,
+            b'{"kind":"log","message":"same"}\n'
+            b'{"kind":"log","message":"same"}\n',
+        )
+    )
+    inventory = RuntimeEvidenceIngestor().ingest(request)
+    first, second = inventory.events
+    assert [event.sequence for event in inventory.events] == [0, 1]
+    assert first.event_id != second.event_id
+    assert first.event_fingerprint == second.event_fingerprint
+    assert inventory.events_by_fingerprint[
+        first.event_fingerprint
+    ] == inventory.events
+    repeated = RuntimeEvidenceIngestor().ingest(request)
+    assert _id_tuples(repeated) == _id_tuples(inventory)
+
+
+def test_identity_tuples_are_identical_across_repeated_runs_and_graphs():
+    request = _runtime_request(
+        RuntimeArtifact("a.log", RuntimeArtifactFormat.TEXT_LOG, b"one\n"),
+        RuntimeArtifact(
+            "b.jsonl",
+            RuntimeArtifactFormat.JSON_EVENTS,
+            b'{"kind":"log","message":"two"}\n',
+        ),
+        RuntimeArtifact(
+            "c.txt",
+            RuntimeArtifactFormat.STACK_TRACE_TEXT,
+            b'  File "pkg/app.py", line 1, in f\n',
+            RuntimeFrameLanguage.PYTHON,
+        ),
+    )
+    graph = _file_graph("pkg/app.py")
+    without_graph = [
+        RuntimeEvidenceIngestor().ingest(request) for _ in range(2)
+    ]
+    with_graph = [
+        RuntimeEvidenceIngestor().ingest(request, graph) for _ in range(2)
+    ]
+    for pair in (without_graph, with_graph):
+        assert pair[0] == pair[1]
+        for name in (
+            "events_by_artifact",
+            "events_by_trace_id",
+            "events_by_fingerprint",
+            "frames_by_file",
+            "frames_by_node",
+        ):
+            assert getattr(pair[0], name) is not getattr(pair[1], name)
+    assert len({
+        _id_tuples(inventory)
+        for inventory in (*without_graph, *with_graph)
+    }) == 1
