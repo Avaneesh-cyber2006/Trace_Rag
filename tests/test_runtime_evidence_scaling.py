@@ -3,13 +3,14 @@
 import json
 import sys
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
+import backend.runtime_evidence.association as association
 import backend.runtime_evidence.json_adapter as json_adapter
 from backend.runtime_evidence import (
     FrameAssociation,
@@ -67,6 +68,25 @@ class CountingTuple(tuple):
     def __iter__(self):
         self.counts["iter"] += 1
         for item in super().__iter__():
+            self.counts["yield"] += 1
+            yield item
+
+
+class CountingSequence(Sequence):
+    def __init__(self, source):
+        self.source = tuple(source)
+        self.counts = Counter()
+
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, index):
+        self.counts["getitem"] += 1
+        return self.source[index]
+
+    def __iter__(self):
+        self.counts["iter"] += 1
+        for item in self.source:
             self.counts["yield"] += 1
             yield item
 
@@ -137,6 +157,26 @@ def _scan_line_events(text):
     return count, result
 
 
+def _match_line_events(lines, symbols):
+    count = 0
+    previous = sys.gettrace()
+
+    def tracer(frame, event, arg):
+        nonlocal count
+        if event == "line" and Path(frame.f_code.co_filename).name == (
+            "association.py"
+        ):
+            count += 1
+        return tracer
+
+    sys.settrace(tracer)
+    try:
+        result = match_symbols_by_line(lines, symbols)
+    finally:
+        sys.settrace(previous)
+    return count, result
+
+
 def test_json_structural_scan_work_is_linear_in_input_fields(monkeypatch):
     monkeypatch.setattr(
         json,
@@ -195,7 +235,7 @@ def test_jsonl_materializes_each_line_once_and_never_sums_nodes(monkeypatch):
     assert len(calls) == 10
 
 
-def test_basename_buckets_avoid_a_global_scan_per_frame():
+def test_basename_buckets_avoid_a_global_scan_per_frame(monkeypatch):
     target = GraphFileEntry("target", "pkg/app.py", ("pkg", "app.py"))
     unrelated = tuple(
         GraphFileEntry(f"f{i}", f"pkg{i}/app{i}.py", (f"pkg{i}", f"app{i}.py"))
@@ -205,12 +245,21 @@ def test_basename_buckets_avoid_a_global_scan_per_frame():
     by_base = CountingMapping(
         {entry.components[-1]: (entry,) for entry in unrelated + (target,)}
     )
-    by_file = CountingMapping({})
+    by_file = CountingMapping({target.relative_path: ()})
     index = AssociationIndex(by_path, by_base, by_file)
     drafts = tuple(
         FrameDraft(RuntimeFrameLanguage.PYTHON, "f", "app.py", 1, None)
         for _ in range(20)
     )
+
+    match_calls = []
+    real_match = association.match_symbols_by_line
+
+    def counted_match(*args, **kwargs):
+        match_calls.append(1)
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(association, "match_symbols_by_line", counted_match)
 
     result = associate_frames(
         drafts,
@@ -222,6 +271,7 @@ def test_basename_buckets_avoid_a_global_scan_per_frame():
         graph_index=index,
     )
 
+    assert len(result.frames) == len(drafts)
     assert all(
         frame.path_match_basis is PathMatchBasis.UNIQUE_BASENAME
         for frame in result.frames
@@ -231,21 +281,110 @@ def test_basename_buckets_avoid_a_global_scan_per_frame():
         frame.association is FrameAssociation.FILE for frame in result.frames
     )
     assert by_path.counts["iter"] == 0
+    assert by_path.counts["get"] == 0
     assert by_base.counts["iter"] == 0
-    assert by_base.counts["get"] >= 1
+    assert by_base.counts["get"] == len(drafts)
+    assert by_file.counts["iter"] == 0
+    assert by_file.counts["yield"] == 0
+    assert by_file.counts["get"] == 1
+    assert match_calls == [1]
+
+
+@pytest.mark.parametrize(
+    ("source", "path_gets"),
+    [
+        ("pkg/app.py", 20),
+        ("/src/pkg/app.py", 0),
+    ],
+)
+def test_suffix_resolution_uses_keyed_basename_bucket(
+    source, path_gets, monkeypatch
+):
+    target = GraphFileEntry(
+        "target", "src/pkg/app.py", ("src", "pkg", "app.py")
+    )
+    shorter = GraphFileEntry("near", "lib/app.py", ("lib", "app.py"))
+    longer = GraphFileEntry(
+        "far", "vendor/other/app.py", ("vendor", "other", "app.py")
+    )
+    by_path = CountingMapping({})
+    by_base = CountingMapping({"app.py": (target, shorter, longer)})
+    by_file = CountingMapping({target.relative_path: ()})
+    index = AssociationIndex(by_path, by_base, by_file)
+    drafts = tuple(
+        FrameDraft(RuntimeFrameLanguage.PYTHON, "f", source, 1, None)
+        for _ in range(20)
+    )
+
+    match_calls = []
+    real_match = association.match_symbols_by_line
+
+    def counted_match(*args, **kwargs):
+        match_calls.append(1)
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(association, "match_symbols_by_line", counted_match)
+
+    result = associate_frames(
+        drafts,
+        event_id="e" * 64,
+        event_sequence=0,
+        source_line=1,
+        repository_namespace="repo",
+        config=RuntimeEvidenceConfig(),
+        graph_index=index,
+    )
+
+    assert len(result.frames) == len(drafts)
+    assert all(
+        frame.path_match_basis is PathMatchBasis.UNIQUE_PATH_SUFFIX
+        for frame in result.frames
+    )
+    assert all(
+        frame.relative_path == "src/pkg/app.py" for frame in result.frames
+    )
+    assert all(
+        frame.association is FrameAssociation.FILE for frame in result.frames
+    )
+    assert by_path.counts["iter"] == 0
+    assert by_path.counts["get"] == path_gets
+    assert by_base.counts["iter"] == 0
+    assert by_base.counts["get"] == len(drafts)
+    assert by_file.counts["iter"] == 0
+    assert by_file.counts["yield"] == 0
+    assert by_file.counts["get"] == 1
+    assert match_calls == [1]
 
 
 def test_line_sweep_never_compares_all_symbols_with_all_frames():
     symbols = CountingTuple(
         GraphSymbolEntry(f"s{i}", i * 10 + 1, i * 10 + 5) for i in range(1000)
     )
-    lines = tuple(range(1, 1001, 10))
+    lines = CountingSequence(range(1, 1001, 10))
 
     matches = match_symbols_by_line(lines, symbols)
 
     assert len(matches) == len(lines)
     assert all(len(match) == 1 for match in matches)
     assert symbols.counts["yield"] <= 2 * len(symbols) + 10
+    line_accesses = lines.counts["getitem"] + lines.counts["yield"]
+    assert line_accesses <= 3 * len(lines) + 10
+
+
+def test_line_sweep_execution_growth_is_not_quadratic():
+    counts = {}
+    for count in (200, 400):
+        symbols = tuple(
+            GraphSymbolEntry(f"s{i}", i * 10 + 1, i * 10 + 5)
+            for i in range(count)
+        )
+        lines = tuple(range(1, count * 10, 10))
+        events, matches = _match_line_events(lines, symbols)
+        assert len(matches) == count
+        assert all(len(match) == 1 for match in matches)
+        counts[count] = events
+    assert counts[200] > 0
+    assert counts[400] <= 3 * counts[200]
 
 
 def test_record_outputs_scale_linearly_without_content_deduplication():
