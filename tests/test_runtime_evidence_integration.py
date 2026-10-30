@@ -6,7 +6,7 @@ import os
 import socket
 import subprocess
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
 
@@ -77,7 +77,12 @@ def _symbol_node(graph, qualified_name):
 
 
 def _leaf_values(value):
-    if is_dataclass(value):
+    # Graph objects are themselves frozen slotted dataclasses. Detect them
+    # before dataclass decomposition so a retained graph object is yielded as
+    # an inspectable leaf instead of being silently unpacked into its fields.
+    if isinstance(value, (GraphNode, CodeGraphInventory)):
+        yield value
+    elif is_dataclass(value):
         for field in fields(value):
             yield from _leaf_values(getattr(value, field.name))
     elif isinstance(value, Mapping):
@@ -213,6 +218,24 @@ def test_ingestion_does_not_reread_source_or_rebuild_the_graph(
     assert not [value for value in leaves if isinstance(value, CodeGraphInventory)]
     assert not [value for value in leaves
                 if isinstance(value, (bytes, bytearray, memoryview))]
+
+
+def test_graph_object_walker_detects_nested_graph_objects(tmp_path):
+    graph, _parsed = _real_graph(tmp_path, {"pkg/app.py": APP})
+    node = _file_node(graph, "pkg/app.py")
+
+    @dataclass(frozen=True, slots=True)
+    class Holder:
+        node: GraphNode
+        graph: CodeGraphInventory
+        nested: tuple
+
+    holder = Holder(node=node, graph=graph, nested=({"node": node},))
+    leaves = tuple(_leaf_values(holder))
+
+    assert any(value is node for value in leaves)
+    assert any(value is graph for value in leaves)
+    assert sum(value is node for value in leaves) == 2
 
 
 def test_ids_are_graph_independent_and_graph_only_changes_association(tmp_path):
