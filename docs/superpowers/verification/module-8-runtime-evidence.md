@@ -415,3 +415,54 @@ Evidence commit: final evidence commit (SHA reported after commit)
 ## Conclusion
 
 Module 8 is implemented and independently audited. Both required verdicts are PASS and there are no Critical or Important findings. The full-suite failure set is empty. The separately retained Module 5 selector result is the single Task 24 E3 observation, outside the original six and covered only by the explicit E3 exception; its raw cause is UNCONFIRMED. It is isolated and not waived. No merge, push, retrieval, or LLM work occurred.
+
+## Post-Task-24 correction — external finding I4
+
+This section is appended after the historical Task 24 conclusion and does not rewrite it. The Task 23 E1/E2 and Task 24 E3 disclosures above remain the historical record. Nothing in them is generalized, withdrawn, or replaced by this addendum. The prior Task 24 PASS/PASS audit result and the frozen Task 24 evidence remain as recorded.
+
+### Finding and specification basis
+
+External final-acceptance finding I4 concerned numeric stack positions in `backend/runtime_evidence/stack_parser.py`. The pre-fix `_MAX_POSITION_DIGITS = 19` cap was not present in the design or the approved plan. Design §10.2 requires a valid positive line or column position to be retained exactly, and requires an unusable location to be reported as `INVALID_SOURCE_LOCATION` rather than silently discarded. A valid 20-digit-or-longer decimal token could therefore be dropped, and a V8 frame could be demoted to message text, without the required issue. The defect was confirmed against the frozen pre-fix HEAD.
+
+The investigation and correction were limited to numeric stack-position handling. Fixed-language grammar, bounded processing, privacy, event ordering, and existing frame-association semantics were not changed. No approved model contract or public API was changed, no assertion was weakened, and no new design decision was required.
+
+### Correction
+
+The production/test commit is `bc53db01543199da045096bb0610555961e1d2f5`, parent `674ad17661c4151699eca143cdab2e8a523b1556`, with the exact message `fix: resolve module 8 independent audit findings`. It changes exactly two files and no others:
+
+- `backend/runtime_evidence/stack_parser.py` — decimal conversion is now bounded at 4,300 significant digits, independently of the interpreter's configured integer-string safety threshold; leading zeroes are stripped before the bound and `ValueError` is caught. An unrepresentable token becomes an internal invalid marker (line `0`, column `-1`) instead of `None`.
+- `tests/test_runtime_evidence_stack.py` — characterization and boundary coverage for 19-, 20-, 21-, 4,300-, and 4,301-digit positions, zero/invalid positions, exact conversion boundaries, and recoverable invalid markers.
+
+Association converts the internal invalid marker to `None` and reports `INVALID_SOURCE_LOCATION`. For V8 frames, an independently valid component is retained while only the invalid component is removed. No unbounded integer conversion was introduced. No Module 5 production or test file was changed.
+
+### Test evidence
+
+- Characterization RED before the fix, with a fresh external basetemp and cache disabled: `4 failed, 4 passed, 79 deselected`, exit 1.
+- Focused GREEN after the fix: `8 passed, 79 deselected`, exit 0.
+- Stack file: `87 passed`; after the boundary additions, `89 passed`.
+- Post-commit stack verification at `bc53db0`: `89 passed in 0.31s`, exit 0, fresh basetemp `C:\Users\avane\AppData\Local\Temp\i4-postcommit-af43a261718f45b6bfe22a45cb27ef31`.
+- Targeted stack/json/association/integration verification: `579 passed` before the boundary additions; post-commit `581 passed in 0.66s`, exit 0, fresh basetemp `C:\Users\avane\AppData\Local\Temp\i4-postcommit-targeted-5a11112bb6be4ece9b2fac91c00dbd5f`.
+- Module 8: `1238 passed, 2572 deselected` before the boundary additions; final `1240 passed, 2572 deselected in 4.32s`, exit 0.
+- Module 1: `48 passed, 1 deselected`, exit 0. Module 2: `178 passed, 2 skipped`, exit 0. Module 3: `214 passed, 1 skipped`, exit 0. Module 4: `143 passed`, exit 0. Module 6: `590 passed, 3220 deselected`, exit 0. Module 7: `178 passed, 1 skipped, 3631 deselected`, exit 0.
+
+### Unsuppressed Module 5 and full-suite observations
+
+The I4 work did not retry, suppress, skip, xfail, or otherwise alter Module 5, and it did not generalize E3. Two non-green observations are retained and disclosed for external assessment:
+
+- The retained I4 Module 5 selector log records `1 failed, 1176 passed, 1 skipped, 2632 deselected, 1 warning in 94.52s`, exit 1, at `tests/test_chroma_vector_store.py::test_concurrent_query_retains_snapshot_from_identity_through_normalization[normalization-VectorStoreCorruptionError]`; the outer failure is `VectorStoreReadError` at `backend/embedding_vector_store/stores/chroma.py:1255`. This is not the exact Task 24 E3 node (`test_publication_requires_readable_unambiguous_pointer_after_replace[checksum-False]`) and is not covered by E1, E2, or E3. The test function belongs to a family named in the historical Chroma flake ruling, but this parameterization is not one of the original six. It remains unwaived and was not retried.
+- The pre-boundary full suite recorded `1 failed, 3802 passed, 5 skipped, 2 deselected, 1 warning in 528.58s`, exit 1, at `tests/test_chroma_integrity_deletion.py::test_delete_repository_index_removes_incomplete_abandoned_candidates[True-1]`, one of the exact original-six historical observations. The final full suite at committed HEAD recorded `1 failed, 3804 passed, 5 skipped, 2 deselected, 1 warning in 529.61s`, exit 1, at `tests/test_embedding_scaling.py::test_real_chroma_candidate_id_work_is_linear[True-1025]`. The latter has the same test function and outer call-site signature as the historical `[True-257]` observation but is not that exact node and is not covered by E3. Neither observation was retried or suppressed.
+
+These observations do not alter the I4 correction or its focused GREEN results. They are disclosed as residual Module 5/full-suite observations requiring external review; they are not a Module 5 waiver and not a production-readiness claim.
+
+### Independent review
+
+The original Task 24 auditor session `ses_e631e14c2ffeO4hdua2c7z0u8M` could not be continued because the harness returned `Session ses_e631e14c2ffeO4hdua2c7z0u8M is not a child of the current session`. Continuity with the original auditor was therefore lost and is disclosed. A genuinely fresh reviewer session `ses_e62eaaa15ffeYnrnjlRPwGRpu1` reviewed the I4 correction and returned: I4 classification `Minor with specification-supported justification`; Specification compliance PASS; Implementation/test quality PASS; final verdict `MODULE 8 I4 REVIEW APPROVED`. No Critical or Important findings were reported. A follow-up confirmed the two test-only Minor observations were resolved.
+
+### Preservation and repository state
+
+- Primary `main` remains `6f25511af8fa1615342a6be3083b09ac3e73d4be`; the five worktrees remain registered.
+- The primary experimental artifact set remains `expected=127 actual=127 missing=0 changed=0 extra=0`.
+- Design blob `d6773f1d32ad815c75fbd6da9155688244a5cbc4` and plan blob `5e67caf68b006c0f751a9f385f8a149ae54b2d32` are unchanged from their establishing state. The branch diff contains only Module 8 production/test paths, the plan, this verification record, and `README.md`; Modules 1–7, 9, and 10 are untouched.
+- No merge, push, fetch, pull, reset, restore, stash, clean, rebase, or amend was performed. The production/test commit was not amended. This addendum is a separate documentation-only commit whose parent is `bc53db01543199da045096bb0610555961e1d2f5`; its SHA is reported in the final response.
+
+The I4 correction is complete and approved by the fresh reviewer. External final acceptance remains pending, including review of the unwaived Module 5/full-suite observations disclosed above.
