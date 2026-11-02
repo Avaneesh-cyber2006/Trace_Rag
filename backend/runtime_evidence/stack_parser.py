@@ -41,7 +41,13 @@ _V8_LANGUAGES = frozenset(
     )
 )
 _BLANK_CHARACTERS = frozenset(" \t")
-_MAX_POSITION_DIGITS = 19
+# Bound decimal conversion independently of the interpreter's configured
+# safety threshold. Positions beyond this are not representable as validated
+# frame locations; callers convert the invalid markers below into None and
+# report INVALID_SOURCE_LOCATION.
+_MAX_POSITION_DIGITS = 4300
+_INVALID_LINE_POSITION = 0
+_INVALID_COLUMN_POSITION = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +74,23 @@ def _is_ascii_digits(text: str) -> bool:
 
 
 def _parse_position(text: str) -> int | None:
-    if len(text) > _MAX_POSITION_DIGITS:
+    significant = text.lstrip("0") or "0"
+    if len(significant) > _MAX_POSITION_DIGITS:
         return None
-    return int(text)
+    try:
+        return int(significant)
+    except ValueError:
+        return None
+
+
+def _parse_line_position(text: str) -> int:
+    position = _parse_position(text)
+    return _INVALID_LINE_POSITION if position is None else position
+
+
+def _parse_column_position(text: str) -> int:
+    position = _parse_position(text)
+    return _INVALID_COLUMN_POSITION if position is None else position
 
 
 def _build_frame(
@@ -107,7 +127,7 @@ def _split_java_source_and_line(
         if _is_ascii_digits(line_text):
             return (
                 inside[:separator],
-                _parse_position(line_text),
+                _parse_line_position(line_text),
             )
     return (inside, None)
 
@@ -130,11 +150,11 @@ def _split_v8_suffix(
         and _is_ascii_digits(column_text)
     ):
         return None
-    line = _parse_position(line_text)
-    column = _parse_position(column_text)
-    if line is None or column is None:
-        return (prefix, None, None)
-    return (prefix, line, column)
+    return (
+        prefix,
+        _parse_line_position(line_text),
+        _parse_column_position(column_text),
+    )
 
 
 def _split_v8_source_and_positions(
@@ -267,7 +287,7 @@ def _classify_python_line(
             language,
             match.group("function"),
             match.group("source"),
-            _parse_position(match.group("line")),
+            _parse_line_position(match.group("line")),
             None,
             max_function_bytes,
         )

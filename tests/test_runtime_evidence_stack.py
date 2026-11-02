@@ -501,6 +501,225 @@ def test_numeric_locations_keep_multi_digit_values_exactly():
     assert (v8.line, v8.column) == (123456, 7890)
 
 
+_TWENTY_DIGIT_LINE = 12345678901234567890
+_TWENTY_DIGIT_COLUMN = 98765432109876543210
+_TWENTY_ONE_DIGIT_POSITION = 123456789012345678901
+_NINETEEN_DIGIT_POSITION = 9999999999999999999
+_MAX_POSITION_DIGITS = 4300
+
+
+def _ingest_stack(text, language, config=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact(
+                "trace.stack",
+                RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                text.encode("ascii"),
+                language,
+            ),
+        ),
+    ))
+
+
+def test_twenty_digit_python_line_is_retained_exactly():
+    text = f'  File "a.py", line {_TWENTY_DIGIT_LINE}, in run\n'
+    result = _parse(text, RuntimeFrameLanguage.PYTHON)
+    assert result.recognized_frame_count == 1
+    assert result.frames[0].line == _TWENTY_DIGIT_LINE
+
+    inventory = _ingest_stack(text, RuntimeFrameLanguage.PYTHON)
+    assert [frame.line for frame in inventory.events[0].frames] == [
+        _TWENTY_DIGIT_LINE
+    ]
+    assert inventory.issues == ()
+
+
+def test_twenty_digit_java_line_is_retained_exactly():
+    text = f"\tat a.b.C.run(C.java:{_TWENTY_DIGIT_LINE})\n"
+    result = _parse(text, RuntimeFrameLanguage.JAVA)
+    assert result.recognized_frame_count == 1
+    assert result.frames[0].line == _TWENTY_DIGIT_LINE
+
+    inventory = _ingest_stack(text, RuntimeFrameLanguage.JAVA)
+    assert [frame.line for frame in inventory.events[0].frames] == [
+        _TWENTY_DIGIT_LINE
+    ]
+    assert inventory.issues == ()
+
+
+def test_twenty_digit_v8_line_and_column_are_retained_exactly():
+    text = (
+        f"    at run (src/app.js:{_TWENTY_DIGIT_LINE}:"
+        f"{_TWENTY_DIGIT_COLUMN})\n"
+        f"    at src/other.js:{_TWENTY_DIGIT_LINE}:"
+        f"{_TWENTY_DIGIT_COLUMN}\n"
+    )
+    result = _parse(text, RuntimeFrameLanguage.JAVASCRIPT)
+    assert result.recognized_frame_count == 2
+    assert [
+        (frame.line, frame.column) for frame in result.frames
+    ] == [
+        (_TWENTY_DIGIT_LINE, _TWENTY_DIGIT_COLUMN),
+        (_TWENTY_DIGIT_LINE, _TWENTY_DIGIT_COLUMN),
+    ]
+
+    inventory = _ingest_stack(text, RuntimeFrameLanguage.JAVASCRIPT)
+    assert [
+        (frame.line, frame.column) for frame in inventory.events[0].frames
+    ] == [
+        (_TWENTY_DIGIT_LINE, _TWENTY_DIGIT_COLUMN),
+        (_TWENTY_DIGIT_LINE, _TWENTY_DIGIT_COLUMN),
+    ]
+    assert inventory.issues == ()
+
+
+def test_nineteen_digit_position_is_retained_exactly():
+    python = _parse(
+        f'  File "a.py", line {_NINETEEN_DIGIT_POSITION}, in run\n',
+        RuntimeFrameLanguage.PYTHON,
+    ).frames[0]
+    java = _parse(
+        f"\tat a.b.C.run(C.java:{_NINETEEN_DIGIT_POSITION})\n",
+        RuntimeFrameLanguage.JAVA,
+    ).frames[0]
+    v8 = _parse(
+        f"    at run (src/app.js:{_NINETEEN_DIGIT_POSITION}:"
+        f"{_NINETEEN_DIGIT_POSITION})\n",
+        RuntimeFrameLanguage.JAVASCRIPT,
+    ).frames[0]
+    assert (python.line, python.column) == (
+        _NINETEEN_DIGIT_POSITION, None)
+    assert (java.line, java.column) == (
+        _NINETEEN_DIGIT_POSITION, None)
+    assert (v8.line, v8.column) == (
+        _NINETEEN_DIGIT_POSITION, _NINETEEN_DIGIT_POSITION)
+
+
+def test_twenty_one_digit_position_is_retained_exactly():
+    python = _parse(
+        f'  File "a.py", line {_TWENTY_ONE_DIGIT_POSITION}, in run\n',
+        RuntimeFrameLanguage.PYTHON,
+    ).frames[0]
+    java = _parse(
+        f"\tat a.b.C.run(C.java:{_TWENTY_ONE_DIGIT_POSITION})\n",
+        RuntimeFrameLanguage.JAVA,
+    ).frames[0]
+    v8 = _parse(
+        f"    at run (src/app.js:{_TWENTY_ONE_DIGIT_POSITION}:"
+        f"{_TWENTY_ONE_DIGIT_POSITION})\n",
+        RuntimeFrameLanguage.JAVASCRIPT,
+    ).frames[0]
+    assert (python.line, python.column) == (
+        _TWENTY_ONE_DIGIT_POSITION, None)
+    assert (java.line, java.column) == (
+        _TWENTY_ONE_DIGIT_POSITION, None)
+    assert (v8.line, v8.column) == (
+        _TWENTY_ONE_DIGIT_POSITION, _TWENTY_ONE_DIGIT_POSITION)
+
+
+def test_position_conversion_bound_is_exact():
+    digits = "9" * _MAX_POSITION_DIGITS
+    python = _parse(
+        f'  File "a.py", line {digits}, in run\n',
+        RuntimeFrameLanguage.PYTHON,
+    ).frames[0]
+    v8 = _parse(
+        f"    at run (src/app.js:{digits}:{digits})\n",
+        RuntimeFrameLanguage.JAVASCRIPT,
+    ).frames[0]
+    expected = int(digits)
+    assert (python.line, python.column) == (expected, None)
+    assert (v8.line, v8.column) == (expected, expected)
+
+    inventory = _ingest_stack(
+        f'  File "a.py", line {digits}, in run\n',
+        RuntimeFrameLanguage.PYTHON,
+    )
+    assert [frame.line for frame in inventory.events[0].frames] == [
+        expected
+    ]
+    assert inventory.issues == ()
+
+
+@pytest.mark.parametrize(
+    ("language", "text", "expected_column"),
+    [
+        (
+            RuntimeFrameLanguage.PYTHON,
+            b'  File "a.py", line 0, in run\n',
+            None,
+        ),
+        (
+            RuntimeFrameLanguage.JAVA,
+            b"\tat a.b.C.run(C.java:0)\n",
+            None,
+        ),
+        (
+            RuntimeFrameLanguage.JAVASCRIPT,
+            b"    at run (src/app.js:0:5)\n",
+            5,
+        ),
+    ],
+)
+def test_zero_line_is_invalid_and_reported(
+    language, text, expected_column
+):
+    inventory = RuntimeEvidenceIngestor().ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact(
+                "trace.stack",
+                RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                text,
+                language,
+            ),
+        ),
+    ))
+    frame = inventory.events[0].frames[0]
+    assert frame.line is None
+    assert frame.column == expected_column
+    assert [
+        (issue.code, issue.event_sequence) for issue in inventory.issues
+    ] == [(RuntimeIssueCode.INVALID_SOURCE_LOCATION, 0)]
+    assert (
+        inventory.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    )
+
+
+def test_unrepresentable_position_at_line_byte_boundary_is_recoverable():
+    prefix = b'  File "a.py", line '
+    suffix = b", in run"
+    max_line_bytes = 8192
+    digits = b"9" * (max_line_bytes - len(prefix) - len(suffix))
+    content = prefix + digits + suffix + b"\n"
+    assert len(content[:-1]) == max_line_bytes
+    config = RuntimeEvidenceConfig(max_line_bytes=max_line_bytes)
+    parsed = parse_stack_trace_text(
+        content, config, RuntimeFrameLanguage.PYTHON, 10
+    )
+    assert len(parsed.events) == 1
+
+    inventory = RuntimeEvidenceIngestor(config).ingest(
+        RuntimeEvidenceRequest(
+            "repo", (
+                RuntimeArtifact(
+                    "trace.stack",
+                    RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                    content,
+                    RuntimeFrameLanguage.PYTHON,
+                ),
+            ),
+        )
+    )
+    frame = inventory.events[0].frames[0]
+    assert frame.line is None
+    assert [
+        (issue.code, issue.event_sequence) for issue in inventory.issues
+    ] == [(RuntimeIssueCode.INVALID_SOURCE_LOCATION, 0)]
+    assert (
+        inventory.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    )
+
+
 def test_function_truncation_is_reported_and_codepoint_safe():
     text = (
         "Unicode: caf\u00e9\n"
@@ -684,59 +903,55 @@ def test_v8_continuation_is_ignored():
 
 def test_oversized_position_tokens_do_not_raise():
     huge = "9" * 4301
-    python = _parse(
-        f'  File "a.py", line {huge}, in run\n',
-        RuntimeFrameLanguage.PYTHON,
-    )
-    assert python.recognized_frame_count == 1
-    assert python.frames[0].line is None
-
-    java = _parse(
-        f"\tat a.b.C.run(C.java:{huge})\n",
-        RuntimeFrameLanguage.JAVA,
-    )
-    assert java.recognized_frame_count == 1
-    assert java.frames[0].line is None
-
-    v8_line = _parse(
-        f"    at run (src/app.js:{huge}:2)\n",
-        RuntimeFrameLanguage.JAVASCRIPT,
-    )
-    assert v8_line.recognized_frame_count == 1
-    assert (v8_line.frames[0].line, v8_line.frames[0].column) == (
-        None,
-        None,
-    )
-
-    v8_column = _parse(
-        f"    at run (src/app.js:1:{huge})\n",
-        RuntimeFrameLanguage.JAVASCRIPT,
-    )
-    assert v8_column.recognized_frame_count == 1
-    assert (
-        v8_column.frames[0].line,
-        v8_column.frames[0].column,
-    ) == (None, None)
-
-    v8_bare_line = _parse(
-        f"    at src/app.js:{huge}:2\n",
-        RuntimeFrameLanguage.JAVASCRIPT,
-    )
-    assert v8_bare_line.recognized_frame_count == 1
-    assert (
-        v8_bare_line.frames[0].line,
-        v8_bare_line.frames[0].column,
-    ) == (None, None)
-
-    v8_bare_column = _parse(
-        f"    at src/app.js:1:{huge}\n",
-        RuntimeFrameLanguage.JAVASCRIPT,
-    )
-    assert v8_bare_column.recognized_frame_count == 1
-    assert (
-        v8_bare_column.frames[0].line,
-        v8_bare_column.frames[0].column,
-    ) == (None, None)
+    cases = [
+        (
+            RuntimeFrameLanguage.PYTHON,
+            f'  File "a.py", line {huge}, in run\n',
+            None,
+            None,
+        ),
+        (
+            RuntimeFrameLanguage.JAVA,
+            f"\tat a.b.C.run(C.java:{huge})\n",
+            None,
+            None,
+        ),
+        (
+            RuntimeFrameLanguage.JAVASCRIPT,
+            f"    at run (src/app.js:{huge}:2)\n",
+            None,
+            2,
+        ),
+        (
+            RuntimeFrameLanguage.JAVASCRIPT,
+            f"    at run (src/app.js:1:{huge})\n",
+            1,
+            None,
+        ),
+        (
+            RuntimeFrameLanguage.JAVASCRIPT,
+            f"    at src/app.js:{huge}:2\n",
+            None,
+            2,
+        ),
+        (
+            RuntimeFrameLanguage.JAVASCRIPT,
+            f"    at src/app.js:1:{huge}\n",
+            1,
+            None,
+        ),
+    ]
+    for language, text, expected_line, expected_column in cases:
+        inventory = _ingest_stack(text, language)
+        frame = inventory.events[0].frames[0]
+        assert (frame.line, frame.column) == (
+            expected_line,
+            expected_column,
+        )
+        assert [
+            (issue.code, issue.event_sequence)
+            for issue in inventory.issues
+        ] == [(RuntimeIssueCode.INVALID_SOURCE_LOCATION, 0)]
 
 
 def test_pathological_long_unmatched_lines_do_not_backtrack_catastrophically():
