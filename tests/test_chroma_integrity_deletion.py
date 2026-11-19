@@ -117,6 +117,65 @@ def test_delete_repository_index_removes_incomplete_abandoned_candidates(
     }
 
 
+@pytest.mark.parametrize("written", [0, 1])
+def test_delete_repository_index_does_not_require_hnsw_embedding_reads(
+    tmp_path, monkeypatch, written,
+):
+    """Evicted HNSW data must not prevent deletion of an owned namespace."""
+    from chromadb.api.models.Collection import Collection
+    from chromadb.errors import InternalError
+
+    store, _, snapshot = indexed_store(tmp_path)
+    candidate = store.begin_candidate(NAMESPACE, IDENTITY, EMBEDDING_DOCUMENT_VERSION, 2)
+    if written:
+        store.add_reused(candidate, store.read_manifest(snapshot)[:1])
+    original_get = Collection.get
+    pages = []
+
+    def get_without_hnsw(collection, *args, **kwargs):
+        includes = kwargs.get("include", ())
+        if "embeddings" in includes:
+            raise InternalError("Error creating hnsw segment reader: Nothing found on disk")
+        pages.append(includes)
+        return original_get(collection, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Collection, "get", get_without_hnsw)
+        store.delete_repository_index(NAMESPACE)
+
+    assert pages
+    assert not store.inspect_active(NAMESPACE).indexed
+    assert store._client.list_collections() == []
+
+
+def test_deletion_rejects_tampered_document_without_reading_embeddings(
+    tmp_path, monkeypatch,
+):
+    """Skipping HNSW must never skip content integrity or ownership checks."""
+    from chromadb.api.models.Collection import Collection
+
+    store, _, snapshot = indexed_store(tmp_path)
+    collection = store._client.get_collection(snapshot._token, embedding_function=None)
+    collection.update(
+        ids=["1".zfill(64)], documents=["tampered payload"],
+        embeddings=[[1.0, 0.0, 0.0]],
+    )
+    old_pointer = store._active_pointer_path(NAMESPACE).read_bytes()
+    original_get = Collection.get
+
+    def get_without_embeddings(collection, *args, **kwargs):
+        assert "embeddings" not in kwargs.get("include", ())
+        return original_get(collection, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Collection, "get", get_without_embeddings)
+        with pytest.raises(VectorStoreCorruptionError):
+            store.delete_repository_index(NAMESPACE)
+
+    assert store._active_pointer_path(NAMESPACE).read_bytes() == old_pointer
+    assert {item.name for item in store._client.list_collections()} == {snapshot._token}
+
+
 @pytest.mark.parametrize("evidence", ["control", "record"])
 def test_delete_repository_index_rejects_foreign_namespace_in_incomplete_candidate(
     tmp_path, evidence,

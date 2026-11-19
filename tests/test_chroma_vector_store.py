@@ -824,6 +824,67 @@ def test_publication_requires_readable_unambiguous_pointer_after_replace(
             store.inspect_active(NAMESPACE)
 
 
+
+@pytest.mark.parametrize("failures", [1, 2, 4, 5])
+def test_manifest_bounds_retries_for_transient_hnsw_reader_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int,
+) -> None:
+    """A transient HNSW reader error gets finite waits; corruption still fails."""
+    from chromadb.api.models.Collection import Collection
+    from chromadb.errors import InternalError
+
+    store = _store(tmp_path)
+    snapshot = _publish_records(store, NAMESPACE, (_candidate_records()[0],))
+    real_get = Collection.get
+    attempts = 0
+    delays = []
+    monkeypatch.setattr(chroma_module, "sleep", delays.append)
+
+    def intermittent_get(collection, *args, **kwargs):
+        nonlocal attempts
+        if kwargs.get("include") == ["documents", "embeddings", "metadatas"]:
+            attempts += 1
+            if attempts <= failures:
+                raise InternalError(
+                    "Error executing plan: Internal error: "
+                    "Error creating hnsw segment reader: Nothing found on disk"
+                )
+        return real_get(collection, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "get", intermittent_get)
+    if failures < 5:
+        assert store.read_manifest(snapshot)[0].chunk_id == "c" * 64
+    else:
+        with pytest.raises(VectorStoreReadError):
+            store.read_manifest(snapshot)
+    assert attempts == min(failures + 1, 5)
+    assert delays == list(chroma_module._HNSW_READER_RETRY_DELAYS[:min(failures, 4)])
+
+
+def test_manifest_does_not_retry_other_chroma_internal_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chromadb.api.models.Collection import Collection
+    from chromadb.errors import InternalError
+
+    store = _store(tmp_path)
+    snapshot = _publish_records(store, NAMESPACE, (_candidate_records()[0],))
+    attempts = 0
+    delays = []
+    monkeypatch.setattr(chroma_module, "sleep", delays.append)
+
+    def failing_get(collection, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise InternalError("Error finding id")
+
+    monkeypatch.setattr(Collection, "get", failing_get)
+    with pytest.raises(VectorStoreReadError):
+        store.read_manifest(snapshot)
+    assert attempts == 1
+    assert delays == []
+
+
 def test_restart_ignores_abandoned_candidate_after_precommit_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2626,3 +2687,100 @@ def test_search_rejects_invalid_snapshot_before_opening_collection(
 
     with pytest.raises(VectorStoreReadError):
         store.search(object(), EmbeddingVector((1.0, 0.0, 0.0)), 1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("initial", [102, 2048, 4096])
+def test_windows_chroma_cache_override_is_scoped_to_client_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial: int,
+) -> None:
+    """Override native cache before startup and always restore Chroma's API."""
+    from types import SimpleNamespace
+    from chromadb.api.rust import RustBindingsAPI
+
+    monkeypatch.setattr(chroma_module, "_IS_WINDOWS", True)
+    observed: list[int] = []
+
+    def spy_start(api):
+        observed.append(api.hnsw_cache_size)
+
+    monkeypatch.setattr(RustBindingsAPI, "start", spy_start)
+
+    def fake_client(*, path, settings):
+        server = SimpleNamespace(hnsw_cache_size=initial)
+        RustBindingsAPI.start(server)
+        return SimpleNamespace(_server=server, close=lambda: None)
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fake_client)
+    chroma_module._new_persistent_client(tmp_path)
+    assert observed == [max(initial, chroma_module._WINDOWS_HNSW_CACHE_MIN_ENTRIES)]
+    assert RustBindingsAPI.start is spy_start
+
+
+def test_windows_chroma_cache_override_restores_start_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chromadb.api.rust import RustBindingsAPI
+
+    monkeypatch.setattr(chroma_module, "_IS_WINDOWS", True)
+    original_start = RustBindingsAPI.start
+
+    def fail_client(*, path, settings):
+        assert RustBindingsAPI.start is not original_start
+        raise OSError("simulated backend outage")
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fail_client)
+    with pytest.raises(OSError, match="simulated backend outage"):
+        chroma_module._new_persistent_client(tmp_path)
+    assert RustBindingsAPI.start is original_start
+
+
+def test_windows_chroma_cache_rejects_insufficient_existing_system(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from chromadb.api.rust import RustBindingsAPI
+
+    monkeypatch.setattr(chroma_module, "_IS_WINDOWS", True)
+    original_start = RustBindingsAPI.start
+    closed = []
+
+    def existing_client(*, path, settings):
+        return SimpleNamespace(
+            _server=SimpleNamespace(hnsw_cache_size=102),
+            close=lambda: closed.append(True),
+        )
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", existing_client)
+    with pytest.raises(VectorStoreConfigurationError):
+        chroma_module._new_persistent_client(tmp_path)
+    assert closed == [True]
+    assert RustBindingsAPI.start is original_start
+
+
+def test_non_windows_chroma_client_does_not_patch_native_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chromadb.api.rust import RustBindingsAPI
+
+    monkeypatch.setattr(chroma_module, "_IS_WINDOWS", False)
+    original_start = RustBindingsAPI.start
+    token = object()
+
+    def fake_client(*, path, settings):
+        assert RustBindingsAPI.start is original_start
+        return token
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fake_client)
+    assert chroma_module._new_persistent_client(tmp_path) is token
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows HNSW cache regression")
+def test_windows_chroma_real_persistent_client_has_large_native_cache(
+    tmp_path: Path,
+) -> None:
+    from chromadb.api.rust import RustBindingsAPI
+
+    original_start = RustBindingsAPI.start
+    store = _store(tmp_path)
+    assert store._client._server.hnsw_cache_size >= 2048
+    assert RustBindingsAPI.start is original_start

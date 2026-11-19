@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import struct
+from time import sleep
 from threading import Lock, RLock
 from typing import Iterable, Iterator
 import weakref
@@ -20,7 +21,7 @@ import weakref
 import chromadb
 from chromadb.api.client import SharedSystemClient
 from chromadb.config import Settings
-from chromadb.errors import ChromaError, NotFoundError
+from chromadb.errors import ChromaError, InternalError, NotFoundError
 
 from .._concurrency import _repository_writer_guard
 from ..exceptions import (
@@ -84,12 +85,68 @@ _PUBLICATION_MESSAGE = "Vector store publication failed."
 _READ_MESSAGE = "Vector store data could not be read."
 _BUSY_MESSAGE = "Repository index is in use."
 _MANIFEST_PAGE_SIZE = 100
+# Chroma 1.5.9 derives this per-process Rust cache limit from the Windows
+# C stdio limit (typically 512 / 5 = 102), even though the two limits are
+# unrelated. A newly added HNSW index can be evicted before it is persisted.
+# 2,048 entries resolved this intermittent failure in the Windows full suite.
+_WINDOWS_HNSW_CACHE_MIN_ENTRIES = 2048
+_IS_WINDOWS = os.name == "nt"
+_HNSW_READER_NOT_ON_DISK = "Error creating hnsw segment reader: Nothing found on disk"
+# Chroma 1.5.x may need time for an in-flight HNSW segment transition.
+# Never retry unrelated errors or continue after these four bounded waits.
+_HNSW_READER_RETRY_DELAYS = (0.02, 0.1, 0.4, 0.8)
 _COSINE_DISTANCE_ENDPOINT_TOLERANCE = 1e-6
 _POINTER_KEYS = frozenset({"payload", "sha256"})
 _POINTER_PAYLOAD_KEYS = frozenset(
     {"schema_version", "repository_namespace", "active_collection"}
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _new_persistent_client(root: Path):
+    """Start TraceRAG's Chroma 1.5.9 Rust system with a viable Windows cache.
+
+    Chroma 1.5.9 has no public Settings key for hnsw_cache_size. Limit this
+    temporary start-method override to construction of this one client;
+    _PERSISTENCE_STATES_LOCK serializes TraceRAG client construction. Restore
+    the original method even when Chroma initialization raises. This is a
+    pinned-version compatibility workaround, not a repair of corrupt data.
+    """
+    settings = Settings(anonymized_telemetry=False)
+    if not _IS_WINDOWS:
+        return chromadb.PersistentClient(path=str(root), settings=settings)
+
+    # Refuse silent fallback if the private Chroma interface changes.
+    if chromadb.__version__ != "1.5.9":
+        raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+
+    from chromadb.api.rust import RustBindingsAPI
+
+    original_start = RustBindingsAPI.start
+
+    def start_with_sufficient_cache(self: RustBindingsAPI) -> None:
+        previous = self.hnsw_cache_size
+        if type(previous) is not int or previous <= 0:
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        self.hnsw_cache_size = max(previous, _WINDOWS_HNSW_CACHE_MIN_ENTRIES)
+        return original_start(self)
+
+    RustBindingsAPI.start = start_with_sufficient_cache
+    try:
+        client = chromadb.PersistentClient(path=str(root), settings=settings)
+    finally:
+        RustBindingsAPI.start = original_start
+
+    # A pre-existing Chroma singleton for this root might bypass start().
+    # Never silently use that singleton with the known insufficient limit.
+    server = getattr(client, "_server", None)
+    actual = getattr(server, "hnsw_cache_size", None)
+    if type(actual) is not int or actual < _WINDOWS_HNSW_CACHE_MIN_ENTRIES:
+        try:
+            client.close()
+        finally:
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+    return client
 
 
 class _PersistenceConcurrencyState:
@@ -123,9 +180,7 @@ class _PersistenceConcurrencyState:
                 fcntl.flock(
                     self.ownership_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
-            self.client = chromadb.PersistentClient(
-                path=str(root), settings=Settings(anonymized_telemetry=False)
-            )
+            self.client = _new_persistent_client(root)
         except BaseException:
             self.ownership_file.close()
             raise
@@ -1234,11 +1289,25 @@ class ChromaVectorStore:
             limit = min(_MANIFEST_PAGE_SIZE, count - offset)
             mapped_failure = None
             try:
-                page = collection.get(
-                    limit=limit,
-                    offset=offset,
-                    include=["documents", "embeddings", "metadatas"],
-                )
+                # This Chroma 1.5.x HNSW reader error can outlive an
+                # immediate retry while an index transition is in progress.
+                # Retry only the idempotent page read, with a bounded delay;
+                # never weaken later record, embedding or count validation.
+                for attempt in range(len(_HNSW_READER_RETRY_DELAYS) + 1):
+                    try:
+                        page = collection.get(
+                            limit=limit,
+                            offset=offset,
+                            include=["documents", "embeddings", "metadatas"],
+                        )
+                        break
+                    except InternalError as error:
+                        if (
+                            not str(error).endswith(_HNSW_READER_NOT_ON_DISK)
+                            or attempt == len(_HNSW_READER_RETRY_DELAYS)
+                        ):
+                            raise
+                        sleep(_HNSW_READER_RETRY_DELAYS[attempt])
                 page_ids = page["ids"]
                 documents = page["documents"]
                 embeddings = page["embeddings"]
@@ -1365,6 +1434,73 @@ class ChromaVectorStore:
         if delete_reserved:
             self._delete_reserved_collection(old_collection)
 
+    def _validate_collection_for_deletion(
+        self,
+        repository_namespace: str,
+        snapshot: RepositoryIndexSnapshot,
+        count: int,
+        collection: object,
+    ) -> None:
+        """Validate owned records before deletion without opening HNSW vectors.
+
+        This operation discards embeddings; reading the HNSW segment here is
+        unnecessary, and an evicted Chroma 1.5.x segment may have no persisted
+        reader. Still verify every ID, exact row count, content checksum and
+        identity/namespace metadata before permitting any deletion.
+        """
+        identifiers: set[str] = set()
+        for offset in range(0, count, _MANIFEST_PAGE_SIZE):
+            limit = min(_MANIFEST_PAGE_SIZE, count - offset)
+            mapped_failure = None
+            try:
+                page = collection.get(
+                    limit=limit,
+                    offset=offset,
+                    include=["documents", "metadatas"],
+                )
+                page_ids = page["ids"]
+                documents = page["documents"]
+                metadatas = page["metadatas"]
+            except NotFoundError:
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+            except (KeyError, TypeError, ValueError):
+                mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
+            except VectorStoreError:
+                raise
+            except Exception:
+                mapped_failure = VectorStoreReadError(_READ_MESSAGE)
+            if mapped_failure is not None:
+                raise mapped_failure
+            if (
+                not isinstance(page_ids, list)
+                or not isinstance(documents, list)
+                or not isinstance(metadatas, list)
+                or len(page_ids) != limit
+                or len(documents) != limit
+                or len(metadatas) != limit
+            ):
+                _raise_corruption()
+            for identifier, document, metadata in zip(
+                page_ids, documents, metadatas, strict=True
+            ):
+                if not isinstance(identifier, str) or identifier in identifiers:
+                    _raise_corruption()
+                identifiers.add(identifier)
+                identity = self._validated_record_evidence(
+                    repository_namespace,
+                    identifier=identifier,
+                    document=document,
+                    metadata=metadata,
+                )
+                if (
+                    identity != snapshot.identity
+                    or metadata["document_version"] != snapshot.document_version
+                    or metadata["schema_version"] != snapshot.schema_version
+                ):
+                    _raise_corruption()
+        if len(identifiers) != count:
+            _raise_corruption()
+
     def _repository_collection_names(
         self, repository_namespace: str, active_collection: str | None
     ) -> tuple[str, ...]:
@@ -1415,11 +1551,10 @@ class ChromaVectorStore:
                 )
             ):
                 _raise_corruption()
-            # Unpublished collections may have stopped between batches. Their
-            # complete namespace evidence still has to validate for every row.
-            self._read_manifest_from_collection(
-                repository_namespace, snapshot.identity, snapshot.document_version,
-                snapshot.schema_version, count, collection,
+            # Incomplete candidates must be checked before *any* deletion, but
+            # vector payloads are not needed to establish safe ownership.
+            self._validate_collection_for_deletion(
+                repository_namespace, snapshot, count, collection,
             )
         return tuple(sorted(names))
 
