@@ -1,0 +1,1755 @@
+import ast
+import json
+from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
+
+import pytest
+
+from backend.runtime_evidence import json_adapter, json_scanner
+from backend.runtime_evidence.config import RuntimeEvidenceConfig
+from backend.runtime_evidence.ingestor import RuntimeEvidenceIngestor
+from backend.runtime_evidence.json_adapter import (
+    NormalizedEvent,
+    normalize_event_object,
+    parse_json_events,
+)
+from backend.runtime_evidence.json_scanner import (
+    JsonScanError,
+    JsonScanResult,
+    scan_json_structure,
+)
+from backend.runtime_evidence.lines import strip_utf8_bom
+from backend.runtime_evidence.models import (
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeArtifactStatus,
+    RuntimeEventKind,
+    RuntimeEvidenceRequest,
+    RuntimeFrameLanguage,
+    RuntimeIncompleteReason,
+    RuntimeIssueCode,
+    issue_message,
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "nodes", "kind", "number_bytes"),
+    [
+        ("{}", 1, "object", 0),
+        ('{"a":1}', 3, "object", 1),
+        ("[{}]", 2, "array", 0),
+        ('{"a":{}}', 3, "object", 0),
+        ('[ "x" ]', 2, "array", 0),
+        ('{"a":true}', 3, "object", 0),
+        ('{"a":false}', 3, "object", 0),
+        ("[null]", 2, "array", 0),
+        ('{"\\u0061":-1.2e+3}', 3, "object", 7),
+        ('{"a":1,"a":2}', 5, "object", 1),
+        ("7", 1, "scalar", 1),
+    ],
+)
+def test_exact_node_and_number_token_counts(
+    text, nodes, kind, number_bytes
+):
+    result = scan_json_structure(text)
+    assert (
+        result.node_count,
+        result.top_level_kind,
+        result.max_number_token_bytes,
+    ) == (nodes, kind, number_bytes)
+
+
+def test_braces_quotes_and_backslashes_inside_strings_are_not_structure():
+    result = scan_json_structure('{"a":"} ] \\\\ \\" {", "b":[1]}')
+    assert result.top_level_kind == "object"
+    assert result.node_count == 6
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '{"a":}',
+        '{"a":1,}',
+        '{"a" 1}',
+        '"\\x"',
+        '"\\u12"',
+        "[1,]",
+        '{"a":1} trailing',
+        "NaN",
+        "Infinity",
+        '{"a":"\x01"}',
+    ],
+)
+def test_invalid_syntax_is_rejected_without_artifact_text(bad):
+    with pytest.raises(JsonScanError) as caught:
+        scan_json_structure(bad)
+    assert "\\x01" not in str(caught.value)
+
+
+def test_scanner_does_not_materialize_json(monkeypatch):
+    monkeypatch.setattr(
+        json, "loads", lambda *args, **kwargs: pytest.fail("materialized")
+    )
+    monkeypatch.setattr(
+        json,
+        "JSONDecoder",
+        lambda *args, **kwargs: pytest.fail("decoder constructed"),
+    )
+    assert scan_json_structure('{"a":[1,2,3]}').node_count == 6
+
+
+def test_deep_nesting_is_iterative_and_unpaired_escape_is_syntax_only():
+    deep = "[" * 5000 + "0" + "]" * 5000
+    assert scan_json_structure(deep).node_count == 5001
+    assert scan_json_structure('"\\ud800"').node_count == 1
+
+
+def test_json_whitespace_only_around_value():
+    result = scan_json_structure(' \t\r\n{"a"\t:\r\n[ 1 , 2 ]\n}\t ')
+    assert (
+        result.node_count,
+        result.top_level_kind,
+        result.max_number_token_bytes,
+    ) == (5, "object", 1)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "   ", "\t\r\n", "\v{}", "\f{}", "{}\u00a0", "\u00a0{}"],
+)
+def test_empty_or_non_json_whitespace_is_rejected(text):
+    with pytest.raises(JsonScanError):
+        scan_json_structure(text)
+
+
+def test_top_level_trailing_whitespace_is_allowed():
+    assert scan_json_structure('{"a":1} \n\t\r').node_count == 3
+
+
+def test_duplicate_and_escaped_keys_are_counted_once_each():
+    assert scan_json_structure('{"a":1,"a":2}').node_count == 5
+    assert scan_json_structure('{"a":{},"a":[]}').node_count == 5
+    assert scan_json_structure('{"\\u0061":1}').node_count == 3
+    assert scan_json_structure('{"a\\"b":1}').node_count == 3
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "01",
+        "00",
+        "-01",
+        "1.",
+        "1e",
+        "1e+",
+        "1e-",
+        ".1",
+        "+1",
+        "-",
+        "--1",
+        "1..2",
+        "1e+-2",
+        "1 2",
+        "0x10",
+        "1_0",
+    ],
+)
+def test_malformed_numbers_are_rejected(text):
+    with pytest.raises(JsonScanError):
+        scan_json_structure(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "number_bytes"),
+    [
+        ("0", 1),
+        ("-0", 2),
+        ("1.0", 3),
+        ("1e10", 4),
+        ("1E-10", 5),
+        ("-1.2e+3", 7),
+    ],
+)
+def test_valid_number_forms_and_token_bytes(text, number_bytes):
+    result = scan_json_structure(text)
+    assert result.top_level_kind == "scalar"
+    assert result.node_count == 1
+    assert result.max_number_token_bytes == number_bytes
+
+
+def test_max_number_token_includes_sign_dot_and_exponent():
+    result = scan_json_structure("[-1.25e+10, 3]")
+    assert result.node_count == 3
+    assert result.top_level_kind == "array"
+    assert result.max_number_token_bytes == 9
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["True", "FALSE", "Null", "nul", "tru", "falsey", "truefalse"],
+)
+def test_literals_are_lowercase_only_and_complete(bad):
+    with pytest.raises(JsonScanError):
+        scan_json_structure(bad)
+
+
+@pytest.mark.parametrize("text", ["true", "false", "null"])
+def test_valid_literals_are_scalars(text):
+    result = scan_json_structure(text)
+    assert result.node_count == 1
+    assert result.top_level_kind == "scalar"
+
+
+@pytest.mark.parametrize("text", ['"x"', "-1.2e3"])
+def test_valid_non_literal_scalars(text):
+    result = scan_json_structure(text)
+    assert result.node_count == 1
+    assert result.top_level_kind == "scalar"
+
+
+def test_array_and_object_punctuation_counts():
+    result = scan_json_structure('{"a":[1,{"b":null}]}')
+    assert result.node_count == 7
+    assert result.top_level_kind == "object"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '{"a":1 "b":2}',
+        "[1 2]",
+        '{"a"::1}',
+        '{"a":,}',
+        '{,"a":1}',
+        "[,1]",
+        "[1,,2]",
+        '{"a":1]',
+        "[1}",
+        '{"a":1}}',
+        "[]extra",
+        "{}{}",
+        '"unterminated',
+        '{"a":1',
+        "[1,2",
+        '"\\',
+    ],
+)
+def test_malformed_delimiters_and_strings_are_rejected(bad):
+    with pytest.raises(JsonScanError):
+        scan_json_structure(bad)
+
+
+def test_actual_surrogate_code_points_are_rejected():
+    surrogate = chr(0xD800)
+    for text in (
+        surrogate,
+        '"' + surrogate + '"',
+        '{"a":"' + surrogate + '"}',
+    ):
+        with pytest.raises(JsonScanError):
+            scan_json_structure(text)
+
+
+def test_escaped_surrogates_are_syntax_only():
+    assert scan_json_structure('"\\ud800"').node_count == 1
+    assert scan_json_structure('{"\\ud800":1}').node_count == 3
+    assert scan_json_structure('"\\ud83d\\ude00"').node_count == 1
+
+
+@pytest.mark.parametrize(
+    "character", ["\x00", "\x01", "\x1f", "\n", "\t", "\r"]
+)
+def test_raw_control_characters_in_strings_are_rejected(character):
+    with pytest.raises(JsonScanError):
+        scan_json_structure('"' + character + '"')
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r'"\n"',
+        r'"\t"',
+        r'"\r"',
+        r'"\b"',
+        r'"\f"',
+        r'"\/"',
+        r'"\\"',
+    ],
+)
+def test_escaped_controls_and_solidus_are_accepted(text):
+    assert scan_json_structure(text).node_count == 1
+
+
+def test_scanner_reports_without_enforcing_budgets():
+    huge_number = "1" * 2000
+    result = scan_json_structure(huge_number)
+    assert result.node_count == 1
+    assert result.max_number_token_bytes == 2000
+
+    many = "[" + ",".join(["0"] * 2000) + "]"
+    assert scan_json_structure(many).node_count == 2001
+
+
+def test_error_message_is_fixed_and_sanitized():
+    sentinel = '{"secret":"' + chr(1) + '"}'
+    with pytest.raises(JsonScanError) as caught:
+        scan_json_structure(sentinel)
+    assert str(caught.value) == "invalid JSON structure"
+
+
+def test_json_scan_result_is_frozen_slotted_and_typed():
+    assert [field.name for field in fields(JsonScanResult)] == [
+        "node_count",
+        "max_number_token_bytes",
+        "top_level_kind",
+    ]
+    assert JsonScanResult.__slots__ == (
+        "node_count",
+        "max_number_token_bytes",
+        "top_level_kind",
+    )
+    result = scan_json_structure("{}")
+    assert type(result.node_count) is int
+    assert type(result.max_number_token_bytes) is int
+    assert type(result.top_level_kind) is str
+    assert not hasattr(result, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        result.node_count = 2
+
+
+def test_module_has_no_materialization_regex_or_execution():
+    source = Path(json_scanner.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    banned_modules = {
+        "json",
+        "re",
+        "importlib",
+        "os",
+        "pathlib",
+        "socket",
+        "subprocess",
+    }
+    banned_calls = {"compile", "eval", "exec", "open"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert all(
+                alias.name.split(".")[0] not in banned_modules
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            assert (
+                node.module or ""
+            ).split(".")[0] not in banned_modules
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                assert node.func.id not in banned_calls
+
+
+def _config(**kw):
+    values = dict(max_tags=4, max_tag_key_bytes=8, max_tag_value_bytes=8,
+                  max_message_bytes=16, max_error_message_bytes=16,
+                  max_stack_bytes=128, max_frames_per_event=4,
+                  max_frame_function_bytes=12, retain_event_text=True)
+    values.update(kw)
+    return RuntimeEvidenceConfig(**values)
+
+
+def _norm(value, **kw):
+    values = dict(sequence=0, source_line=None, config=_config(),
+                  declared_language=None)
+    values.update(kw)
+    return normalize_event_object(value, **values)
+
+
+def _codes(result):
+    return [issue.code for issue in result.issues]
+
+
+def test_log_event_is_normalized_not_empty():
+    result = _norm({"kind": "log", "message": "hello"})
+    assert result.draft is not None
+    assert result.draft.kind is RuntimeEventKind.LOG
+    assert result.issues == ()
+
+
+def test_log_event_and_duration_are_exact_strings():
+    result = _norm({"kind": "log", "message": "hello", "duration_ms": "001"},
+                   source_line=7)
+    assert result.draft is None
+    result = _norm({"kind": "log", "message": "hello", "duration_ms": "1.20"},
+                   source_line=7)
+    assert result.draft.message == "hello"
+    assert result.draft.duration_ms_text == "1.20"
+    assert result.draft.source_line == 7
+
+
+def test_required_fields_and_error_only_on_error():
+    for value in ({"kind": "log"},
+                  {"kind": "span"},
+                  {"kind": "error"},
+                  {"kind": "log", "message": "x", "error": {}},
+                  {"kind": "span", "operation": "op", "error": {}}):
+        assert _norm(value).draft is None
+    assert _norm({"kind": "error"}).draft is None
+    assert _norm({"kind": "error", "error": {}}).draft is not None
+
+
+def test_numeric_strings_do_not_satisfy_int_fields_and_bool_is_not_int():
+    for line in ("1", True, 1.0):
+        assert _norm({"kind": "error", "message": "x",
+                      "error": {"frames": [{"line": line}]}}).draft is None
+
+
+def test_numeric_metadata_never_becomes_duration_text():
+    result = _norm({"kind": "log", "message": "x", "duration_ms": 1})
+    assert result.draft is None
+
+
+def test_duration_bound_is_exact_utf8_bytes():
+    assert _norm({"kind": "log", "message": "x",
+                  "duration_ms": "1" * 64}).draft.duration_ms_text == "1" * 64
+    assert _norm({"kind": "log", "message": "x",
+                  "duration_ms": "1" * 65}).draft is None
+
+
+def test_tags_are_sorted_and_metadata_only_omits_them():
+    result = _norm({"kind": "log", "message": "x",
+                    "tags": {"b": "2", "a": "1"}})
+    assert [t.key for t in result.draft.tags] == ["a", "b"]
+    projected = _norm({"kind": "log", "message": "x",
+                       "tags": {"a": "1"}},
+                      config=_config(retain_event_text=False)).draft
+    assert projected.message is None and projected.tags == ()
+    assert projected.text_truncated is False
+    assert all(i.code is not RuntimeIssueCode.TEXT_TRUNCATED
+               for i in _norm({"kind": "log", "message": "x" * 100},
+                              config=_config(retain_event_text=False)).issues)
+
+
+def test_explicit_frames_precede_stack_and_retain_invalid_locations():
+    value = {"kind": "error", "error": {
+        "frames": [{"function": "f", "source": "a.py", "line": 0,
+                    "column": -2}],
+        "stack": "this would be unparseable"}}
+    result = _norm(value)
+    assert len(result.draft.frames) == 1
+    assert result.draft.frames[0].line is None
+    assert result.draft.frames[0].column is None
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.INVALID_SOURCE_LOCATION]
+
+
+def test_stack_language_precedes_size_and_parse():
+    big = "x" * 200
+    result = _norm({"kind": "error", "error": {"stack": big}},
+                   declared_language=None)
+    assert result.draft is not None and result.draft.frames == ()
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_LANGUAGE_MISSING]
+
+
+def test_stack_size_truncation_sets_both_flags_and_issues():
+    result = _norm({"kind": "error",
+                    "error": {"stack": '  File "a.py", line 1, in f\n' + "x" * 200}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft.frames == ()
+    assert result.draft.text_truncated is True
+    assert result.draft.frames_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_TOO_LARGE, RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_unknown_keys_are_not_inspected_for_nul_or_surrogates():
+    value = {"kind": "log", "message": "x", "unknown": "\x00\ud800"}
+    assert _norm(value).draft is not None
+
+
+def test_normalized_event_interface_is_frozen_and_slotted():
+    assert [field.name for field in fields(NormalizedEvent)] == [
+        "draft", "issues"]
+    assert NormalizedEvent.__slots__ == ("draft", "issues")
+    result = _norm({"kind": "log", "message": "x"})
+    assert isinstance(result.issues, tuple)
+    assert not hasattr(result, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        result.draft = None
+
+
+def test_invalid_event_issue_has_no_sequence_and_keeps_source_line():
+    result = _norm({"kind": "bogus"}, sequence=5, source_line=9)
+    assert result.draft is None
+    (issue,) = result.issues
+    assert issue.code is RuntimeIssueCode.INVALID_EVENT_SCHEMA
+    assert issue.event_sequence is None
+    assert issue.source_line == 9
+
+
+def test_valid_event_issues_use_event_sequence_and_source_line():
+    result = _norm({"kind": "log", "message": "x" * 20},
+                   sequence=3, source_line=11)
+    (issue,) = result.issues
+    assert issue.code is RuntimeIssueCode.TEXT_TRUNCATED
+    assert issue.event_sequence == 3
+    assert issue.source_line == 11
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, [], "log", 1, True, {"kind": None}, {"kind": 1}, {"kind": "LOG"}],
+)
+def test_event_must_be_object_with_known_kind(value):
+    assert _norm(value).draft is None
+
+
+def test_all_optional_fields_map_exactly():
+    result = _norm({
+        "kind": "span", "operation": "op", "timestamp": "ts", "level": "INFO",
+        "logger": "lg", "trace_id": "t", "span_id": "s",
+        "parent_span_id": "p", "duration_ms": "0.5", "status": "ok",
+        "message": "m",
+    })
+    draft = result.draft
+    assert draft.timestamp_text == "ts"
+    assert draft.level == "INFO"
+    assert draft.logger == "lg"
+    assert draft.operation == "op"
+    assert draft.trace_id == "t"
+    assert draft.span_id == "s"
+    assert draft.parent_span_id == "p"
+    assert draft.duration_ms_text == "0.5"
+    assert draft.status == "ok"
+    assert draft.message == "m"
+    assert draft.error_type is None
+    assert draft.error_message is None
+    assert draft.tags == ()
+    assert draft.frames == ()
+    assert draft.text_truncated is False
+    assert draft.frames_truncated is False
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "max_bytes"),
+    [
+        ("timestamp", 128), ("level", 32), ("logger", 256),
+        ("operation", 256), ("trace_id", 256), ("span_id", 256),
+        ("parent_span_id", 256), ("status", 32),
+    ],
+)
+def test_non_truncatable_event_text_bounds(field, max_bytes):
+    base = {"kind": "log", "message": "x"}
+    exact = dict(base)
+    exact[field] = "a" * max_bytes
+    assert _norm(exact).draft is not None
+    over = dict(base)
+    over[field] = "a" * (max_bytes + 1)
+    assert _norm(over).draft is None
+
+
+def test_non_truncatable_bound_is_utf8_bytes():
+    assert _norm({"kind": "log", "message": "x",
+                  "level": "\u00e9" * 16}).draft is not None
+    assert _norm({"kind": "log", "message": "x",
+                  "level": "\u00e9" * 17}).draft is None
+
+
+@pytest.mark.parametrize(
+    "text", ["0", "10", "1.20", "0.0", "1234567890.000"],
+)
+def test_duration_decimal_forms_are_accepted(text):
+    result = _norm({"kind": "log", "message": "x", "duration_ms": text})
+    assert result.draft.duration_ms_text == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "00", "01", "-1", "1.", ".5", "1e3", " 1", "1 ", "1..2", "abc"],
+)
+def test_duration_decimal_forms_are_rejected(text):
+    assert _norm({"kind": "log", "message": "x",
+                  "duration_ms": text}).draft is None
+
+
+def test_message_truncation_sets_flag_and_one_issue():
+    result = _norm({"kind": "log", "message": "\u00e9" * 20},
+                   config=_config(max_message_bytes=17))
+    assert result.draft.message == "\u00e9" * 7 + "\u2026"
+    assert result.draft.text_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED]
+
+    exact = _norm({"kind": "log", "message": "a" * 16})
+    assert exact.draft.message == "a" * 16
+    assert exact.draft.text_truncated is False
+    assert exact.issues == ()
+
+
+def test_error_message_truncation_sets_flag_and_one_issue():
+    result = _norm({"kind": "error", "message": "m",
+                    "error": {"message": "x" * 20}})
+    assert result.draft.error_message == "x" * 13 + "\u2026"
+    assert result.draft.text_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_multiple_text_truncations_report_one_issue():
+    result = _norm({"kind": "error", "message": "x" * 20,
+                    "error": {"message": "y" * 20}})
+    assert result.draft.text_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_tag_count_and_value_types():
+    four = {f"k{i}": "v" for i in range(4)}
+    assert len(_norm({"kind": "log", "message": "x",
+                      "tags": four}).draft.tags) == 4
+    five = {f"k{i}": "v" for i in range(5)}
+    assert _norm({"kind": "log", "message": "x",
+                  "tags": five}).draft is None
+    for bad in ({"a": 1}, {"a": True}, {"a": None}, {"a": {"b": "c"}},
+                {"a": ["b"]}):
+        assert _norm({"kind": "log", "message": "x",
+                      "tags": bad}).draft is None
+    assert _norm({"kind": "log", "message": "x", "tags": []}).draft is None
+
+
+def test_tag_key_and_value_bounds_are_exact_utf8_bytes():
+    result = _norm({"kind": "log", "message": "x",
+                    "tags": {"a" * 8: "b" * 8}})
+    assert result.draft.tags[0].key == "a" * 8
+    assert result.draft.tags[0].value == "b" * 8
+    assert _norm({"kind": "log", "message": "x",
+                  "tags": {"a" * 9: "b"}}).draft is None
+    assert _norm({"kind": "log", "message": "x",
+                  "tags": {"a": "b" * 9}}).draft is None
+    assert _norm({"kind": "log", "message": "x",
+                  "tags": {"\u00e9" * 5: "b"}}).draft is None
+
+
+def test_tag_keys_and_values_reject_nul_and_unpaired_surrogates():
+    for tags in ({"a": "\x00"}, {"\x00": "b"}, {"a": "\ud800"},
+                 {"\udc00": "b"}):
+        assert _norm({"kind": "log", "message": "x",
+                      "tags": tags}).draft is None
+    assert _norm({"kind": "log", "message": "x",
+                  "tags": {"a": "\ud83d\ude00"}}).draft is not None
+
+
+def test_tags_are_sorted_by_key():
+    result = _norm({"kind": "log", "message": "x",
+                    "tags": {"z": "1", "a": "2", "m": "3"}})
+    assert [tag.key for tag in result.draft.tags] == ["a", "m", "z"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "timestamp", "level", "logger", "operation", "trace_id", "span_id",
+        "parent_span_id", "duration_ms", "status", "message",
+    ],
+)
+def test_nul_in_retained_event_string_invalidates(field):
+    value = {"kind": "log", "message": "x"}
+    if field == "duration_ms":
+        value[field] = "0\x00"
+    else:
+        value[field] = "a\x00"
+    assert _norm(value).draft is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "timestamp", "level", "logger", "operation", "trace_id", "span_id",
+        "parent_span_id", "duration_ms", "status", "message",
+    ],
+)
+def test_unpaired_surrogate_in_retained_event_string_invalidates(field):
+    value = {"kind": "log", "message": "x"}
+    if field == "duration_ms":
+        value[field] = "0\ud800"
+    else:
+        value[field] = "a\ud800"
+    assert _norm(value).draft is None
+
+
+def test_error_fields_reject_nul_and_surrogates():
+    for error in ({"type": "a\x00"}, {"type": "a\ud800"},
+                  {"message": "a\x00"}, {"message": "a\ud800"}):
+        assert _norm({"kind": "error", "message": "x",
+                      "error": error}).draft is None
+
+
+def test_valid_surrogate_pairs_are_accepted_and_combined():
+    pair = "\ud83d\ude00"
+    result = _norm({"kind": "log", "message": pair})
+    assert result.draft is not None
+    assert result.draft.message == "\U0001f600"
+
+
+def test_explicit_frame_source_is_retained_raw():
+    for source in ("a\x00.py", "a\ud800.py", "x" * 2000):
+        result = _norm({"kind": "error", "message": "x",
+                        "error": {"frames": [{"source": source}]}})
+        assert result.draft is not None
+        assert result.draft.frames[0].source_text == source
+        assert result.issues == ()
+
+
+def test_explicit_frame_elements_and_fields_are_typed():
+    for frames in (["x"], [1], [None], [{"function": 1}],
+                   [{"source": 1}], [{"line": "1"}], [{"line": True}],
+                   [{"line": 1.0}], [{"column": False}],
+                   [{"column": "0"}]):
+        assert _norm({"kind": "error", "message": "x",
+                      "error": {"frames": frames}}).draft is None
+    assert _norm({"kind": "error", "message": "x",
+                  "error": {"frames": {}}}).draft is None
+
+
+def test_frame_positions_are_exact_and_invalid_values_become_none_once():
+    result = _norm({"kind": "error", "message": "x", "error": {"frames": [
+        {"line": 5, "column": 0},
+        {"line": 0, "column": -1},
+    ]}})
+    assert [(frame.line, frame.column) for frame in result.draft.frames] == [
+        (5, 0), (None, None)]
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.INVALID_SOURCE_LOCATION]
+
+
+def test_frame_cap_omits_extras_and_reports_once():
+    frames = [{"function": f"f{i}"} for i in range(6)]
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"frames": frames}},
+                   config=_config(max_frames_per_event=4))
+    assert len(result.draft.frames) == 4
+    assert [frame.function_text for frame in result.draft.frames] == [
+        "f0", "f1", "f2", "f3"]
+    assert result.draft.frames_truncated is True
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+
+
+def test_frame_function_truncation_sets_text_flag():
+    result = _norm({"kind": "error", "message": "x", "error": {"frames": [
+        {"function": "abcdefghijklmnop"}]}})
+    assert result.draft.frames[0].function_text == "abcdefghi\u2026"
+    assert result.draft.text_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_frame_function_nul_and_surrogate_invalidate_event():
+    for function in ("a\x00", "a\ud800"):
+        assert _norm({"kind": "error", "message": "x", "error": {"frames": [
+            {"function": function}]}}).draft is None
+
+
+def test_explicit_frames_use_declared_language_or_unknown():
+    value = {"kind": "error", "message": "x",
+             "error": {"frames": [{"function": "f"}]}}
+    assert _norm(
+        value, declared_language=RuntimeFrameLanguage.PYTHON
+    ).draft.frames[0].language is RuntimeFrameLanguage.PYTHON
+    assert _norm(value).draft.frames[0].language is RuntimeFrameLanguage.UNKNOWN
+    assert _norm(
+        value, declared_language=RuntimeFrameLanguage.UNKNOWN
+    ).draft.frames[0].language is RuntimeFrameLanguage.UNKNOWN
+
+
+def test_empty_explicit_frames_suppress_stack():
+    result = _norm({"kind": "error",
+                    "error": {"frames": [], "stack": "not a stack"}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft.frames == ()
+    assert result.issues == ()
+    assert result.draft.frames_truncated is False
+
+
+def test_stack_is_ignored_when_frames_key_is_present():
+    result = _norm({"kind": "error", "message": "x", "error": {
+        "frames": [{"function": "f"}],
+        "stack": "\x00\ud800" + "x" * 200}},
+        declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is not None
+    assert len(result.draft.frames) == 1
+    assert result.issues == ()
+
+
+def test_valid_stack_parses_frames_in_reported_order():
+    stack = '  File "a.py", line 3, in f\n  File "b.py", line 4, in g\n'
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert [(frame.function_text, frame.source_text, frame.line,
+             frame.column, frame.language)
+            for frame in result.draft.frames] == [
+        ("f", "a.py", 3, None, RuntimeFrameLanguage.PYTHON),
+        ("g", "b.py", 4, None, RuntimeFrameLanguage.PYTHON)]
+    assert result.issues == ()
+    assert result.draft.text_truncated is False
+    assert result.draft.frames_truncated is False
+
+
+@pytest.mark.parametrize(
+    "stack",
+    [
+        "not a stack",
+        "\x00",
+        '  File "a.py", line 1, in f\n\x00',
+        '  File "a.py", line 1, in f\n\ud800',
+    ],
+)
+def test_stack_without_recognized_frame_or_with_nul_or_surrogate_is_unparseable(
+    stack,
+):
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is not None
+    assert result.draft.frames == ()
+    assert result.draft.frames_truncated is False
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_UNPARSEABLE]
+
+
+def test_over_cap_unpaired_surrogate_stack_is_unparseable_not_truncated():
+    stack = "\ud800" * 200
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is not None
+    assert result.draft.frames == ()
+    assert result.draft.frames_truncated is False
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_UNPARSEABLE]
+
+
+def test_json_adapter_does_not_use_surrogatepass():
+    source = Path(json_adapter.__file__).read_text(encoding="utf-8")
+    assert "surrogatepass" not in source
+
+
+def test_stack_type_is_validated_even_when_frames_are_present():
+    result = _norm({"kind": "error",
+                    "error": {"frames": [], "stack": 42}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft is None
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.INVALID_EVENT_SCHEMA]
+
+
+def test_stack_function_truncation_sets_text_flag():
+    stack = '  File "a.py", line 1, in abcdefghijklmnop\n'
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft.frames[0].function_text == "abcdefghi\u2026"
+    assert result.draft.text_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_stack_frame_limit_sets_frames_truncated_and_issue():
+    stack = "".join(
+        f'  File "a.py", line {index + 1}, in f\n' for index in range(3))
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON,
+                   config=_config(max_frames_per_event=2))
+    assert len(result.draft.frames) == 2
+    assert result.draft.frames_truncated is True
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+
+
+def test_stack_size_precedes_nul_and_parse():
+    stack = '  File "a.py", line 1, in f\n\x00' + "x" * 200
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft.frames == ()
+    assert result.draft.text_truncated is True
+    assert result.draft.frames_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_TOO_LARGE, RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_stack_size_is_exact_utf8_bytes():
+    exact = _norm({"kind": "error", "message": "x",
+                   "error": {"stack": "\u00e9" * 64}},
+                  declared_language=RuntimeFrameLanguage.PYTHON)
+    assert [i.code for i in exact.issues] == [
+        RuntimeIssueCode.STACK_UNPARSEABLE]
+    over = _norm({"kind": "error", "message": "x",
+                  "error": {"stack": "\u00e9" * 65}},
+                 declared_language=RuntimeFrameLanguage.PYTHON)
+    assert [i.code for i in over.issues] == [
+        RuntimeIssueCode.STACK_TOO_LARGE, RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_valid_surrogate_pair_in_stack_is_parseable():
+    stack = '  File "a.py", line 1, in \ud83d\ude00\n'
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON)
+    assert result.draft.frames[0].function_text == "\U0001f600"
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize("error", [None, [], "x", 1, True])
+def test_non_object_error_invalidates(error):
+    assert _norm({"kind": "error", "message": "x",
+                  "error": error}).draft is None
+
+
+def test_error_type_and_message_map_with_bounds():
+    result = _norm({"kind": "error", "error": {"type": "T",
+                                               "message": "m"}})
+    assert result.draft.error_type == "T"
+    assert result.draft.error_message == "m"
+    assert result.draft.message is None
+    for text in ("a" * 257, "a\x00"):
+        assert _norm({"kind": "error", "message": "x",
+                      "error": {"type": text}}).draft is None
+
+
+def test_metadata_only_projection_retains_structure_and_omits_text():
+    result = _norm({
+        "kind": "error",
+        "timestamp": "ts", "level": "ERROR", "logger": "lg",
+        "operation": "op", "trace_id": "t", "span_id": "s",
+        "parent_span_id": "p", "duration_ms": "1.5", "status": "failed",
+        "message": "secret message",
+        "tags": {"a": "b"},
+        "error": {
+            "type": "Boom", "message": "secret error",
+            "frames": [{"function": "f", "source": "src/a.py",
+                        "line": 3, "column": 4}],
+        },
+    }, config=_config(retain_event_text=False))
+    draft = result.draft
+    assert draft is not None
+    assert draft.kind is RuntimeEventKind.ERROR
+    assert draft.timestamp_text == "ts"
+    assert draft.level == "ERROR"
+    assert draft.trace_id == "t"
+    assert draft.span_id == "s"
+    assert draft.parent_span_id == "p"
+    assert draft.duration_ms_text == "1.5"
+    assert draft.status == "failed"
+    assert draft.message is None
+    assert draft.logger is None
+    assert draft.operation is None
+    assert draft.error_type is None
+    assert draft.error_message is None
+    assert draft.tags == ()
+    assert [(frame.function_text, frame.source_text, frame.line,
+             frame.column) for frame in draft.frames] == [
+        (None, "src/a.py", 3, 4)]
+    assert draft.text_truncated is False
+    assert draft.frames_truncated is False
+    assert result.issues == ()
+
+
+def test_metadata_only_omits_over_limit_truncatable_text_without_issues():
+    result = _norm({
+        "kind": "error",
+        "message": "m" * 100,
+        "tags": {"a": "b"},
+        "error": {"message": "e" * 100,
+                  "frames": [{"function": "f" * 100}]},
+    }, config=_config(retain_event_text=False))
+    draft = result.draft
+    assert draft.message is None
+    assert draft.error_message is None
+    assert draft.tags == ()
+    assert draft.frames[0].function_text is None
+    assert draft.text_truncated is False
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("logger", "a" * 257), ("operation", "a" * 257),
+        ("level", "a" * 33), ("timestamp", "a" * 129),
+        ("status", "a" * 33),
+    ],
+)
+def test_metadata_only_still_validates_non_truncatable_bounds(field, value):
+    result = _norm({"kind": "log", "message": "x", field: value},
+                   config=_config(retain_event_text=False))
+    assert result.draft is None
+
+
+def test_metadata_only_still_validates_tags_and_nul():
+    for value in ({"kind": "log", "message": "x", "tags": {"a": 1}},
+                  {"kind": "log", "message": "x", "tags": {"a": "b" * 9}},
+                  {"kind": "log", "message": "a\x00"},
+                  {"kind": "log", "message": "a\ud800"}):
+        assert _norm(value, config=_config(
+            retain_event_text=False)).draft is None
+
+
+def test_metadata_only_stack_parsing_keeps_structural_frames():
+    stack = '  File "a.py", line 3, in abcdefghijklmnop\n'
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON,
+                   config=_config(retain_event_text=False))
+    assert len(result.draft.frames) == 1
+    assert result.draft.frames[0].function_text is None
+    assert result.draft.frames[0].source_text == "a.py"
+    assert result.draft.frames[0].line == 3
+    assert result.draft.text_truncated is False
+    assert result.issues == ()
+
+
+def test_metadata_only_stack_size_truncation_still_reports():
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": "x" * 200}},
+                   declared_language=RuntimeFrameLanguage.PYTHON,
+                   config=_config(retain_event_text=False))
+    assert result.draft.text_truncated is True
+    assert result.draft.frames_truncated is True
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.STACK_TOO_LARGE, RuntimeIssueCode.TEXT_TRUNCATED]
+
+
+def test_metadata_only_stack_frame_limit_still_reports():
+    stack = "".join(
+        f'  File "a.py", line {index + 1}, in f\n' for index in range(3))
+    result = _norm({"kind": "error", "message": "x",
+                    "error": {"stack": stack}},
+                   declared_language=RuntimeFrameLanguage.PYTHON,
+                   config=_config(retain_event_text=False,
+                                  max_frames_per_event=2))
+    assert result.draft.frames_truncated is True
+    assert result.draft.text_truncated is False
+    assert [i.code for i in result.issues] == [
+        RuntimeIssueCode.FRAME_LIMIT_REACHED]
+
+
+def test_structural_budget_messages_are_fixed():
+    secret = "s3cr3t-" + "x" * 300
+    result = _norm({"kind": "log", "message": "x", "logger": secret})
+    (issue,) = result.issues
+    assert issue.code is RuntimeIssueCode.INVALID_EVENT_SCHEMA
+    assert issue_message(issue.code) == (
+        "event does not match the supported schema")
+    assert secret not in issue_message(issue.code)
+
+    oversized = _norm({"kind": "error", "message": "x",
+                       "error": {"stack": "x" * 200}},
+                      declared_language=RuntimeFrameLanguage.PYTHON)
+    assert issue_message(RuntimeIssueCode.STACK_TOO_LARGE) == (
+        "stack exceeds the configured byte limit")
+    assert "200" not in issue_message(
+        RuntimeIssueCode.STACK_TOO_LARGE)
+
+
+def _parse(content, max_new_events=10, declared_language=None, **kw):
+    return parse_json_events(
+        content, _config(**kw), declared_language, max_new_events
+    )
+
+
+def test_single_line_object_is_document_mode_with_no_line_provenance():
+    result = _parse(b'{"kind":"log","message":"x"}')
+    assert len(result.events) == 1
+    assert result.events[0].source_line is None
+    assert result.empty_input is False
+
+
+def test_complete_valid_documents_select_document_mode():
+    obj = _parse(b'{"kind":"log","message":"x"}')
+    arr = _parse(
+        b'[{"kind":"log","message":"a"},'
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert obj.events[0].source_line is None
+    assert [event.source_line for event in arr.events] == [None, None]
+    assert [event.sequence for event in arr.events] == [0, 1]
+
+
+def test_pretty_printed_document_is_still_document_mode():
+    content = (b'{\n  "kind": "log",\n  "message": "x"\n}\n')
+    result = _parse(content)
+    assert len(result.events) == 1
+    assert result.events[0].source_line is None
+
+
+def test_document_array_empty_array_and_non_object_elements():
+    result = _parse(
+        b'[{"kind":"log","message":"a"}, 3, '
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert [e.message for e in result.events] == ["a", "b"]
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+    empty = _parse(b"[]")
+    assert empty.events == () and empty.empty_input is False
+
+
+def test_document_array_issues_remain_document_scoped():
+    result = _parse(
+        b'[3, null, {"kind":"bogus"}, '
+        b'{"kind":"log","message":"a"}, '
+        b'{"kind":"log","message":"b"}]'
+    )
+    assert [(event.sequence, event.message) for event in result.events] == [
+        (0, "a"), (1, "b")]
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)] * 3
+
+
+def test_all_invalid_document_object_has_no_event():
+    result = _parse(b"{}")
+    assert result.events == ()
+    assert [(i.code, i.event_sequence, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+
+
+def test_empty_and_blank_only_jsonl_are_complete_shaped():
+    for content in (b"", b"\n \t\n", b"\xef\xbb\xbf", b" " * 40 + b"\n"):
+        result = _parse(content, max_line_bytes=32)
+        assert result.events == () and result.empty_input is True
+        assert result.issues == ()
+        assert result.text_truncated is False
+        assert result.frames_truncated is False
+        assert result.event_limit_hit is False
+
+
+def test_blank_whitespace_is_not_blankness():
+    result = _parse(b"\x0b\n")
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_malformed_balanced_documents_fall_back_to_jsonl():
+    for bad in (b'{"kind":"log","message":"ok","x":"\\x"}\n',
+                b'{"kind":"log","message":"ok" "x":1}\n',
+                b'{"kind":"log","message":"ok",}\n'):
+        result = _parse(bad)
+        assert result.events == ()
+        assert [(i.code, i.source_line) for i in result.issues] == [
+            (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_balanced_invalid_document_with_recoverable_object_line():
+    content = (b'{"kind":"log","message":"ok",}\n'
+               b'{"kind":"log","message":"saved"}\n')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b'{"kind":"log","message":"ok","x":"\\x"}',
+        b'{"kind":"log","message":"ok" "x":1}',
+        b'{"kind":"log","message":"ok",}',
+        b'{"kind":"log","message":"ok"} trailing',
+    ],
+)
+def test_malformed_whole_candidates_recover_later_objects(bad):
+    result = _parse(bad + b'\n{"kind":"log","message":"saved"}')
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_invalid_jsonl_line_does_not_discard_later_valid_line():
+    result = _parse(
+        b'{"kind":"log"\n{"kind":"log","message":"saved"}'
+    )
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_valid_jsonl_object_lines_keep_one_based_physical_lines():
+    content = (b'{"kind":"log","message":"a"}\n'
+               b'\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 1), ("b", 3)]
+
+
+def test_invalid_utf8_whole_candidate_recovers_valid_object_line():
+    content = b'\xff\n{"kind":"log","message":"saved"}\n'
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+    no_recovery = _parse(b'\xff\n')
+    assert no_recovery.events == ()
+    assert no_recovery.empty_input is False
+    assert [(i.code, i.source_line) for i in no_recovery.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+
+def test_invalid_utf8_cannot_select_document_mode():
+    result = _parse(b'{"kind":"log","message":"\xff"}')
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_UTF8, 1)]
+
+
+def test_over_budget_document_fails_whole_and_does_not_fall_back():
+    content = b'[' + b",".join([b"0"] * 8) + b"]"
+    result = _parse(content, max_json_nodes=5)
+    assert result.events == ()
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+
+def test_over_budget_document_is_not_materialized(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("document was materialized")
+
+    monkeypatch.setattr(json_adapter.json, "loads", fail)
+    content = b'[' + b",".join([b"0"] * 8) + b"]"
+    result = _parse(content, max_json_nodes=5)
+    assert result.events == ()
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+
+def test_document_materializes_once_through_guarded_hooks(monkeypatch):
+    calls = []
+    real_loads = json_adapter.json.loads
+
+    def counting_loads(text, **kwargs):
+        calls.append(kwargs)
+        return real_loads(text, **kwargs)
+
+    monkeypatch.setattr(json_adapter.json, "loads", counting_loads)
+    result = _parse(b'{"kind":"log","message":"x"}')
+    assert len(result.events) == 1
+    assert len(calls) == 1
+    assert "object_pairs_hook" in calls[0]
+    assert "parse_constant" in calls[0]
+
+
+def test_aggregate_jsonl_nodes_may_exceed_document_budget():
+    content = b"\n".join([b'{"kind":"log","message":"x"}'] * 5)
+    result = _parse(content, max_json_nodes=5)
+    assert len(result.events) == 5
+
+
+def test_over_budget_jsonl_line_recovers_later_event():
+    content = (b'[0,1,2,3,4,5]\n'
+               b'{"kind":"log","message":"saved"}\n')
+    result = _parse(content, max_json_nodes=5)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_node_budget_exact_boundary_document_and_jsonl():
+    document = b'{"kind":"log","message":"x"}'
+    assert len(_parse(document, max_json_nodes=5).events) == 1
+    rejected = _parse(document, max_json_nodes=4)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    jsonl = document + b"\n" + document
+    assert len(_parse(jsonl, max_json_nodes=5).events) == 2
+    rejected = _parse(jsonl, max_json_nodes=4)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1),
+        (RuntimeIssueCode.MALFORMED_JSON, 2)]
+
+
+def test_number_token_budget_exact_boundary_and_recovery():
+    document = b'{"kind":"log","message":"x","n":-1.2e+3}'
+    assert len(_parse(document, max_json_nodes=7,
+                      max_json_number_bytes=7).events) == 1
+    rejected = _parse(document, max_json_nodes=7,
+                      max_json_number_bytes=6)
+    assert rejected.events == ()
+    assert [(i.code, i.source_line) for i in rejected.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    jsonl = document + b"\n" + b'{"kind":"log","message":"saved"}'
+    recovered = _parse(jsonl, max_json_nodes=7, max_json_number_bytes=6)
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_numeric_conversion_failure_is_recoverable():
+    huge_number = b"9" * 5000
+    document = (b'{"kind":"log","message":"x","n":'
+                + huge_number + b"}")
+
+    failed = _parse(document, max_json_number_bytes=10000)
+    assert failed.events == ()
+    assert [(i.code, i.source_line) for i in failed.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    recovered = _parse(
+        document + b'\n{"kind":"log","message":"saved"}',
+        max_json_number_bytes=10000,
+    )
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_oversized_numeric_token_is_rejected_before_materialization():
+    huge_number = b"9" * 5000
+    content = (b'{"kind":"log","message":"x","n":'
+               + huge_number + b"}\n"
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content, max_json_number_bytes=1024)
+    assert [e.message for e in result.events] == ["saved"]
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_deep_nesting_document_and_jsonl_resource_failure():
+    deep = b"[" * 5000 + b"0" + b"]" * 5000
+    document = _parse(deep)
+    assert document.events == ()
+    assert [(i.code, i.source_line) for i in document.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, None)]
+
+    recovered = _parse(
+        deep + b'\n{"kind":"log","message":"saved"}',
+        max_line_bytes=20000,
+    )
+    assert [e.message for e in recovered.events] == ["saved"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b"NaN",
+        b"Infinity",
+        b"-Infinity",
+        b'{"kind":"log","message":"x","n":NaN}',
+        b"[Infinity]",
+    ],
+)
+def test_non_standard_json_constants_are_malformed(bad):
+    result = _parse(bad)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_nan_line_does_not_discard_later_valid_object():
+    content = (b'{"kind":"log","message":"x","n":NaN}\n'
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.MALFORMED_JSON, 1)]
+
+
+def test_jsonl_failure_precedence_and_one_based_lines():
+    content = (b'{"kind":"log","message":"ok"}\n'
+               b'\x00' + b"x" * 40 + b'\n'
+               b'no\x00\n'
+               b'\xff\n'
+               b'{"kind":"log"}\n')
+    result = _parse(content, max_line_bytes=32)
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 2),
+        (RuntimeIssueCode.NUL_BYTE, 3),
+        (RuntimeIssueCode.INVALID_UTF8, 4),
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, 5),
+    ]
+
+
+def test_line_both_overlong_and_nul_reports_length_first():
+    content = (b'\x00' + b"x" * 40 + b"\n"
+               b'{"kind":"log","message":"saved"}')
+    result = _parse(content, max_line_bytes=32)
+    assert [e.message for e in result.events] == ["saved"]
+    assert result.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 1)]
+
+
+def test_blank_and_overlong_whitespace_only_lines_are_ignored():
+    content = (b" " * 40 + b"\n"
+               b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content, max_line_bytes=32)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 2), ("b", 3)]
+    assert result.issues == ()
+
+    blank_only = _parse(b" " * 40 + b"\n" + b"\t" * 40,
+                        max_line_bytes=32)
+    assert blank_only.events == ()
+    assert blank_only.empty_input is True
+    assert blank_only.issues == ()
+
+
+def test_multibyte_text_is_retained_and_lines_are_byte_measured():
+    line = (b'{"kind":"log","message":"'
+            + "\u00e9".encode("utf-8") * 8 + b'"}')
+    char_length = len(line.decode("utf-8"))
+    assert len(line) > char_length
+    content = line + b'\n{"kind":"log","message":"ok"}'
+
+    overlong = _parse(content, max_line_bytes=char_length,
+                      max_message_bytes=64)
+    assert overlong.events[0].source_line == 2
+    assert [e.message for e in overlong.events] == ["ok"]
+    assert [(i.code, i.source_line) for i in overlong.issues] == [
+        (RuntimeIssueCode.LINE_TOO_LONG, 1)]
+
+    accepted = _parse(content, max_line_bytes=len(line),
+                      max_message_bytes=64)
+    assert [e.message for e in accepted.events] == ["\u00e9" * 8, "ok"]
+    assert accepted.issues == ()
+
+
+def test_deferred_diagnostic_scan_without_a_qualifying_object():
+    content = (b"3\n"
+               b"[1,2]\n"
+               b'{"kind":"log"\n')
+    result = _parse(content)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [
+        (i.code, i.event_sequence, i.source_line)
+        for i in result.issues
+    ] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 1),
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 2),
+        (RuntimeIssueCode.MALFORMED_JSON, None, 3),
+    ]
+
+
+@pytest.mark.parametrize("content", [b"3", b'"text"', b"true", b"null"])
+def test_top_level_scalars_are_jsonl_invalid_schema(content):
+    result = _parse(content)
+    assert result.events == ()
+    assert result.empty_input is False
+    assert [
+        (i.code, i.event_sequence, i.source_line)
+        for i in result.issues
+    ] == [(RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, 1)]
+
+
+def test_duplicate_key_precedence_document_and_jsonl():
+    document = (b'[{"kind":"log","message":"a"},'
+                b'{"kind":"log","message":"b","x":1,"x":2}]')
+    failed = _parse(document)
+    assert failed.events == ()
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in failed.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, None, None)]
+
+    lone = b'{"kind":"log","message":"a","x":1,"x":2}'
+    lone_result = _parse(lone)
+    assert lone_result.events == ()
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in lone_result.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, None, None)]
+
+    jsonl = (b'{"kind":"log","message":"a","x":1,"x":2}\n'
+             b'{"kind":"log","message":"b"}')
+    recovered = _parse(jsonl)
+    assert [e.message for e in recovered.events] == ["b"]
+    assert recovered.events[0].source_line == 2
+    assert [(i.code, i.source_line) for i in recovered.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, 1)]
+
+
+def test_duplicate_key_precedes_wrong_shape_in_jsonl():
+    content = (b'[{"a":1,"a":2}]\n'
+               b'{"kind":"log","message":"ok"}')
+    result = _parse(content)
+    assert [e.message for e in result.events] == ["ok"]
+    assert [(i.code, i.source_line) for i in result.issues] == [
+        (RuntimeIssueCode.DUPLICATE_JSON_KEY, 1)]
+
+
+def test_event_limit_hit_stops_before_another_valid_event():
+    content = (b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}\n'
+               b'{"kind":"log","message":"c"}')
+    result = _parse(content, max_new_events=2)
+    assert [(e.sequence, e.message) for e in result.events] == [
+        (0, "a"), (1, "b")]
+    assert result.event_limit_hit is True
+
+    exact = _parse(content, max_new_events=3)
+    assert len(exact.events) == 3
+    assert exact.event_limit_hit is False
+
+
+def test_document_event_limit_continues_past_invalid_elements():
+    content = (b'[{"kind":"log","message":"a"},'
+               b'{"kind":"log","message":"b"},'
+               b'3,'
+               b'{"kind":"log","message":"c"}]')
+    result = _parse(content, max_new_events=2)
+    assert [(e.sequence, e.message) for e in result.events] == [
+        (0, "a"), (1, "b")]
+    assert result.event_limit_hit is True
+    assert [(i.code, i.event_sequence, i.source_line)
+            for i in result.issues] == [
+        (RuntimeIssueCode.INVALID_EVENT_SCHEMA, None, None)]
+
+
+def test_result_flags_are_or_of_emitted_event_flags():
+    text = _parse(
+        b'[{"kind":"log","message":"abcdef"},'
+        b'{"kind":"log","message":"x"}]',
+        max_message_bytes=4,
+    )
+    assert text.text_truncated is True
+    assert text.frames_truncated is False
+    assert text.events[0].message == "a\u2026"
+
+    frames = _parse(
+        b'[{"kind":"error","message":"x","error":{"frames":['
+        b'{"function":"f0"},{"function":"f1"},{"function":"f2"}]}}]',
+        max_frames_per_event=2,
+    )
+    assert frames.text_truncated is False
+    assert frames.frames_truncated is True
+    assert frames.events[0].frames_truncated is True
+
+
+def test_strip_utf8_bom_removes_at_most_one_leading_bom():
+    bom = b"\xef\xbb\xbf"
+    assert strip_utf8_bom(b"") == b""
+    assert strip_utf8_bom(b"{}") == b"{}"
+    assert strip_utf8_bom(bom + b"{}") == b"{}"
+    assert strip_utf8_bom(bom + bom + b"{}") == bom + b"{}"
+    assert strip_utf8_bom(b"x" + bom) == b"x" + bom
+
+
+def test_bom_document_and_jsonl_use_one_bom_only():
+    bom = b"\xef\xbb\xbf"
+    document = _parse(bom + b'{"kind":"log","message":"x"}')
+    assert len(document.events) == 1
+    assert document.events[0].source_line is None
+
+    content = (bom + b'{"kind":"log","message":"a"}\n'
+               b'{"kind":"log","message":"b"}')
+    result = _parse(content)
+    assert [(e.message, e.source_line) for e in result.events] == [
+        ("a", 1), ("b", 2)]
+
+
+def test_parser_failure_messages_do_not_leak_artifact_text():
+    secret = "s3cr3t"
+    content = ('{"kind":"log","message":"%s","x":"\\x"}' % secret).encode()
+    result = _parse(content)
+    (issue,) = result.issues
+    assert issue.code is RuntimeIssueCode.MALFORMED_JSON
+    assert issue_message(issue.code) == "line or document is not valid JSON"
+    assert secret not in issue_message(issue.code)
+
+
+def _ingest_json(content, config=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact("events.json", RuntimeArtifactFormat.JSON_EVENTS,
+                            content),
+        )))
+
+
+def test_pipeline_jsonl_and_document_provenance_is_exact():
+    jsonl = _ingest_json(
+        b'{"kind":"log","message":"a"}\n'
+        b'{"kind":"log","message":"b"}\n')
+    assert [(event.sequence, event.source_line, event.message)
+            for event in jsonl.events] == [
+        (0, 1, "a"), (1, 2, "b")]
+    assert jsonl.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+    assert jsonl.artifacts[0].issue_count == 0
+
+    document = _ingest_json(
+        b'[{"kind":"log","message":"a"},{"kind":"log","message":"b"}]')
+    assert [(event.sequence, event.source_line, event.message)
+            for event in document.events] == [
+        (0, None, "a"), (1, None, "b")]
+    assert document.artifacts[0].status is RuntimeArtifactStatus.COMPLETE
+
+
+def test_pipeline_metadata_only_keeps_structure_and_identities():
+    content = (
+        b'{"kind":"error","timestamp":"ts","level":"ERROR",'
+        b'"logger":"lg","operation":"op","trace_id":"t","span_id":"s",'
+        b'"parent_span_id":"p","duration_ms":"1.5","status":"failed",'
+        b'"message":"secret message","tags":{"a":"b"},'
+        b'"error":{"type":"Boom","message":"secret error","frames":['
+        b'{"function":"f","source":"src/a.py","line":3,"column":4}]}}'
+    )
+    retained = _ingest_json(content)
+    metadata = _ingest_json(
+        content, RuntimeEvidenceConfig(retain_event_text=False))
+    assert len(retained.events) == 1
+    assert len(metadata.events) == 1
+    retained_event = retained.events[0]
+    metadata_event = metadata.events[0]
+    assert retained.event_text_retained is True
+    assert metadata.event_text_retained is False
+    assert retained_event.message == "secret message"
+    assert metadata_event.message is None
+    assert metadata_event.logger is None
+    assert metadata_event.operation is None
+    assert metadata_event.error_type is None
+    assert metadata_event.error_message is None
+    assert metadata_event.tags == ()
+    assert metadata_event.frames[0].function_text is None
+    assert metadata_event.timestamp_text == "ts"
+    assert metadata_event.level == "ERROR"
+    assert metadata_event.trace_id == "t"
+    assert metadata_event.span_id == "s"
+    assert metadata_event.parent_span_id == "p"
+    assert metadata_event.duration_ms_text == "1.5"
+    assert metadata_event.status == "failed"
+    assert metadata_event.frames[0].line == 3
+    assert metadata_event.frames[0].column == 4
+    assert metadata.artifacts[0].artifact_id == (
+        retained.artifacts[0].artifact_id)
+    assert metadata_event.event_id == retained_event.event_id
+    assert metadata_event.frames[0].frame_id == (
+        retained_event.frames[0].frame_id)
+    assert metadata_event.event_fingerprint != (
+        retained_event.event_fingerprint)
+
+
+# --- Task 17: record budgets ------------------------------------------------
+
+
+def test_json_document_event_budget_keeps_prefix_and_marks_partial():
+    inv = _ingest_json(
+        b'[{"kind":"log","message":"a"},{"kind":"log","message":"b"}]',
+        RuntimeEvidenceConfig(max_events=1))
+    assert inv.total_events == len(inv.events) == 1
+    assert [(event.sequence, event.source_line, event.message)
+            for event in inv.events] == [(0, None, "a")]
+    assert inv.artifacts[0].event_count == 1
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is True
+    assert inv.incomplete_reasons == (
+        RuntimeIncompleteReason.ARTIFACT_PARTIAL,
+        RuntimeIncompleteReason.EVENT_LIMIT_REACHED,
+    )
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.EVENT_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence is None
+    assert issue.source_line is None
+
+
+def test_jsonl_event_budget_keeps_prefix_and_marks_partial():
+    content = (
+        b'{"kind":"log","message":"a"}\n'
+        b'{"kind":"log","message":"b"}\n'
+        b'{"kind":"log","message":"c"}\n'
+    )
+    inv = _ingest_json(content, RuntimeEvidenceConfig(max_events=1))
+    assert inv.total_events == len(inv.events) == 1
+    assert [(event.sequence, event.source_line, event.message)
+            for event in inv.events] == [(0, 1, "a")]
+    assert inv.artifacts[0].event_count == 1
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    assert inv.events_truncated is True
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.EVENT_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence is None
+    assert issue.source_line is None
+
+
+def _ingest_json_with_language(content, config=None, language=None):
+    return RuntimeEvidenceIngestor(config).ingest(RuntimeEvidenceRequest(
+        "repo", (
+            RuntimeArtifact(
+                "events.json", RuntimeArtifactFormat.JSON_EVENTS,
+                content, language),
+        )))
+
+
+def test_json_explicit_frames_respect_global_frame_budget():
+    content = (
+        b'[{"kind":"error","message":"a","error":{"frames":['
+        b'{"function":"f0","source":"a.py","line":1}]}},'
+        b'{"kind":"error","message":"b","error":{"frames":['
+        b'{"function":"f1","source":"b.py","line":2}]}}]'
+    )
+    inv = _ingest_json(content, RuntimeEvidenceConfig(
+        max_frames_per_event=1, max_total_frames=1))
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    assert inv.events[0].frames[0].function_text == "f0"
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.FRAME_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line is None
+
+
+def test_json_parsed_stack_frames_respect_global_frame_budget():
+    content = (
+        b'[{"kind":"error","message":"a","error":{"stack":'
+        b'"  File \\"pkg/a.py\\", line 3, in f\\n"}},'
+        b'{"kind":"error","message":"b","error":{"stack":'
+        b'"  File \\"pkg/b.py\\", line 4, in g\\n"}}]'
+    )
+    inv = _ingest_json_with_language(
+        content,
+        RuntimeEvidenceConfig(max_frames_per_event=1, max_total_frames=1),
+        RuntimeFrameLanguage.PYTHON,
+    )
+    assert inv.total_events == 2
+    assert inv.total_frames == 1
+    assert [len(event.frames) for event in inv.events] == [1, 0]
+    assert [event.frames_truncated for event in inv.events] == [False, True]
+    retained = inv.events[0].frames[0]
+    assert (retained.function_text, retained.relative_path, retained.line) == (
+        "f", "pkg/a.py", 3)
+    assert inv.frames_truncated is True
+    assert inv.artifacts[0].status is RuntimeArtifactStatus.PARTIAL
+    (issue,) = inv.issues
+    assert issue.code is RuntimeIssueCode.FRAME_LIMIT_REACHED
+    assert issue.artifact_id == inv.artifacts[0].artifact_id
+    assert issue.event_sequence == 1
+    assert issue.source_line is None

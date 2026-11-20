@@ -583,3 +583,213 @@ python -m pytest tests -q -k git_history
 Normal verification is offline and excludes both networked integration markers.
 Module 7 does not implement Module 8 runtime evidence, Module 9 retrieval or graph
 expansion, or Module 10 LLM answering, causal reasoning, or citation presentation.
+
+## Module 8 — Runtime Evidence
+
+Module 8 ingests runtime evidence bytes supplied by the caller and returns a
+normalized, deterministic inventory of events, stack frames, issues, and
+provenance. It does not discover, tail, watch, execute, instrument, or read
+application code or logs.
+
+### Bytes-in contract
+
+`RuntimeArtifact` is an immutable caller-supplied byte string plus a logical
+`source_name`, a closed `format`, and an optional declared language. The caller
+captures and owns the bytes. Module 8 performs no filesystem, subprocess, Git,
+network, database, vector-store, LLM, or code-execution operation.
+
+### Public API
+
+```python
+from backend.runtime_evidence import (
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeEvidenceRequest,
+    ingest_runtime_evidence,
+)
+
+request = RuntimeEvidenceRequest(
+    repository_namespace="github.com/acme/app",
+    artifacts=(
+        RuntimeArtifact(
+            source_name="run-42.log",
+            format=RuntimeArtifactFormat.TEXT_LOG,
+            content=b"2026-10-23T10:00:00Z INFO started\n",
+        ),
+    ),
+)
+inventory = ingest_runtime_evidence(request)
+print(inventory.total_events)
+print(inventory.artifacts[0].status.value)
+```
+
+`RuntimeEvidenceIngestor().ingest(request)` is equivalent. Both entry points
+accept an optional Module 6 `CodeGraphInventory` as the second argument.
+
+### Formats
+
+| Format | Input |
+|---|---|
+| `TEXT_LOG` | UTF-8 text; one event per non-blank physical line |
+| `JSON_EVENTS` | one JSON object/array document, or JSONL with one object per non-blank line |
+| `STACK_TRACE_TEXT` | one or more UTF-8 Python, Java, JavaScript, TypeScript, or TSX (V8) stack blocks; requires a known declared language |
+
+A whole JSON object or array is document mode and its events have
+`source_line=None`. A lone JSON object is therefore not a one-line JSONL
+artifact. Use one object per non-blank line when line provenance is required.
+Malformed JSONL lines are recoverable per-line issues. A whole-content
+candidate that is syntactically malformed or invalid UTF-8 falls back to
+per-line JSONL recovery; a syntactically valid document that exceeds the node
+or number budget, or contains a duplicate key, fails the whole document
+without fallback.
+
+### JSON event schema
+
+Common fields: `kind` (required; `log`, `error`, or `span`), `message`,
+`timestamp`, `level`, `logger`, `operation`, `trace_id`, `span_id`,
+`parent_span_id`, `duration_ms`, `status`, and `tags`.
+
+| Kind | Required |
+|---|---|
+| `log` | `message` |
+| `error` | `message` or `error` |
+| `span` | `operation` |
+
+`error` supports `type`, `message`, `stack`, and `frames`. Explicit frame
+objects support `function`, `source`, `line`, and `column`. An explicit
+`frames` list takes precedence over `error.stack`; an empty list suppresses
+stack parsing. `tags` is an object of string values. All text, tags, frames,
+nodes, and numbers are structurally bounded by the configuration.
+
+### Optional Module 6 association
+
+Association is optional, deterministic, and **not causal**. It only matches
+normalized source paths to a caller-supplied Module 6 graph with the same
+repository namespace. It never reads source files or rebuilds the graph.
+
+```python
+from pathlib import Path
+
+from backend.code_graph import build_code_graph
+from backend.code_parser import CodeParser
+from backend.file_scanner import FileScanner
+from backend.runtime_evidence import (
+    RuntimeArtifact,
+    RuntimeArtifactFormat,
+    RuntimeEvidenceRequest,
+    RuntimeFrameLanguage,
+    ingest_runtime_evidence,
+)
+
+namespace = "github.com/acme/app"
+files = FileScanner().scan(Path("."), repository_namespace=namespace)
+graph = build_code_graph(files, CodeParser().parse_inventory(files))
+stack = (
+    b"Traceback (most recent call last):\n"
+    b'  File "pkg/app.py", line 5, in run\n'
+    b"ValueError: boom\n"
+)
+request = RuntimeEvidenceRequest(
+    namespace,
+    (RuntimeArtifact("trace.log", RuntimeArtifactFormat.STACK_TRACE_TEXT,
+                     stack, RuntimeFrameLanguage.PYTHON),),
+)
+inventory = ingest_runtime_evidence(request, graph)
+for node_id, frames in inventory.frames_by_node.items():
+    print(node_id, [frame.ordinal for frame in frames])
+```
+
+The graph must use exactly the public Module 6 `CodeGraphInventory` shape and
+the same namespace. A mismatch is a fatal `RuntimeEvidenceGraphError`. The graph
+is not stored in the inventory and is never mutated. `FILE` association is
+file-level; `AMBIGUOUS_SYMBOL` is not a symbol claim.
+
+### Determinism
+
+Artifacts are ordered by primary source name `(casefold(), original)` and then
+artifact ID; input artifact order never affects output. Events retain
+artifact/sequence order; frames retain event/ordinal order; issues retain the
+canonical issue order, and the issue-limit sentinel is ordered by that same
+key. Tags sort by key and
+index keys sort lexically. Fingerprints are SHA-256 over canonical JSON arrays.
+Timestamps are opaque strings and are not parsed or compared. Repeated runs
+over equal inputs return equal content.
+
+### Privacy and metadata-only mode
+
+Module 8 **does not redact**. Treat artifact bytes as untrusted. With
+`retain_event_text=False`, it omits free-form `message`, `error_type`,
+`error_message`, `logger`, `operation`, tags, and frame function text after
+schema validation and before truncation/fingerprinting. Timestamps, levels,
+status, trace/span IDs, duration, source positions, and structural frames are
+retained. Public representations, normal logs, and fatal messages omit raw
+bytes, free-form text, tags, paths, source names, namespaces, claims,
+trace/span IDs, graph contents, and exception text. The caller must sanitize
+evidence when redaction is required.
+
+### Resource limits
+
+All limits are structural. There is no processing-time limit, background
+worker, thread pool, or network call.
+
+| Config field | Default |
+|---|---:|
+| `max_artifacts` | 64 |
+| `max_namespace_bytes` | 256 |
+| `max_artifact_bytes` | 8,388,608 |
+| `max_submitted_input_bytes` | 67,108,864 |
+| `max_total_input_bytes` | 67,108,864 |
+| `max_events` | 50,000 |
+| `max_json_nodes` | 1,000,000 |
+| `max_json_number_bytes` | 1,024 |
+| `max_frames_per_event` | 128 |
+| `max_total_frames` | 200,000 |
+| `max_issues` | 10,000 |
+| `max_line_bytes` | 65,536 |
+| `max_source_reference_bytes` | 1,024 |
+| `max_message_bytes` | 8,192 |
+| `max_error_message_bytes` | 8,192 |
+| `max_stack_bytes` | 65,536 |
+| `max_frame_function_bytes` | 1,024 |
+| `max_tags` | 32 |
+| `max_tag_key_bytes` | 128 |
+| `max_tag_value_bytes` | 512 |
+| `retain_event_text` | `True` |
+
+### Errors and outcomes
+
+Fatal exceptions are `RuntimeEvidenceError` and its subclasses:
+`RuntimeEvidenceConfigurationError`, `RuntimeEvidenceValidationError`,
+`RuntimeEvidenceLimitError`, `RuntimeEvidenceGraphError`,
+`RuntimeEvidenceInvariantError`, and `RuntimeEvidenceIngestionError`. Fatal
+messages are fixed and content-free; no partial inventory is returned.
+
+Recoverable artifact statuses are `COMPLETE`, `PARTIAL`, `FAILED`, and
+`SKIPPED`. Per-line, per-event, and per-frame failures are reported as issues
+such as `INVALID_UTF8`, `MALFORMED_JSON`, `INVALID_EVENT_SCHEMA`,
+`EVENT_LIMIT_REACHED`, `FRAME_LIMIT_REACHED`, and `ISSUE_LIMIT_REACHED`.
+`PARTIAL` means usable evidence was retained; `FAILED` means no usable event
+was produced; `SKIPPED` means the artifact was not parsed because it exceeded
+`max_artifact_bytes` or the event budget was already exhausted when its turn
+arrived. A request-envelope failure is fatal and returns no inventory.
+
+### Explicit non-goals
+
+Module 8 does not collect logs, read files, execute or instrument code, attach
+to processes, run commands, call Git/GitHub, use ChromaDB or another store, call
+an LLM, merge duplicate events by content, infer causality, or implement
+Modules 9–10. It provides no sandbox and makes no redaction guarantee.
+
+### Tests
+
+Run the offline Module 8 suite with:
+
+```bash
+python -m pytest tests -q -k runtime_evidence
+```
+
+Normal verification excludes networked markers:
+
+```bash
+python -m pytest tests -q -m "not integration and not gemini_live"
+```
