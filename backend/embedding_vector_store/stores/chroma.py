@@ -34,8 +34,10 @@ from ..exceptions import (
     VectorStoreWriteError,
 )
 from ..models import EmbeddingModelIdentity, EmbeddingVector, VectorRecord
+from ..source_revision import InvalidSourceRevision, SourceRevision
 from .base import (
     CandidateIndex,
+    SourceRevisionToken,
     RepositoryIndexSnapshot,
     RepositoryIndexState,
     StoreSearchResult,
@@ -78,6 +80,7 @@ _CONTROL_KEYS = frozenset(
         "expected_chunk_count",
     }
 )
+_CONTROL_OPTIONAL_KEYS = frozenset({"source_revision"})
 _CORRUPTION_MESSAGE = "Vector store data is incompatible or corrupt."
 _CONFIGURATION_MESSAGE = "Vector store configuration is invalid."
 _WRITE_MESSAGE = "Vector store record is invalid."
@@ -575,7 +578,7 @@ class ChromaVectorStore:
         count = self._read_collection_count(collection)
         if type(count) is not int or count != snapshot.expected_chunk_count:
             _raise_corruption()
-        self._read_manifest_from_collection(
+        records = self._read_manifest_from_collection(
             repository_namespace,
             snapshot.identity,
             snapshot.document_version,
@@ -583,6 +586,7 @@ class ChromaVectorStore:
             snapshot.expected_chunk_count,
             collection,
         )
+        self._validate_source_revision(snapshot.source_revision, records)
         return snapshot
 
     def inspect_active(self, repository_namespace: str) -> RepositoryIndexState:
@@ -631,7 +635,7 @@ class ChromaVectorStore:
         mapped_failure = None
         try:
             return self._client.get_collection(
-                name=collection_name, embedding_function=None
+                name=str(collection_name), embedding_function=None
             )
         except NotFoundError:
             mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
@@ -683,17 +687,50 @@ class ChromaVectorStore:
         document_version: str,
         expected_chunk_count: int,
     ) -> CandidateIndex:
-        """Create one private immutable-generation candidate."""
+        """Canonical Module 5 candidate lifecycle, without source claims."""
+        return self._begin_candidate_with_proof(
+            repository_namespace, identity, document_version, expected_chunk_count, None
+        )
+
+    def begin_candidate_with_source_revision(
+        self,
+        repository_namespace: str,
+        identity: EmbeddingModelIdentity,
+        document_version: str,
+        expected_chunk_count: int,
+        source_revision: str,
+    ) -> CandidateIndex:
+        """Opt-in provenance extension; never modifies the Module 5 protocol."""
+        if source_revision is None:
+            raise VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
+        return self._begin_candidate_with_proof(
+            repository_namespace, identity, document_version, expected_chunk_count,
+            source_revision,
+        )
+
+    def _begin_candidate_with_proof(
+        self,
+        repository_namespace: str,
+        identity: EmbeddingModelIdentity,
+        document_version: str,
+        expected_chunk_count: int,
+        source_revision: str | None,
+    ) -> CandidateIndex:
         self._assert_owner_process()
         mapped_failure = None
         try:
+            if source_revision is not None:
+                proof = SourceRevision.decode(source_revision)
+                if proof.repository_namespace != repository_namespace:
+                    raise InvalidSourceRevision("Source revision evidence is invalid.")
+            token = secrets.token_hex(16)
             candidate = CandidateIndex(
                 repository_namespace=repository_namespace,
                 identity=identity,
                 document_version=document_version,
                 schema_version=STORAGE_SCHEMA_VERSION,
                 expected_chunk_count=expected_chunk_count,
-                _token=secrets.token_hex(16),
+                _token=SourceRevisionToken(token, source_revision),
             )
         except ValueError:
             mapped_failure = VectorStoreConfigurationError(_CONFIGURATION_MESSAGE)
@@ -722,9 +759,10 @@ class ChromaVectorStore:
             or decoded.document_version != snapshot.document_version
             or decoded.schema_version != snapshot.schema_version
             or decoded.expected_chunk_count != snapshot.expected_chunk_count
+            or decoded.source_revision != snapshot.source_revision
         ):
             _raise_corruption()
-        return self._read_manifest_from_collection(
+        records = self._read_manifest_from_collection(
             snapshot.repository_namespace,
             snapshot.identity,
             snapshot.document_version,
@@ -732,6 +770,17 @@ class ChromaVectorStore:
             snapshot.expected_chunk_count,
             collection,
         )
+        self._validate_source_revision(snapshot.source_revision, records)
+        return records
+
+    @staticmethod
+    def _validate_source_revision(encoded: str | None, records: tuple[StoredRecord, ...]) -> None:
+        if encoded is None:
+            return
+        try:
+            SourceRevision.decode(encoded).validate_records(records)
+        except InvalidSourceRevision:
+            _raise_corruption()
 
     def search(
         self,
@@ -1005,6 +1054,8 @@ class ChromaVectorStore:
             "expected_chunk_count": handle.expected_chunk_count,
             **_metadata_for_identity(handle.identity),
         }
+        if handle.source_revision is not None:
+            metadata["source_revision"] = handle.source_revision
         mapped_failure = None
         try:
             self._decode_snapshot_metadata(handle.repository_namespace, metadata, object())
@@ -1020,7 +1071,8 @@ class ChromaVectorStore:
         if (
             not _is_nonempty_string(repository_namespace)
             or type(metadata) is not dict
-            or frozenset(metadata) != _CONTROL_KEYS
+            or not _CONTROL_KEYS.issubset(metadata)
+            or not frozenset(metadata).issubset(_CONTROL_KEYS | _CONTROL_OPTIONAL_KEYS)
             or metadata.get("schema_version") != STORAGE_SCHEMA_VERSION
             or metadata.get("repository_namespace") != repository_namespace
             or not _is_nonempty_string(metadata.get("document_version"))
@@ -1028,6 +1080,15 @@ class ChromaVectorStore:
         ):
             _raise_corruption()
         identity = _identity_from_metadata(metadata)
+        source_revision = metadata.get("source_revision")
+        if "source_revision" in metadata and type(source_revision) is not str:
+            _raise_corruption()
+        if source_revision is not None:
+            try:
+                if SourceRevision.decode(source_revision).repository_namespace != repository_namespace:
+                    _raise_corruption()
+            except InvalidSourceRevision:
+                _raise_corruption()
         mapped_failure = None
         try:
             return RepositoryIndexSnapshot(
@@ -1036,7 +1097,10 @@ class ChromaVectorStore:
                 document_version=metadata["document_version"],  # type: ignore[arg-type]
                 schema_version=STORAGE_SCHEMA_VERSION,
                 expected_chunk_count=metadata["expected_chunk_count"],  # type: ignore[arg-type]
-                _token=token,
+                _token=(
+                    SourceRevisionToken(token, source_revision)
+                    if isinstance(token, str) else token
+                ),
             )
         except ValueError:
             mapped_failure = VectorStoreCorruptionError(_CORRUPTION_MESSAGE)
@@ -1107,6 +1171,7 @@ class ChromaVectorStore:
             or decoded.document_version != candidate.document_version
             or decoded.schema_version != candidate.schema_version
             or decoded.expected_chunk_count != candidate.expected_chunk_count
+            or decoded.source_revision != candidate.source_revision
         ):
             _raise_corruption()
         return collection
@@ -1384,7 +1449,8 @@ class ChromaVectorStore:
     def validate_candidate(self, candidate: CandidateIndex) -> None:
         """Validate the complete logical candidate before publication."""
         self._assert_owner_process()
-        self._read_candidate_manifest(candidate)
+        records = self._read_candidate_manifest(candidate)
+        self._validate_source_revision(candidate.source_revision, records)
 
     def _resolve_publication_outcome(
         self, candidate: CandidateIndex, old_collection: str | None
@@ -1410,7 +1476,7 @@ class ChromaVectorStore:
                 document_version=candidate.document_version,
                 schema_version=candidate.schema_version,
                 expected_chunk_count=candidate.expected_chunk_count,
-                _token=current_collection,
+                _token=SourceRevisionToken(current_collection, candidate.source_revision),
             )
         if current_collection == old_collection:
             raise VectorStorePublicationError(_PUBLICATION_MESSAGE)

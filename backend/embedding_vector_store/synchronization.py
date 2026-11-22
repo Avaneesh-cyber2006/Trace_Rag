@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from backend.code_chunker.models import CodeChunkInventory
+from backend.code_parser.models import CodeParseInventory
 
 from ._concurrency import _repository_writer_guard
 from .documents import EMBEDDING_DOCUMENT_VERSION, build_embedding_document
@@ -15,6 +16,7 @@ from .models import (
 )
 from .providers.base import EmbeddingProvider
 from .retry import RetryPolicy, run_with_embedding_retries
+from .source_revision import build_source_revision
 from .stores.base import StoredRecord, VectorStore
 from .validation import (
     ChunkInput,
@@ -65,7 +67,19 @@ class SemanticIndexer:
         self._identity = identity
 
     def synchronize(self, inventory: CodeChunkInventory) -> IndexSyncResult:
-        """Publish a complete replacement for one repository index."""
+        """Publish an ordinary index without claiming original-file provenance."""
+        return self._synchronize(inventory, None)
+
+    def synchronize_with_sources(
+        self, files: object, parsed: CodeParseInventory, chunks: CodeChunkInventory
+    ) -> IndexSyncResult:
+        """Publish original-file SHA evidence with the exact index generation."""
+        revision = build_source_revision(files, parsed, chunks)
+        return self._synchronize(chunks, revision.encode())
+
+    def _synchronize(
+        self, inventory: CodeChunkInventory, source_revision: str | None
+    ) -> IndexSyncResult:
         repository_namespace, current = validate_and_flatten_inventory(inventory)
         with _repository_writer_guard(self._store, repository_namespace):
             active_state = self._store.inspect_active(repository_namespace)
@@ -86,6 +100,7 @@ class SemanticIndexer:
                 and not diff.new
                 and not diff.updated
                 and not diff.deleted
+                and snapshot.source_revision == source_revision
             ):
                 return IndexSyncResult(
                     repository_namespace=repository_namespace,
@@ -100,12 +115,24 @@ class SemanticIndexer:
                     document_version=EMBEDDING_DOCUMENT_VERSION,
                 )
 
-            candidate = self._store.begin_candidate(
-                repository_namespace,
-                self._identity,
-                EMBEDDING_DOCUMENT_VERSION,
-                len(current),
-            )
+            if source_revision is None:
+                candidate = self._store.begin_candidate(
+                    repository_namespace, self._identity, EMBEDDING_DOCUMENT_VERSION, len(current)
+                )
+            else:
+                # Provenance is a store-specific extension, never an added
+                # parameter on the canonical Module 5 VectorStore protocol.
+                begin_with_proof = getattr(
+                    self._store, "begin_candidate_with_source_revision", None
+                )
+                if not callable(begin_with_proof):
+                    raise EmbeddingVectorStoreConfigurationError(
+                        "Source revision publication requires a provenance-capable store."
+                    )
+                candidate = begin_with_proof(
+                    repository_namespace, self._identity,
+                    EMBEDDING_DOCUMENT_VERSION, len(current), source_revision,
+                )
             try:
                 capacity = self._provider.max_batch_size
                 if type(capacity) is not int or capacity <= 0:

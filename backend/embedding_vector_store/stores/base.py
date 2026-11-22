@@ -47,6 +47,30 @@ def _validate_handle(
         raise ValueError("Vector store internal contract is invalid.")
 
 
+class SourceRevisionToken(str):
+    """Internal collection token carrying optional immutable generation provenance.
+
+    Retains the canonical Module 5 handle fields and method signatures: the
+    optional metadata is attached to the adapter-owned token, not the contract.
+    """
+
+    __slots__ = ("_source_revision",)
+
+    def __new__(cls, name: str, source_revision: str | None):
+        if not isinstance(name, str) or not name or (
+            source_revision is not None
+            and (type(source_revision) is not str or not source_revision)
+        ):
+            raise ValueError("Vector store internal contract is invalid.")
+        token = super().__new__(cls, name)
+        object.__setattr__(token, "_source_revision", source_revision)
+        return token
+
+    @property
+    def source_revision(self) -> str | None:
+        return self._source_revision
+
+
 @dataclass(frozen=True, slots=True)
 class RepositoryIndexSnapshot:
     """An adapter-owned immutable view of one published repository index."""
@@ -57,6 +81,15 @@ class RepositoryIndexSnapshot:
     schema_version: str
     expected_chunk_count: int
     _token: object = field(repr=False, compare=False)
+
+    @property
+    def source_revision(self) -> str | None:
+        """Adapter-owned extension, not a canonical Module 5 dataclass field."""
+        return (
+            self._token.source_revision
+            if isinstance(self._token, SourceRevisionToken)
+            else None
+        )
 
     def __post_init__(self) -> None:
         _validate_handle(
@@ -79,6 +112,15 @@ class CandidateIndex:
     schema_version: str
     expected_chunk_count: int
     _token: object = field(repr=False, compare=False)
+
+    @property
+    def source_revision(self) -> str | None:
+        """Adapter-owned extension, not a canonical Module 5 dataclass field."""
+        return (
+            self._token.source_revision
+            if isinstance(self._token, SourceRevisionToken)
+            else None
+        )
 
     def __post_init__(self) -> None:
         _validate_handle(
